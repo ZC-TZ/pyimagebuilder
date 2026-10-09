@@ -2,7 +2,7 @@
 
 [文档目录](README.md) · [项目首页](../README.md)
 
-本页面向维护者，说明模块分工、数据流和实现边界。使用步骤见 [用户指南](README.md#按任务阅读)，Dockerfile 支持范围见 [兼容表](DOCKERFILE_COMPAT.md)，历次实现过程见 [阶段记录](PHASE_NOTES.md)。
+本页面向维护者，说明模块分工、数据流和实现边界。使用步骤见 [用户指南](README.md#按任务阅读)，Dockerfile 支持范围见 [兼容表](DOCKERFILE_COMPAT.md)，测试方法见 [开发与维护](../CONTRIBUTING.md)。
 
 `main.py` 编排构建与镜像管理，Fast 复用同一构建器。基础镜像来自 Docker archive 或本地 CAS；Registry/Artifactory 下载器负责远端输入。文件指令生成层，元数据指令更新配置；RUN 另外使用 Linux 执行器。Docker/OCI writer 生成并校验交付归档。
 
@@ -127,6 +127,8 @@ Docker 归档入口共用 docker_manifest 校验 Config、Layers 与 RepoTags �
 构建事务先在工作区生成并验证镜像，随后生成证明和可选签名，最后发布所有产物。独立验收命令要求明确提供受信任公钥和全部归档，只确认签名及交付文件摘要关系，不替代构建环境可信性审计。`RUN` 的动态网络来源不自动纳入 `resolvedDependencies`；SBOM 是有明确检测范围的清单，不是漏洞或许可证审查结果。
 
 标准参考：[SPDX 2.3](https://spdx.github.io/spdx-spec/v2.3/)、[SLSA provenance v1](https://slsa.dev/spec/v1.0/provenance)、[DSSE envelope](https://github.com/secure-systems-lab/dsse/blob/master/envelope.proto)、[RFC 8032](https://www.rfc-editor.org/rfc/rfc8032)。
+
+随包的纯 Python Ed25519 实现没有经过独立安全审计，Python 大整数运算并非常数时间。生产签名应结合组织的安全评估和密钥保护要求；私钥不得提交到仓库或写入镜像。
 
 ## RUN 隔离
 

@@ -133,4 +133,4 @@ python -m unittest discover -s tests
 python .\conformance.py offline
 ```
 
-离线检查不代替 Docker 对照、Linux RUN 或应用验收。目标环境可用 `conformance.py reference`、`compare`、`linux`，执行前查看相应 `--help`；测试边界和历史结论见 [审计记录](../AUDIT_2026-10-09.md)。
+离线检查不代替 Docker 对照、Linux RUN 或应用验收。目标环境可用 `conformance.py reference`、`compare`、`linux`，执行前查看相应 `--help`；测试方法和环境边界见 [开发与维护](../../CONTRIBUTING.md)。

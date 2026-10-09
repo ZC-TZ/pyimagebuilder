@@ -37,3 +37,9 @@ config.local.json
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# 本地审计和开发过程资料，不属于正式项目文档
+/docs/AUDIT_*.md
+/docs/PHASE_NOTES.md
+/internal/
+/docs/internal/

@@ -26,6 +26,16 @@
 
 以下命令在工具目录执行，使用 PowerShell。`D:\packages`、`D:\images` 和内网地址都是示例，请替换为实际路径和地址。输出建议放在构建目录外；已有同名输出会报错。
 
+## 获取源码
+
+```text
+git clone https://github.com/ZC-TZ/pyimagebuilder.git
+cd pyimagebuilder
+python main.py --help
+```
+
+也可以在 GitHub 的 **Code → Download ZIP** 下载并解压源码，然后进入包含 `main.py` 的目录。核心功能无需安装第三方 Python 包。
+
 ## 快速开始：WAR 转镜像
 
 ### 1. 首次准备模板
@@ -91,4 +101,5 @@ docker load -i sfcx_back-1.3.4.tar
 - [命令速查](docs/guides/COMMANDS.md)：按用途查命令，以及与 Docker CLI 的差异。
 - [进阶构建](docs/guides/ADVANCED.md)：RUN/WSL、跨架构、缓存、签名与严格封闭构建。
 - [常见问题](docs/guides/TROUBLESHOOTING.md)：下载失败、找不到基础镜像、输出与缓存问题。
-- [文档目录](docs/README.md)：用户指南、技术参考和审计历史的完整入口。
+- [文档目录](docs/README.md)：用户指南和技术参考的完整入口。
+- [开发与维护](CONTRIBUTING.md)：源码结构、测试方法和提交范围。

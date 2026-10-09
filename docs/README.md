@@ -33,29 +33,22 @@
 | --- | --- |
 | [架构说明](ARCHITECTURE.md) | 模块分工、数据流、执行模型及实现边界 |
 | [镜像身份契约](IMAGE_IDENTITY.md) | ImageID、manifest digest、原始 JSON 字节与转存规则 |
-
-## 历史与审计
-
-这里保留实现过程和当时的测试结论。早期示例可能已更新，日常操作以用户指南、兼容表和当前命令的 `--help` 为准。
-
-- [阶段技术记录](PHASE_NOTES.md)
-- [2026-09-29 审计](AUDIT_2026-09-29.md)
-- [2026-09-30 审计](AUDIT_2026-09-30.md)
-- [2026-10-09 审计与后续修复](AUDIT_2026-10-09.md)
+| [开发与维护](../CONTRIBUTING.md) | 测试、目标环境验收与公开仓库提交范围 |
 
 ## 文件放在哪里
 
 ```text
 pyimagebuilder/
 ├── README.md                 项目入口与最短使用路径
+├── CONTRIBUTING.md           开发、测试与提交约定
 ├── main.py / fast.py / ...   程序与独立脚本
 ├── config.example.json      配置模板
 ├── config/                  TongWeb XML 等部署文件
 ├── docs/
 │   ├── README.md             本文档目录
 │   ├── guides/               按任务组织的使用指南
-│   └── *.md                  兼容表、技术参考和历史记录
+│   └── *.md                  兼容表与技术参考
 └── tests/                    回归与目标环境验收脚本
 ```
 
-运行数据位置由配置决定：`data/image-store/`、`cache/layers/`、应用包和输出镜像不应随程序版本反复打包。已有参考文档保留原文件路径，便于旧链接继续使用。
+运行数据位置由配置决定：`data/image-store/`、`cache/layers/`、应用包和输出镜像不应随程序版本反复打包。审计日志和开发过程记录在仓库外保存，正式文档描述当前使用方式与实现边界。
