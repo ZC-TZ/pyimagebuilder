@@ -1,0 +1,39 @@
+# Python 运行产物
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 本机配置、凭据及签名私钥；示例配置可以提交
+config.json
+config.local.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# 镜像库、构建缓存、工作目录及交付产物
+/data/
+/cache/
+/images/
+/workspace/
+/workspaces/
+*.tar
+*.tar.gz
+*.tgz
+*.war
+*.zip
+*.log
+
+# 编辑器与系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini

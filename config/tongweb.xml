@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<tongweb>
+    <!-- 修改访问前缀文根的时候，放开下面的注释即可配置 -->
+    <!-- <apps>
+        <web-app delegate="false" vs-names="localhost" context-root="/xxx" app-root="xxx.war" caching-allowed="true" cache-ttl="5000" cache-object-max-size="100" cache-max-size="2000" deploy-order="100" unload-delay="2000">
+        </web-app>
+    </apps> -->
+    <server shutdown-port="8007">
+        <web-container graceful-stop-await-millis="30000">
+            <virtual-host name="localhost" accesslog-enabled="true"  app-base="autodeploy" auto-deploy="false">
+            </virtual-host>
+
+        <!--  <http-listener name="https" port="8443"  io-mode="nio" ssl-enabled="true" http2-enabled="true">
+                <ssl keystore-file="conf/ssl/tongweb.keystore"
+                     keystore-pass="xxxxxx" keystore-type="JKS"
+                     client-auth="false"
+                     truststore-file="conf/ssl/tongweb.keystore" truststore-pass="xxxxxx" truststore-type="JKS" />
+            </http-listener>-->
+
+        <!--  <http-listener name="https" port="8444"  io-mode="nio" ssl-enabled="true">
+                <ssl   ssl-protocol="GMSSLv1.1"
+                        keystore-type="PKCS12"
+                        keystore-file="conf/ssl/sm2.enc.pfx"
+                        keystore-pass="xxxxxx"
+                        truststore-file="conf/ssl/sm2.sig.pfx"
+                        truststore-pass="xxxxxx"
+                        truststore-type="PKCS12"
+                />
+            </http-listener>-->
+
+            <http-listener port="8081" io-mode="nio" uri-encoding="UTF-8" redirect-port="8443">
+                <protocol max-connections="500" keep-alive-timeout="15000" connection-timeout="5000" max-threads="40" min-spare-threads="15" backlog="10" enable-lookups="false" bind-on-init="false"/>
+                <http-options  max-keep-alive-requests="100" max-http-header-size="8192" disable-upload-timeout="true" compression="on" compression-min-size="1024" no-compression-user-agents="gozilla, traviata" compressable-mime-type="text/html,text/xml,text/javascript,text/css,text/plain" />
+            </http-listener>
+        </web-container>
+
+        <monitor-service monitoring-enabled="true"  service-info="type:prometheus,context-root:/monitor,request-url:/prometheus">
+            <monitor-config name="Memory" monitoring-enabled="true"/>
+            <monitor-config name="JVMMemoryPool"/>
+            <monitor-config name="GarbageCollector"/>
+            <monitor-config name="JVMThread"/>
+            <monitor-config name="Compilation"/>
+            <monitor-config name="ClassLoading"/>
+            <monitor-config name="Runtime"/>
+            <monitor-config name="OperatingSystem"/>
+            <monitor-config name="TWServer"/>
+            <monitor-config name="ConnectorAndThreadPool"/>
+            <monitor-config name="DataSource"/>
+            <monitor-config name="WebModule"/>
+            <monitor-config name="SessionManager"/>
+            <monitor-config name="Loader"/>
+            <monitor-config name="ResourceCache"/>
+            <monitor-config name="Request">
+                <property name="clearSlowRequestSwitch" value="true"/>
+                <property name="clearSlowRequestPeriod" value="600"/>
+                <property name="slowRequestTime" value="5"/>
+            </monitor-config>
+        </monitor-service>
+
+
+<!--     <jdbc-connection-pool link-name="jdbc/myDataSource" name="jdbc/myDataSource" bundle-app="true"
+         factory="com.tongweb.web.jdbc.pool.DataSourceFactory"
+         driver-class="com.tencentcloud.tdsql.mysql.cj.jdbc.Driver"
+         driver-jar="tdsql-mysql-connector-java8-1.4.6.jar"
+         jdbc-url=""
+         user-name="xxxxxx" jummqilx="xxxxxx"
+         initial-size="5" max-active="10" min-idle="2" max-wait="15000"
+         validation-query="SELECT 1" validation-query-timeout="1"
+         test-on-borrow="true" test-on-connect="false" test-on-return="false"
+         test-while-idle="true" validation-interval="1000"
+         time-between-eviction-runs="60000" min-evictable-idle-time="600000" max-age="900000" remove-abandoned="false"
+         remove-abandoned-timeout="300" sql-log="false" log-on-excute-time="20" default-auto-commit="true"
+         jdbc-interceptors="com.tongweb.web.jdbc.pool.interceptor.ConnectionState;com.tongweb.web.jdbc.pool.interceptor.StatementFinalizer"
+        />-->
+
+<!--     <jdbc-connection-pool link-name="jdbc/myDataSource" name="jdbc/myDataSource" bundle-app="true"
+         factory="com.tongweb.web.jdbc.pool.DataSourceFactory"
+         driver-class="com.mysql.cj.jdbc.Driver"
+         driver-jar="mysql-connector-java-8.0.31.jar"
+         jdbc-url=""
+         user-name="xxxxxx" jummqilx="xxxxxx"
+         initial-size="5" max-active="10" min-idle="2" max-wait="15000"
+         validation-query="SELECT 1" validation-query-timeout="1"
+         test-on-borrow="true" test-on-connect="false" test-on-return="false"
+         test-while-idle="true" validation-interval="1000"
+         time-between-eviction-runs="60000" min-evictable-idle-time="600000" max-age="900000" remove-abandoned="false"
+         remove-abandoned-timeout="300" sql-log="false" log-on-excute-time="20" default-auto-commit="true"
+         jdbc-interceptors="com.tongweb.web.jdbc.pool.interceptor.ConnectionState;com.tongweb.web.jdbc.pool.interceptor.StatementFinalizer"
+        />-->
+
+<!--     <jdbc-connection-pool link-name="jdbc/myDataSource" name="jdbc/myDataSource" bundle-app="true"
+         factory="com.tongweb.web.jdbc.pool.DataSourceFactory"
+         driver-class="org.postgresql.Driver"
+         driver-jar="gsjdbc4.jar"
+         jdbc-url=""
+         user-name="xxxxxx" jummqilx="xxxxxx"
+         initial-size="5" max-active="10" min-idle="2" max-wait="15000"
+         validation-query="SELECT 1" validation-query-timeout="1"
+         test-on-borrow="true" test-on-connect="false" test-on-return="false"
+         test-while-idle="true" validation-interval="1000"
+         time-between-eviction-runs="60000" min-evictable-idle-time="600000" max-age="900000" remove-abandoned="false"
+         remove-abandoned-timeout="300" sql-log="false" log-on-excute-time="20" default-auto-commit="true"
+         jdbc-interceptors="com.tongweb.web.jdbc.pool.interceptor.ConnectionState;com.tongweb.web.jdbc.pool.interceptor.StatementFinalizer"
+        />-->
+<!--     <jdbc-connection-pool link-name="jdbc/myDataSource" name="jdbc/myDataSource" bundle-app="true"
+         factory="com.tongweb.web.jdbc.pool.DataSourceFactory"
+         driver-class="org.postgresql.Driver"
+         driver-jar="gsjdbc-505.0.0.SPC0500.jar"
+         jdbc-url=""
+         user-name="xxxxxx" jummqilx="xxxxxx"
+         initial-size="5" max-active="10" min-idle="2" max-wait="15000"
+         validation-query="SELECT 1" validation-query-timeout="1"
+         test-on-borrow="true" test-on-connect="false" test-on-return="false"
+         test-while-idle="true" validation-interval="1000"
+         time-between-eviction-runs="60000" min-evictable-idle-time="600000" max-age="900000" remove-abandoned="false"
+         remove-abandoned-timeout="300" sql-log="false" log-on-excute-time="20" default-auto-commit="true"
+         jdbc-interceptors="com.tongweb.web.jdbc.pool.interceptor.ConnectionState;com.tongweb.web.jdbc.pool.interceptor.StatementFinalizer"
+        />-->
+
+    </server>
+</tongweb>

@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 2,
+  "cache": {
+    "imageStore": "./data/image-store",
+    "layerCache": "./cache/layers"
+  },
+  "repositories": {
+    "nmkf.zpk.abc": {
+      "source": "artifactory",
+      "username": "robot-account",
+      "passwordEnv": "PYIMAGEBUILDER_ARTIFACTORY_PASSWORD"
+    },
+    "harbor.internal": {
+      "source": "registry",
+      "username": "robot-account",
+      "passwordEnv": "PYIMAGEBUILDER_REGISTRY_PASSWORD"
+    }
+  },
+  "fast": {
+    "defaultProfile": "tongweb",
+    "profiles": {
+      "tongweb": {
+        "flavor": "tongweb",
+        "baseImage": "nmkf.zpk.abc/repo/tongweb:11",
+        "baseUrl": "https://nmkf.zpk.abc/repo/tongweb:11",
+        "owner": "tongadmin:tonggrp",
+        "deployDir": "/soft/TongWeb7.0/autodeploy",
+        "serverConfig": "./config/tongweb.xml",
+        "outputDir": "./images"
+      },
+      "tomcat": {
+        "flavor": "tomcat",
+        "baseImage": "nmkf.zpk.abc/repo/tomcat:9",
+        "baseUrl": "https://nmkf.zpk.abc/repo/tomcat:9",
+        "owner": "tomcat:tomcat",
+        "deployDir": "/soft/tomcat/webapps",
+        "outputDir": "./images"
+      }
+    }
+  }
+}
