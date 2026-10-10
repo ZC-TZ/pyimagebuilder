@@ -112,3 +112,9 @@ flatten 确实改变了层链，会更新 DiffID/config/ImageID 和 manifest，�
 新配置和外层归档时间使用 `--source-date-epoch`，缺省取 SOURCE_DATE_EPOCH 或 0；文件 mtime 保留输入值。同样的输入、标签、配置变更、格式和 epoch 得到相同产物。输出先写私有临时目录并验证，再排他发布；失败清理本次临时文件，不覆盖已有或竞争创建的输出。
 
 查看完整参数：`python main.py export --help`、`import --help`、`flatten --help`。
+
+## 硬链接与权限
+
+export 与 flatten 以可见 inode 分组输出硬链接，使用 inode 的最终 UID/GID、mode、mtime 与 PAX 扩展属性。硬链接头更新权限时，同 inode 的所有名字一起更新；原路径被后续层覆盖或删除后，存活的别名仍保留原内容及权限。同一层被重复应用时，重新写入的普通文件是新 inode，不与旧别名重新合并。
+
+上述行为参照 [containerd 的层解包实现](https://github.com/containerd/containerd/blob/main/pkg/archive/tar.go)。权限更新中的 chown 会清除旧的 security.capability，除非当前链接头显式重新设置该属性；归档保留能力与真实 Linux RUN 能否物化该属性须分别验证。

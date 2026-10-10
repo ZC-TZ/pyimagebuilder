@@ -1,5 +1,6 @@
 """以虚拟索引应用 OCI 层和 whiteout，不把 rootfs 解包到宿主磁盘。"""
 
+import copy
 import posixpath
 import tarfile
 from dataclasses import dataclass
@@ -8,12 +9,36 @@ from errors import ArchiveError
 
 
 @dataclass
+class Inode:
+    """共享文件元数据；内容成员固定后，链接头仍可改变整个 inode 的权限。"""
+    metadata: object
+
+    def apply_link(self, member):
+        """应用链接头的 inode 属性，保留未覆盖的普通扩展属性。"""
+        updated = copy.copy(member)
+        # 链接不重新创建文件，未覆盖的普通 xattr 仍在 inode 上。
+        # 物化时 lchown 会清除旧 capability，因此不能把该属性从旧头恢复回来。
+        attrs = {key: value for key, value in self.metadata.pax_headers.items()
+                 if key.startswith("SCHILY.xattr.") and key != "SCHILY.xattr.security.capability"}
+        updated.pax_headers = dict(member.pax_headers)
+        attrs.update(updated.pax_headers)
+        updated.pax_headers = attrs
+        self.metadata = updated
+
+
+@dataclass
 class Entry:
-    """记录可见路径的类型及其实际内容所在的层成员；硬链接固定到原始内容。"""
+    """记录可见路径及固定内容位置；硬链接共享 inode 的最终元数据。"""
     kind: str
     linkname: str = ""
     layer: str = ""
     member: str = ""
+    inode: object = None
+
+    @property
+    def metadata(self):
+        """返回文件 inode 的最终元数据，不能用内容成员头替代。"""
+        return self.inode.metadata if self.inode is not None else None
 
 
 def clean_path(name):
@@ -118,7 +143,7 @@ class RootFSIndex:
         """先应用本层 whiteout，再登记新增条目，最后解析硬链接内容。
 
         whiteout 只遮蔽下层内容，不删除同层新增文件；硬链接固定实际成员，
-        避免后续覆盖目标路径时错误改变旧链接的可读字节。
+        避免后续覆盖目标路径时错误改变旧链接的字节；链接头更新共享 inode 属性。
         """
         with tarfile.open(layer_path, "r:") as archive:
             members = []
@@ -160,7 +185,8 @@ class RootFSIndex:
                 else:
                     self._remove(path)
                     if member.isfile():
-                        entry = Entry("file", layer=str(layer_path), member=member.name)
+                        entry = Entry("file", layer=str(layer_path), member=member.name,
+                                      inode=Inode(member))
                     elif member.issym():
                         entry = Entry("symlink", member.linkname, str(layer_path), member.name)
                     elif member.islnk():
@@ -172,24 +198,29 @@ class RootFSIndex:
                         # 导出/扁平化仍需原始 FIFO、设备节点的类型和设备号；不在宿主创建它们。
                         entry = Entry("other", layer=str(layer_path), member=member.name)
                 self.entries[path] = entry
-            # 后续层替换目标路径不会改变旧硬链接所引用的字节，
-            # 因此此时固定实际的层成员，后续读取不再追踪目标路径。
-            for path, member in members:
-                if not member.islnk():
-                    continue
+            links = {path: member for path, member in members if member.islnk()}
+            targets = {path: clean_path(member.linkname.lstrip("/"))
+                       for path, member in links.items()}
+            ready, waiting = [], {}
+            for path, target in targets.items():
+                if target in links:
+                    waiting.setdefault(target, []).append(path)
+                else:
+                    ready.append(path)
+            # 与物化器使用相同的依赖顺序：固定内容，同时共享可变 inode 元数据。
+            # 再次应用同一层的普通文件仍创建新 inode，不能按内容成员把旧别名合并。
+            completed = 0
+            for path in ready:
+                backing = self.entries.get(targets[path])
+                if backing is None:
+                    raise ArchiveError("Hardlink target missing in layer: " + path)
+                if backing.kind not in ("file", "hardlink") or backing.inode is None:
+                    raise ArchiveError("Hardlink target is not a file: " + path)
                 entry = self.entries[path]
-                target = clean_path(entry.linkname.lstrip("/"))
-                seen_links = {path}
-                while True:
-                    if target in seen_links:
-                        raise ArchiveError("Cyclic hardlink in layer: " + path)
-                    seen_links.add(target)
-                    backing = self.entries.get(target)
-                    if backing is None:
-                        raise ArchiveError("Hardlink target missing in layer: " + path)
-                    if backing.kind == "file" or (backing.kind == "hardlink" and backing.layer):
-                        entry.layer, entry.member = backing.layer, backing.member
-                        break
-                    if backing.kind != "hardlink":
-                        raise ArchiveError("Hardlink target is not a file: " + path)
-                    target = clean_path(backing.linkname.lstrip("/"))
+                entry.layer, entry.member, entry.inode = backing.layer, backing.member, backing.inode
+                entry.inode.apply_link(links[path])
+                completed += 1
+                ready.extend(waiting.get(path, ()))
+            if completed != len(links):
+                pending = set(links) - set(ready)
+                raise ArchiveError("Cyclic hardlink in layer: " + next(iter(pending)))

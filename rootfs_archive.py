@@ -141,20 +141,21 @@ def merge_rootfs(layers, output, reporter=None):
                 if entry.layer:
                     archive = opened.get(entry.layer)
                     member = metadata[(entry.layer, entry.member)]
-                    info = _header(member, name)
+                    info = _header(entry.metadata or member, name)
                 else:
                     archive = None
                     info = tarfile.TarInfo(name)
                     info.type = tarfile.DIRTYPE
                     info.mode = 0o755
                 if entry.kind in ("file", "hardlink"):
-                    key = (entry.layer, entry.member)
+                    key = id(entry.inode)
                     if key in inodes:
                         info.type, info.linkname, info.size = tarfile.LNKTYPE, inodes[key], 0
                         target.addfile(info)
                     else:
                         inodes[key] = name
                         info.type, info.linkname = tarfile.REGTYPE, ""
+                        info.size = member.size
                         stream = archive.extractfile(member)
                         if stream is None:
                             raise ArchiveError("Unreadable rootfs file: " + name)

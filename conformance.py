@@ -272,6 +272,8 @@ def _layer_tree(layers):
                 if xattrs:
                     data["xattrs"] = xattrs
                 if kind == "file":
+                    # 每次写普通文件都是新 inode；内容摘要相同不代表与旧别名共享权限。
+                    data["_inode"] = object()
                     stream = archive.extractfile(member)
                     if stream is None:
                         raise ArchiveError("Unreadable regular file: " + name)
@@ -286,23 +288,40 @@ def _layer_tree(layers):
                     data["devmajor"] = member.devmajor
                     data["devminor"] = member.devminor
                 tree[name] = data
-            # 在本层全部路径登记后解析前向链接；固定内容摘要，后续层覆盖目标不改旧别名。
-            for name in hardlinks:
-                target = _path(tree[name]["target"].lstrip("/"))
-                visited = {name}
-                while True:
-                    if target in visited:
-                        raise ArchiveError("Cyclic hardlink in layer: " + name)
-                    visited.add(target)
+            # 独立验收按依赖扫描，而不调用生产索引的解析器。完成链接时，其头的权限
+            # 作用于所有仍可见的同 inode 名字；字节摘要固定到当时目标，不再追踪路径。
+            pending = dict.fromkeys(hardlinks)
+            ready = [name for name in hardlinks
+                     if _path(tree[name]["target"].lstrip("/")) not in pending]
+            while pending:
+                if not ready:
+                    raise ArchiveError("Cyclic hardlink in layer: " + next(iter(pending)))
+                batch, ready = ready, []
+                for name in batch:
+                    data = tree[name]
+                    target = _path(data["target"].lstrip("/"))
                     linked = tree.get(target)
                     if linked is None:
                         raise ArchiveError("Hardlink target missing in layer: " + name)
                     if linked["type"] not in ("file", "hardlink"):
                         raise ArchiveError("Hardlink target is not a file: " + name)
-                    if "sha256" in linked:
-                        tree[name]["sha256"], tree[name]["size"] = linked["sha256"], linked["size"]
-                        break
-                    target = _path(linked["target"].lstrip("/"))
+                    data["sha256"], data["size"] = linked["sha256"], linked["size"]
+                    data["_inode"] = linked["_inode"]
+                    attrs = dict(linked.get("xattrs", {}))
+                    attrs.pop("security.capability", None)
+                    attrs.update(data.get("xattrs", {}))
+                    for alias in tree.values():
+                        if alias.get("_inode") is data["_inode"]:
+                            alias.update({key: data[key] for key in ("uid", "gid", "mode")})
+                            if attrs:
+                                alias["xattrs"] = dict(attrs)
+                            else:
+                                alias.pop("xattrs", None)
+                    del pending[name]
+                    ready.extend(child for child in pending
+                                 if _path(tree[child]["target"].lstrip("/")) == name)
+    for data in tree.values():
+        data.pop("_inode", None)
     return tree
 
 

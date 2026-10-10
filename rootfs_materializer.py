@@ -105,8 +105,11 @@ class RootFSMaterializer:
                 try:
                     os.setxattr(path, key[len("SCHILY.xattr."):], value.encode("utf-8"),
                                 follow_symlinks=False)
-                except OSError as exc:
-                    raise BuildError("Cannot preserve xattr for {}: {}".format(path, exc)) from exc
+                except (OSError, UnicodeError, AttributeError) as exc:
+                    # tarfile 可用 surrogate 表示非 UTF-8 的 PAX 值；当前 RUN 路径
+                    # 不支持该编码，必须明确失败，不能漏掉权限属性或泄漏原始 traceback。
+                    raise BuildError("Cannot preserve xattr {} for {}: {}".format(
+                        key[len("SCHILY.xattr."):], path, exc)) from exc
 
     def apply(self, layer_path):
         """应用镜像层并保留元数据，始终检查 rootfs 路径边界。"""

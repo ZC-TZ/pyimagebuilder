@@ -391,6 +391,10 @@ class LayerBuilder:
                 self._reserve(target, kind, added)
                 info = self._info(target, member.mode, member.mtime, member.uid, member.gid,
                                   ownership, chmod)
+                # 归档解包应保留 xattr；不能复制 path/uid/mtime 等 PAX 覆盖项，
+                # 否则旧头会撤销 --chown、--chmod 或固定 epoch 的结果。
+                info.pax_headers = {key: value for key, value in member.pax_headers.items()
+                                    if key.startswith("SCHILY.xattr.")}
                 if member.isdir():
                     info.name += "/"
                     info.type = tarfile.DIRTYPE
@@ -560,6 +564,8 @@ class LayerBuilder:
             entry = source_rootfs.entries.get(path)
             if entry is None:
                 raise BuildError("Source disappeared from prior stage: /" + path)
+            if entry.metadata is not None:
+                return entry.metadata
             if not entry.layer:
                 return None
             with tarfile.open(entry.layer, "r:") as original:
@@ -587,15 +593,15 @@ class LayerBuilder:
             kind = "dir" if entry.kind == "dir" else "file"
             self._reserve(output, kind, added)
             original_info = member_info(source)
-            if entry.kind == "hardlink":
-                data_entry = file_entry(source)
-                with tarfile.open(data_entry.layer, "r:") as original:
-                    original_info = original.getmember(data_entry.member)
             mode = original_info.mode if original_info else 0o755
             mtime = original_info.mtime if original_info else 0
             uid = original_info.uid if original_info else 0
             gid = original_info.gid if original_info else 0
             info = self._info(output, mode, mtime, uid, gid, ownership, transfer.chmod)
+            if original_info is not None:
+                # 只复制 xattr，源 PAX 的路径、大小或时间不能覆盖目标和固定 epoch。
+                info.pax_headers = {key: value for key, value in original_info.pax_headers.items()
+                                    if key.startswith("SCHILY.xattr.")}
             if entry.kind == "dir":
                 info.name += "/"
                 info.type = tarfile.DIRTYPE
