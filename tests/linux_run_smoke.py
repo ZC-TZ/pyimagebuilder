@@ -3,6 +3,7 @@
 
 import argparse
 import io
+import os
 import sys
 import tarfile
 import tempfile
@@ -60,6 +61,36 @@ def main():
                 expected_ownership = (0, 0) if args.sandbox == "rootless" else (123, 456)
                 if (marker.uid, marker.gid, marker.mode) != (*expected_ownership, 0o700):
                     raise BuildError("COPY ownership or mode is incorrect")
+
+        # 在严格宿主 umask 下删除基础 /tmp，再验证执行器补建目录及非 root 写入。
+        # rootless 单映射模式继续使用镜像 0:0，检查其宿主 umask 隔离。
+        run_owner = (0, 0) if args.sandbox == "rootless" else (12345, 23456)
+        dockerfile.write_text(
+            "FROM {}\nUSER 0:0\nRUN rm -rf /tmp\n"
+            "USER {}:{}\nRUN umask 077; printf permissions-ok > /tmp/permission-result\n".format(
+                args.reference, *run_owner), encoding="utf-8")
+        permissions = root / "permissions.tar"
+        previous_umask = os.umask(0o077)
+        try:
+            build(dockerfile, context, args.base_tar, None, "pyimagebuilder/smoke:permissions",
+                  permissions, enable_run=True, workspace_dir=args.workspace,
+                  run_sandbox=args.sandbox)
+        finally:
+            os.umask(previous_umask)
+        with tempfile.TemporaryDirectory(dir=args.workspace) as unpacked:
+            image = ImageArchiveReader(permissions, Path(unpacked)).read("pyimagebuilder/smoke:permissions")
+            index = RootFSIndex()
+            for layer in image.layers:
+                index.apply_layer(layer)
+            if index.read_file("/tmp/permission-result") != b"permissions-ok":
+                raise BuildError("RUN cannot write to a newly created /tmp")
+            for name, owner, mode in (("tmp", (0, 0), 0o1777),
+                                      ("tmp/permission-result", run_owner, 0o600)):
+                entry = index.entries[name]
+                with tarfile.open(entry.layer) as archive:
+                    member = archive.getmember(entry.member)
+                    if (member.uid, member.gid, member.mode) != (*owner, mode):
+                        raise BuildError("RUN permission metadata is incorrect: " + name)
         dockerfile.write_text("FROM {}\nUSER 0\nRUN false\n".format(args.reference), encoding="utf-8")
         failure = root / "failure.tar"
         try:
@@ -72,7 +103,7 @@ def main():
             raise BuildError("RUN false unexpectedly succeeded")
         if failure.exists():
             raise BuildError("Failed build published an output tar")
-    print("Linux smoke test passed ({}): COPY metadata, ADD, RUN, whiteout, nonzero exit".format(args.sandbox))
+    print("Linux smoke test passed ({}): COPY metadata, ADD, RUN, whiteout, permissions, nonzero exit".format(args.sandbox))
     return 0
 
 

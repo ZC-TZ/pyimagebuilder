@@ -163,7 +163,8 @@ class FilesystemSemanticsTests(unittest.TestCase):
                 write_layer(second, [("alias-a", "link", "alias-b"), ("alias-b", "link", "original")])
                 write_layer(third, [("original", "file", b"replacement")])
                 index = RootFSIndex()
-                materializer = RootFSMaterializer(root / "rootfs")
+                with patch.object(RootFSMaterializer, "_metadata"):
+                    materializer = RootFSMaterializer(root / "rootfs")
                 # Windows 上实际创建文件和硬链接，仅跳过 Linux 属主/xattr 元数据调用。
                 with patch.object(materializer, "_metadata"):
                     for layer in (first, second, third):
@@ -183,7 +184,8 @@ class FilesystemSemanticsTests(unittest.TestCase):
             write_layer(layer, [("original", "file", b"data"), ("alias", "link", "/original")])
             index = RootFSIndex()
             index.apply_layer(layer)
-            materializer = RootFSMaterializer(root / "rootfs")
+            with patch.object(RootFSMaterializer, "_metadata"):
+                materializer = RootFSMaterializer(root / "rootfs")
             with patch.object(materializer, "_metadata"):
                 materializer.apply(layer)
             self.assertEqual((materializer.root / "alias").read_bytes(), index.read_file("alias"))
@@ -247,7 +249,8 @@ class FilesystemSemanticsTests(unittest.TestCase):
             first, second = root / "first.tar", root / "cycle.tar"
             write_layer(first, [("a", "file", b"old a"), ("b", "file", b"old b")])
             write_layer(second, [("a", "link", "b"), ("b", "link", "a")])
-            materializer = RootFSMaterializer(root / "rootfs")
+            with patch.object(RootFSMaterializer, "_metadata"):
+                materializer = RootFSMaterializer(root / "rootfs")
             with patch.object(materializer, "_metadata"):
                 materializer.apply(first)
                 with self.assertRaises(ArchiveError):

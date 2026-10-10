@@ -33,6 +33,10 @@ WSL 内也要有 Python 及内核挂载能力。它不是自动安装步骤。�
 
 rootless 不自动解决任意镜像权限；不能满足条件时会报错。执行模型与目标内核验收见 [架构说明](../ARCHITECTURE.md)，本机 Windows 尚未验证真实 Linux RUN。
 
+root 模式每次执行都会设置镜像用户的附加组、GID、UID；未写 USER 也不会沿用宿主组。rootless 只允许解析结果为 0:0 且没有附加组，不调用 user namespace 禁止的 setgroups；物化属主会落实为宿主当前用户及主组，避免继承 setgid 工作目录的其他组。物化时自动补建的根目录及父目录默认为 0:0、0755；新建 `/tmp` 为 0:0、1777，权限显式恢复以排除宿主 umask 的影响。已有镜像目录保持原元数据。`conformance.py linux` 的冒烟脚本包含 umask=077 下重建 `/tmp` 的检查，root 模式还验证非 root 用户能够写入；这些真实内核检查需要在目标 Linux/WSL 环境运行。
+
+OverlayFS upper 根目录会复制物化 rootfs 根目录的属主和权限。内核使用 upper 的目录元数据，不能仅修正 lower 后就假定非 root 用户可访问合并根目录；详见 [Linux OverlayFS 目录规则](https://docs.kernel.org/filesystems/overlayfs.html#directories)。
+
 ### cache / secret mount
 
 ```dockerfile

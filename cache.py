@@ -14,9 +14,9 @@ from compat import is_linked_directory
 from image_reader import digest_hex, sha256_file, verify_layer_tar
 
 
-# 旧条目可能包含忽略 COPY/ADD 目录属主、权限的层，必须重新执行指令。
-# 更早版本还缺少完整 tar 结构校验，因此不能沿用旧条目的可信身份。
-CACHE_VERSION = 9
+# 旧 RUN 层可能依赖宿主组、错误的附加组或被 umask 削减的 /tmp 权限。
+# 更早版本还遗漏 COPY/ADD 目录元数据和完整 tar 校验，不能复用旧指令层。
+CACHE_VERSION = 10
 
 
 def cache_key(*values):

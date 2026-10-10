@@ -14,6 +14,7 @@ from pathlib import Path
 from compat import is_linked_directory
 from errors import ArchiveError, BuildError, UnsupportedInstruction
 from image_reader import sha256_file
+from image_identity import checked_identity_id
 from rootfs import clean_path
 
 
@@ -145,7 +146,7 @@ def resolve_chown(value, rootfs):
     if not user or (separator and not group):
         raise BuildError("Invalid --chown value: " + value)
     if user.isdecimal():
-        uid = int(user)
+        uid = checked_identity_id(user, "UID")
         primary_gid = uid
     else:
         uid = None
@@ -153,19 +154,19 @@ def resolve_chown(value, rootfs):
             fields = line.split(":")
             if (len(fields) >= 4 and fields[0] == user and
                     fields[2].isdecimal() and fields[3].isdecimal()):
-                uid = int(fields[2])
-                primary_gid = int(fields[3])
+                uid = checked_identity_id(fields[2], "passwd UID")
+                primary_gid = checked_identity_id(fields[3], "passwd GID")
                 break
         if uid is None:
             raise BuildError("--chown user not found in image: " + user)
     if not separator:
         return uid, primary_gid
     if group.isdecimal():
-        return uid, int(group)
+        return uid, checked_identity_id(group, "GID")
     for line in _identity_file(rootfs, "etc/group").splitlines():
         fields = line.split(":")
         if len(fields) >= 3 and fields[0] == group and fields[2].isdecimal():
-            return uid, int(fields[2])
+            return uid, checked_identity_id(fields[2], "group GID")
     raise BuildError("--chown group not found in image: " + group)
 
 

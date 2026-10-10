@@ -75,7 +75,8 @@ class LayerValidationBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             layer = layer_at(root / "bad.tar", self.conflicting_entries(child_kind=tarfile.LNKTYPE))
-            materializer = RootFSMaterializer(root / "rootfs")
+            with patch.object(RootFSMaterializer, "_metadata"):
+                materializer = RootFSMaterializer(root / "rootfs")
             with patch.object(materializer, "_metadata"), self.assertRaisesRegex(ArchiveError, "non-directory"):
                 materializer.apply(layer)
             self.assertEqual(list(materializer.root.iterdir()), [])
@@ -143,7 +144,8 @@ class LayerValidationBoundaryTests(unittest.TestCase):
             self.assertEqual(index.kind("parent"), "file")
             self.assertIsNone(index.kind("parent/child"))
             self.assertEqual(index.read_file("/parent"), b"new")
-            materializer = RootFSMaterializer(root / "rootfs")
+            with patch.object(RootFSMaterializer, "_metadata"):
+                materializer = RootFSMaterializer(root / "rootfs")
             with patch.object(materializer, "_metadata"):
                 for layer in (lower, upper):
                     materializer.apply(layer)

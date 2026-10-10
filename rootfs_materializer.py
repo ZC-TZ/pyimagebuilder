@@ -16,7 +16,22 @@ class RootFSMaterializer:
     def __init__(self, root, rootless=False):
         self.root = Path(root).resolve()
         self.rootless = rootless
+        created = not self.root.exists()
         self.root.mkdir(parents=True, exist_ok=True)
+        if created:
+            if hasattr(os, "chown"):
+                self._default_directory_metadata(self.root)
+            else:
+                # Windows 文件树测试不能设置 POSIX 属主；真实 RUN 由 Linux 入口限定。
+                self.root.chmod(0o755)
+
+    def _default_directory_metadata(self, path):
+        """为未显式声明的镜像目录设置默认值，避免继承宿主 umask 或组。"""
+        member = tarfile.TarInfo(path.name)
+        member.type = tarfile.DIRTYPE
+        member.mode = 0o755
+        member.uid = member.gid = member.mtime = 0
+        self._metadata(path, member)
 
     def _real(self, image_path, follow_final=False):
         """在镜像 root 内解析符号链接，包括镜像中的绝对路径链接。"""
@@ -55,7 +70,10 @@ class RootFSMaterializer:
             current = self._real("/".join(parts[:index]), follow_final=True)
             if current.exists() and not current.is_dir():
                 raise ArchiveError("Non-directory rootfs parent: " + str(current))
+            created = not current.exists()
             current.mkdir(exist_ok=True)
+            if created:
+                self._default_directory_metadata(current)
 
     def _remove(self, image_path):
         path = self._real(image_path)
@@ -71,6 +89,10 @@ class RootFSMaterializer:
             if self.rootless:
                 if member.uid != 0 or member.gid != 0:
                     raise BuildError("Rootless RUN supports only uid/gid 0 in image layers: " + str(path))
+                if hasattr(os, "chown"):
+                    # setgid 父目录可使新节点继承另一个宿主组；单 GID 映射只允许主组。
+                    # 所有者仍是当前用户，非 root 也可将自己文件的组改为自己的主组。
+                    os.chown(path, os.geteuid(), os.getegid(), follow_symlinks=False)
             else:
                 os.chown(path, member.uid, member.gid, follow_symlinks=False)
             if not symlink:

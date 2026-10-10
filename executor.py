@@ -8,6 +8,7 @@ import traceback
 from pathlib import Path
 
 from errors import BuildError, UnsupportedInstruction
+from image_identity import checked_identity_id
 from overlay import mount
 from sandbox import install_filter
 
@@ -111,51 +112,59 @@ def _prepare_devices(merged, rootless=False):
         os.symlink("/proc/self/fd/{}".format(number), devices / name)
 
 
-def _resolve_user(value):
-    user, separator, group = value.partition(":")
-    passwd = {}
-    names_by_uid = {}
+def _identity_records(path, minimum_fields, id_fields):
+    """读取镜像内账户记录，保留原始顺序并拒绝无效的数值身份。"""
+    records = []
     try:
-        with open("/etc/passwd", encoding="utf-8") as stream:
+        with open(path, encoding="utf-8") as stream:
             for line in stream:
-                fields = line.rstrip("\n").split(":")
-                if len(fields) >= 4:
-                    pair = int(fields[2]), int(fields[3])
-                    passwd[fields[0]] = pair
-                    names_by_uid[pair[0]] = fields[0]
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.split(":")
+                if len(fields) < minimum_fields:
+                    continue
+                for index in id_fields:
+                    fields[index] = checked_identity_id(fields[index], path + " ID")
+                records.append(fields)
     except FileNotFoundError:
         pass
+    except (OSError, UnicodeError) as exc:
+        raise BuildError("Cannot read image identity file {}: {}".format(path, exc)) from exc
+    return records
+
+
+def _resolve_user(value):
+    """按镜像账户解析 RUN 身份；数字 UID 和具名用户均使用首个匹配记录。"""
+    user, separator, group = (value or "0").partition(":")
+    if not user or (separator and not group):
+        raise BuildError("Invalid image USER: " + value)
+    passwd = _identity_records("/etc/passwd", 4, (2, 3))
     if user.isdecimal():
-        uid = int(user)
-        gid = next((pair[1] for pair in passwd.values() if pair[0] == uid), 0)
-    elif user in passwd:
-        uid, gid = passwd[user]
+        uid = checked_identity_id(user, "UID")
+        matched = next((fields for fields in passwd if fields[2] == uid), None)
+        gid = matched[3] if matched is not None else 0
     else:
-        raise BuildError("USER not found in image /etc/passwd: " + user)
-    effective_name = names_by_uid.get(uid)
+        matched = next((fields for fields in passwd if fields[0] == user), None)
+        if matched is None:
+            raise BuildError("USER not found in image /etc/passwd: " + user)
+        uid, gid = matched[2:4]
+    # 附加组属于匹配到的账户名，不能经 UID 反查另一个同 UID 的账户。
+    effective_name = matched[0] if matched is not None else None
     supplementary = []
     if separator:
         if group.isdecimal():
-            gid = int(group)
+            gid = checked_identity_id(group, "GID")
         else:
-            try:
-                with open("/etc/group", encoding="utf-8") as stream:
-                    groups = {line.split(":")[0]: int(line.split(":")[2]) for line in stream
-                              if len(line.split(":")) >= 3}
-                gid = groups[group]
-            except (FileNotFoundError, KeyError) as exc:
-                raise BuildError("Group not found in image /etc/group: " + group) from exc
+            matched_group = next((fields for fields in _identity_records("/etc/group", 3, (2,))
+                                  if fields[0] == group), None)
+            if matched_group is None:
+                raise BuildError("Group not found in image /etc/group: " + group)
+            gid = matched_group[2]
     elif effective_name:
-        try:
-            with open("/etc/group", encoding="utf-8") as stream:
-                for line in stream:
-                    fields = line.rstrip("\n").split(":")
-                    if len(fields) >= 4 and effective_name in fields[3].split(","):
-                        number = int(fields[2])
-                        if number != gid:
-                            supplementary.append(number)
-        except FileNotFoundError:
-            pass
+        for fields in _identity_records("/etc/group", 4, (2,)):
+            if effective_name in fields[3].split(",") and fields[2] != gid:
+                supplementary.append(fields[2])
     return uid, gid, sorted(set(supplementary))
 
 
@@ -251,6 +260,13 @@ class RunExecutor:
                     raise BuildError("Image /tmp must not be a symlink during RUN setup")
                 if not temporary.exists():
                     temporary.mkdir(mode=0o1777)
+                    # mkdir 的 mode 会被宿主 umask 削减，必须恢复 world-write 和 sticky 位。
+                    # 有特定权限的已有 /tmp 保持镜像配置，不擅自放宽权限。
+                    if self.sandbox != "rootless":
+                        os.chown(temporary, 0, 0)
+                    temporary.chmod(0o1777)
+                elif not temporary.is_dir():
+                    raise BuildError("Image /tmp must be a directory during RUN setup")
                 _prepare_devices(merged, self.sandbox == "rootless")
                 runner = os.fork()
                 if runner == 0:
@@ -261,14 +277,14 @@ class RunExecutor:
                         if self.sandbox != "legacy":
                             _no_new_privileges()
                             _drop_bounding_capabilities()
-                        if user:
-                            uid, gid, groups = _resolve_user(user)
-                            if self.sandbox == "rootless" and (uid != 0 or gid != 0 or groups):
-                                raise BuildError("Rootless RUN supports only image USER 0:0")
-                            if self.sandbox != "rootless":
-                                os.setgroups(groups)
-                                os.setgid(gid)
-                                os.setuid(uid)
+                        # 未写 USER 也需要按镜像 UID 0 解析并重置组，不能继承宿主组权限。
+                        uid, gid, groups = _resolve_user(user)
+                        if self.sandbox == "rootless" and (uid != 0 or gid != 0 or groups):
+                            raise BuildError("Rootless RUN supports only image USER 0:0")
+                        if self.sandbox != "rootless":
+                            os.setgroups(groups)
+                            os.setgid(gid)
+                            os.setuid(uid)
                         if self.sandbox != "legacy":
                             _clear_capabilities()
                             install_filter()

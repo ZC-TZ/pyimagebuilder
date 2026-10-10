@@ -11,6 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from builder import build
+from errors import BuildError
 from image_reader import ImageArchiveReader
 from layer import LayerBuilder
 from rootfs import RootFSIndex
@@ -106,6 +107,19 @@ class TransferDirectoryMetadataTests(unittest.TestCase):
                             "COPY --chown=1001:2001 --chmod=0750 file /app/private/file\n")
         self.assertEqual(self._metadata(index, "/app"), (3001, 4001, 0o755))
         self.assertEqual(self._metadata(index, "/app/private"), (1001, 2001, 0o750))
+
+    def test_chown_rejects_out_of_range_numeric_ids(self):
+        for owner in ("2147483648", "1001:2147483648"):
+            with self.subTest(owner=owner), self.assertRaises(BuildError):
+                self._build("FROM scratch\nCOPY --chown={} file /file\n".format(owner))
+            self.assertFalse((self.root / "image.tar").exists())
+
+    def test_chown_rejects_out_of_range_image_account_ids(self):
+        for uid, gid in ((2147483648, 1001), (1001, 2147483648)):
+            (self.context / "passwd").write_text("app:x:{}:{}::/:/bin/sh\n".format(uid, gid), encoding="utf-8")
+            with self.subTest(uid=uid, gid=gid), self.assertRaises(BuildError):
+                self._build("FROM scratch\nCOPY passwd /etc/passwd\nCOPY --chown=app file /file\n")
+            self.assertFalse((self.root / "image.tar").exists())
 
     def test_old_cache_entries_are_rebuilt_then_new_entries_hit(self):
         script = "FROM scratch\nCOPY --chown=1001:2001 --chmod=0750 file /app/private/file\n"

@@ -78,6 +78,16 @@ class OverlayManager:
         self.excluded_paths = set()
         for path in (self.upper, self.work, self.merged):
             path.mkdir(parents=True, exist_ok=False)
+        # 合并目录的元数据来自 upper；仅修正 lower 无法排除 upper 的宿主 umask。
+        # 复制 rootfs 根目录的属主、权限，使非 root RUN 看到原来的根目录访问规则。
+        root_metadata = self.rootfs.stat()
+        try:
+            if hasattr(os, "chown"):
+                os.chown(self.upper, root_metadata.st_uid, root_metadata.st_gid,
+                         follow_symlinks=False)
+            self.upper.chmod(stat.S_IMODE(root_metadata.st_mode))
+        except (OSError, NotImplementedError) as exc:
+            raise BuildError("Cannot preserve overlay root metadata: " + str(exc)) from exc
         if self.upper.stat().st_dev != self.work.stat().st_dev:
             raise BuildError("Overlay upperdir and workdir must share a filesystem")
 
