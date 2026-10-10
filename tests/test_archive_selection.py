@@ -24,6 +24,7 @@ from errors import BuildError
 from fast import _require_base_tag
 from image_reader import ImageArchiveReader
 from image_store import _archive_path, _check_archive_platform, pull_image
+from image_reader import BaseImage
 from image_writer import ImageArchiveWriter
 from rootfs import RootFSIndex
 from oci_writer import OCIImageWriter
@@ -45,7 +46,7 @@ def make_variants(root):
                   "rootfs": {"type": "layers", "diff_ids": [diff_id]},
                   "history": [{"created_by": arch}]}
         single = root / (arch + ".tar")
-        ImageArchiveWriter().write(single, config, [layer], REFERENCE)
+        ImageArchiveWriter().write_new(single, config, [layer], REFERENCE)
         with tarfile.open(single) as source:
             entry = json.load(source.extractfile("manifest.json"))[0]
             entries.append(entry)
@@ -265,7 +266,7 @@ class ArchiveSelectionTests(unittest.TestCase):
             for writer in (ImageArchiveWriter(), OCIImageWriter()):
                 output = root / "bad.tar"
                 with self.assertRaises(BuildError):
-                    writer.write(output, config, [], REFERENCE, config_raw=b"{}")
+                    writer.write_image(output, BaseImage(config, [], [REFERENCE], {}, config_raw=b'{}'), REFERENCE)
                 self.assertFalse(output.exists())
 
     def test_legacy_tar_adapter_is_repaired_from_cas_without_download(self):
@@ -279,7 +280,7 @@ class ArchiveSelectionTests(unittest.TestCase):
             store.import_docker(source, REFERENCE, "linux/amd64", "registry")
             image = ImageArchiveReader(source, root / "read").read(REFERENCE)
             adapter = _archive_path(store_root, REFERENCE, "linux/amd64", "registry")
-            ImageArchiveWriter().write(adapter, image.config, image.layers, REFERENCE)
+            ImageArchiveWriter().write_new(adapter, image.config, image.layers, REFERENCE)
             self.assertNotEqual(image_cli.inspect_archive(adapter)["image_id"], expected)
             previous_ref = store.snapshot_ref(REFERENCE, "linux/amd64", "registry")
             previous_tar = adapter.read_bytes()

@@ -90,7 +90,7 @@ class PhaseTenTests(unittest.TestCase):
              patch.object(main.shutil, "which", return_value="wsl.exe"), \
              patch.object(main.subprocess, "call", return_value=0) as call:
             self.assertEqual(main._run_wsl(args), 0)
-        command = call.call_args.args[0]
+        command = call.call_args[0][0]
         self.assertEqual(command[:3], ["wsl.exe", "--exec", "python3"])
         self.assertIn("rootless", command)
 

@@ -203,7 +203,7 @@ repositories
 
 Windows 上的可选 WSL 入口只负责**切换执行地点**：使用 `wsl.exe` 执行本项目 `main.py`，把 Windows 驱动器路径映射到 WSL，工作区放在 Linux `/tmp`。WSL 发行版、Python 3、文件可见性、架构与必要内核权限仍需要在目标机验证。没有可用 WSL 时，含 `RUN` 的构建明确失败；无 `RUN` 的构建不需要 WSL。
 
-`chroot` 单独使用只改变路径解析，不是安全隔离。Phase 2 不能以“直接 chroot 后执行”冒充已实现的容器环境。
+`chroot` 单独使用只改变路径解析，不是安全隔离，不能以“直接 chroot 后执行”冒充完整的容器环境。WSL 桥接缺少显式沙箱参数时，也使用 `hardened` 默认值，不退回早期的 `legacy` 模式。
 
 ## 工程目录
 

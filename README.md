@@ -22,7 +22,7 @@
 | 离线构建 | 已准备本地基础 tar，或镜像库已有需要的镜像 |
 | 加载并启动最终镜像 | 在目标机器使用 Docker 等兼容运行环境 |
 
-**只有 Python 可以完成归档构建；执行 Linux RUN 还需要 Linux 内核能力。** 本项目是实验性构建器，支持范围见 [Dockerfile 兼容表](docs/DOCKERFILE_COMPAT.md)。Python 3.7 是兼容目标，本机未执行真实 3.7 运行时验收。
+**只有 Python 可以完成归档构建；执行 Linux RUN 还需要 Linux 内核能力。** 本项目是实验性构建器，支持范围见 [Dockerfile 兼容表](docs/DOCKERFILE_COMPAT.md)。已在 Windows 的 Python 3.7.9 和 Python 3.12 运行完整离线回归；真实 Docker 与 Linux RUN 仍需目标环境验收。
 
 以下命令在工具目录执行，使用 PowerShell。`D:\packages`、`D:\images` 和内网地址都是示例，请替换为实际路径和地址。输出建议放在构建目录外；已有同名输出会报错。
 

@@ -16,6 +16,7 @@ from cas_store import CASStore
 from errors import BuildError
 from image_cli import history_archive
 from image_reader import ImageArchiveReader
+from image_reader import BaseImage
 from image_writer import ImageArchiveWriter
 from oci_writer import OCIImageWriter
 from optimizer import optimize_image
@@ -46,7 +47,7 @@ def make_source(root, history=ABSENT, onbuild=ABSENT, kind="docker", empty=False
     raw = (json.dumps(config, indent=3) + "\n").encode()
     output = root / (kind + "-source.tar")
     writer = ImageArchiveWriter() if kind == "docker" else OCIImageWriter()
-    writer.write(output, config, layers, BASE, config_raw=raw)
+    writer.write_image(output, BaseImage(config, layers, [BASE], {}, config_raw=raw), BASE)
     return output, config, raw
 
 
@@ -237,7 +238,7 @@ class OptionalImageMetadataTests(unittest.TestCase):
                     if valid:
                         config["config"] = None
                         writer = ImageArchiveWriter() if kind == "docker" else OCIImageWriter()
-                        writer.write(source, config, [root / "layer-0.tar"], BASE)
+                        writer.write_new(source, config, [root / 'layer-0.tar'], BASE)
                         result = conformance.snapshot(source, BASE)
                         self.assertEqual(result["layer_count"], 1)
                         self.assertIn("app/data", result["tree"])

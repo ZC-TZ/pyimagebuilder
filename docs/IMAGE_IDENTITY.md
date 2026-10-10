@@ -45,7 +45,7 @@ writer.write_image(output, image, tag)
 writer.write_new(output, config, layers, tag)
 ```
 
-兼容的低层 `write(..., config_raw=...)` 保留供旧代码使用。项目的业务路径已改为明确选择 `write_image` / `write_new`。以后新增入口应从镜像对象转存，不要从只读分析返回的 dict 重建。
+writer 的公开写入入口只有 `write_image` / `write_new`，用途不明确的旧 `write(...)` 已移除。`_write` 是内部实现，业务代码和测试夹具均应选择明确入口。转存需要构造或保留携带原始字节的 `BaseImage`，不要从只读分析返回的 dict 重建已有镜像。
 
 OCI `write_image` 会创建新的 layout index；它保证 config 身份，并在有原始 manifest 且最终描述符不变时复用 manifest 原字节。它不承诺整个 OCI 归档或 index 逐字节相同。无变化的 OCI 优化直接复制已验证归档，才能同时保留原始 config、manifest、index 和全部扩展字段。
 

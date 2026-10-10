@@ -34,7 +34,16 @@ python .\main.py build D:\project -t company/app:1 -o D:\images\app.tar `
 | `repositories` | 按仓库主机名设置下载方式、账号、密码环境变量与 CA |
 | `fast` | 默认 profile 与多个 TongWeb/Tomcat 打包模板 |
 
-JSON 不允许注释或尾随逗号。请使用模板里的真实字段名，不要把说明文字写入配置。
+使用 UTF-8 JSON，可带 Windows 编辑器生成的 BOM。配置不允许注释、尾随逗号、重复键或 NaN/Infinity；`schemaVersion` 必须是整数 `2`，不能写成 `2.0` 或字符串。顶层、cache、repositories 和 fast 各层只接受已定义字段，拼错字段或放错层级会立即报错。
+
+| 配置层级 | 支持的字段 |
+| --- | --- |
+| `cache` | `imageStore`、`layerCache` |
+| `repositories.<host>` | `source`、`username`、`passwordEnv`、`caFile`、`insecureHttp`、`workers`、`authHost` |
+| `fast` | `defaultProfile`、`profiles` |
+| `fast.profiles.<name>` | `flavor`、`baseImage`、`baseTar`、`baseUrl`、`owner`、`deployDir`、`serverConfig`、`outputDir` |
+
+`defaultProfile` 若设置，必须指向已有 profile；所有 profile 都先做字段及文本类型检查，选中使用时再核对镜像来源、部署路径和文件存在性。鉴权字段放在 `repositories`，下载位置放在 `cache.imageStore`；profile 中的旧 `baseCacheDir` 不再接受。`serverConfig`、`outputDir` 可省略或设为 null。
 
 ## 3. 下载地址与鉴权
 

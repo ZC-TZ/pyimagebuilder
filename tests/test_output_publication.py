@@ -222,8 +222,12 @@ class OutputPublicationTests(unittest.TestCase):
                 verify(writer, path, tag)
                 report.write_bytes(b"other report")
 
+            # sys.flags 是全进程对象；保留其他字段，避免影响 3.7 的默认编码查询。
+            flags = SimpleNamespace(**{name: getattr(sys.flags, name) for name in dir(sys.flags)
+                                       if not name.startswith("_")})
+            flags.hash_randomization = 0
             with patch.dict(os.environ, {"PYTHONHASHSEED": "0"}), \
-                    patch.object(hermetic.sys, "flags", SimpleNamespace(hash_randomization=0)):
+                    patch.object(hermetic.sys, "flags", flags):
                 lock = hermetic.make_lock(context / "Dockerfile", context, tag="example/app:1")
                 lock_path.write_text(json.dumps(lock))
                 with patch.object(ImageArchiveWriter, "verify", competing_verify):

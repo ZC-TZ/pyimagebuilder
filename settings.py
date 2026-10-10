@@ -12,6 +12,35 @@ from errors import BuildError
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
+def _json_object(pairs):
+    """拒绝重复键，避免后一个值静默覆盖已审查的鉴权或缓存配置。"""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate configuration key: " + key)
+        result[key] = value
+    return result
+
+
+def _json_constant(value):
+    """配置采用标准 JSON；NaN/Infinity 不能作为合法数值进入后续校验。"""
+    raise ValueError("Non-JSON configuration number: " + value)
+
+
+def _known_fields(value, allowed, label):
+    """尽早定位拼错或放错层级的字段，不允许配置被静默忽略。"""
+    unknown = sorted(set(value) - set(allowed))
+    if unknown:
+        raise BuildError("Unknown configuration fields in {}: {}".format(label, ", ".join(unknown)))
+
+
+def _optional_text(value, key, label, nullable=False):
+    """共享入口先校验文本类型，避免某个命令在较深调用处出现 TypeError。"""
+    if key in value and not (nullable and value[key] is None):
+        if not isinstance(value[key], str) or not value[key].strip():
+            raise BuildError(label + "." + key + " must be a nonempty string")
+
+
 def config_path(candidate=None):
     """按显式路径、环境变量、当前目录和工具目录顺序选择 config.json。"""
     if candidate is not None:
@@ -30,24 +59,31 @@ def _path(value, root, label):
 
 
 def load_settings(candidate=None, required=False):
-    """加载 schemaVersion=2 配置，并相对配置文件目录解析所配置的路径。"""
+    """严格加载 schemaVersion=2 配置，并相对配置文件目录解析路径。
+
+    共享入口先检查 JSON、字段及基础类型；Fast 的选中 profile 再检查文件和部署语义。
+    """
     path = config_path(candidate)
     if not path.is_file():
         if required or candidate is not None or os.environ.get("PYIMAGEBUILDER_CONFIG"):
             raise BuildError("Configuration file not found: " + str(path))
         return {"schemaVersion": 2, "cache": {}, "repositories": {}, "fast": {}}, path
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"),
+                          object_pairs_hook=_json_object, parse_constant=_json_constant)
     except (OSError, ValueError) as exc:
         raise BuildError("Cannot read configuration {}: {}".format(path, exc)) from exc
-    if not isinstance(data, dict) or data.get("schemaVersion") != 2:
+    if (not isinstance(data, dict) or type(data.get("schemaVersion")) is not int or
+            data.get("schemaVersion") != 2):
         raise BuildError("config.json requires schemaVersion 2")
+    _known_fields(data, ("schemaVersion", "cache", "repositories", "fast"), "config")
     if any(not isinstance(data.get(key, {}), dict) for key in ("cache", "repositories", "fast")):
         raise BuildError("cache, repositories, and fast must be objects")
     root = path.parent
     data.setdefault("cache", {})
     data.setdefault("repositories", {})
     data.setdefault("fast", {})
+    _known_fields(data["cache"], ("imageStore", "layerCache"), "cache")
     for key in ("imageStore", "layerCache"):
         if key in data["cache"]:
             data["cache"][key] = _path(data["cache"][key], root, "cache." + key)
@@ -62,7 +98,12 @@ def load_settings(candidate=None, required=False):
             raise BuildError("Invalid repository source for " + host)
         if "password" in entry or "token" in entry:
             raise BuildError("Do not store passwords or tokens in config.json")
-        if "passwordEnv" in entry and not ENV_NAME.fullmatch(str(entry["passwordEnv"])):
+        _known_fields(entry, ("source", "username", "passwordEnv", "caFile",
+                              "insecureHttp", "workers", "authHost"), "repositories." + host)
+        for key in ("username", "authHost"):
+            _optional_text(entry, key, "repositories." + host, nullable=True)
+        if "passwordEnv" in entry and (not isinstance(entry["passwordEnv"], str) or
+                                       not ENV_NAME.fullmatch(entry["passwordEnv"])):
             raise BuildError("Invalid passwordEnv for " + host)
         if "caFile" in entry:
             entry["caFile"] = _path(entry["caFile"], root, "caFile")
@@ -72,10 +113,23 @@ def load_settings(candidate=None, required=False):
                                    not 0 <= entry["workers"] <= 64):
             raise BuildError("workers must be between 0 and 64 for " + host)
     fast = data["fast"]
+    _known_fields(fast, ("profiles", "defaultProfile"), "fast")
     if not isinstance(fast.get("profiles", {}), dict):
         raise BuildError("fast.profiles must be an object")
-    if "defaultProfile" in fast and not isinstance(fast["defaultProfile"], str):
-        raise BuildError("fast.defaultProfile must be a string")
+    _optional_text(fast, "defaultProfile", "fast")
+    for name, profile in fast.get("profiles", {}).items():
+        if not name.strip() or not isinstance(profile, dict):
+            raise BuildError("fast.profiles entries must be named objects")
+        if "baseCacheDir" in profile:
+            raise BuildError("Move fast profile baseCacheDir to cache.imageStore in config.json")
+        _known_fields(profile, ("flavor", "baseImage", "baseTar", "baseUrl", "owner",
+                                "deployDir", "serverConfig", "outputDir"), "fast.profiles." + name)
+        for key in ("flavor", "baseImage", "baseTar", "baseUrl", "owner", "deployDir"):
+            _optional_text(profile, key, "fast.profiles." + name)
+        for key in ("serverConfig", "outputDir"):
+            _optional_text(profile, key, "fast.profiles." + name, nullable=True)
+    if "defaultProfile" in fast and fast["defaultProfile"] not in fast.get("profiles", {}):
+        raise BuildError("fast.defaultProfile does not name an existing profile")
     return data, path
 
 

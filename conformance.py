@@ -198,6 +198,8 @@ def _drop(tree, name, children=True):
 def _parents(tree, name):
     parent = posixpath.dirname(name)
     while parent:
+        if parent in tree and tree[parent]["type"] != "dir":
+            raise ArchiveError("Layer member has a non-directory parent: " + name)
         tree.setdefault(parent, {"type": "dir", "implicit": True})
         parent = posixpath.dirname(parent)
 
@@ -240,6 +242,7 @@ def _layer_tree(layers):
                             del tree[key]
                 else:
                     _drop(tree, posixpath.join(parent, base[4:]))
+            hardlinks = []
             for name, member in members:
                 if posixpath.basename(name).startswith(".wh."):
                     continue
@@ -278,14 +281,28 @@ def _layer_tree(layers):
                 elif kind in ("symlink", "hardlink"):
                     data["target"] = member.linkname
                     if kind == "hardlink":
-                        linked = tree.get(_path(member.linkname.lstrip("/")))
-                        if linked and "sha256" in linked:
-                            data["sha256"] = linked["sha256"]
-                            data["size"] = linked["size"]
+                        hardlinks.append(name)
                 elif kind == "special":
                     data["devmajor"] = member.devmajor
                     data["devminor"] = member.devminor
                 tree[name] = data
+            # 在本层全部路径登记后解析前向链接；固定内容摘要，后续层覆盖目标不改旧别名。
+            for name in hardlinks:
+                target = _path(tree[name]["target"].lstrip("/"))
+                visited = {name}
+                while True:
+                    if target in visited:
+                        raise ArchiveError("Cyclic hardlink in layer: " + name)
+                    visited.add(target)
+                    linked = tree.get(target)
+                    if linked is None:
+                        raise ArchiveError("Hardlink target missing in layer: " + name)
+                    if linked["type"] not in ("file", "hardlink"):
+                        raise ArchiveError("Hardlink target is not a file: " + name)
+                    if "sha256" in linked:
+                        tree[name]["sha256"], tree[name]["size"] = linked["sha256"], linked["size"]
+                        break
+                    target = _path(linked["target"].lstrip("/"))
     return tree
 
 

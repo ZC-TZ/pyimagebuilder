@@ -42,7 +42,7 @@ def make_oci(root, architecture="amd64"):
     config = {"os": "linux", "architecture": architecture, "config": {},
               "rootfs": {"type": "layers", "diff_ids": [digest(layer.read_bytes())]}}
     output = root / (architecture + ".oci.tar")
-    OCIImageWriter().write(output, config, [layer], TAG)
+    OCIImageWriter().write_new(output, config, [layer], TAG)
     return output
 
 

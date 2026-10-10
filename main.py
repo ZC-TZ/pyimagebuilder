@@ -58,7 +58,7 @@ def _run_wsl(args, trusted_base_cache=False):
         command += ["--distribution", args.wsl_distro]
     if getattr(args, "wsl_user", None):
         command += ["--user", args.wsl_user]
-    elif getattr(args, "run_sandbox", "legacy") != "rootless":
+    elif getattr(args, "run_sandbox", "hardened") != "rootless":
         command += ["--user", "root"]
     command += ["--exec", args.wsl_python,
                 _wsl_path(__file__, args.wsl_mount_root),
@@ -72,7 +72,7 @@ def _run_wsl(args, trusted_base_cache=False):
                 "--progress", getattr(args, "progress", "auto"),
                 "--workspace", args.workspace or "/tmp",
                 "--run", "--run-network", args.run_network,
-                "--run-sandbox", getattr(args, "run_sandbox", "legacy")]
+                "--run-sandbox", getattr(args, "run_sandbox", "hardened")]
     if getattr(args, "oci_output", None) is not None:
         command += ["--oci-output", _wsl_path(args.oci_output, args.wsl_mount_root)]
     if getattr(args, "target", None) is not None:

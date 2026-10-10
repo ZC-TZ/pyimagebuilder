@@ -57,7 +57,7 @@ def fixture(root, kind="docker", arch="amd64", empty=False, sparse=False, prefix
     raw = (json.dumps(config, ensure_ascii=True, indent=3) + "\n").encode()
     original = root / (kind + "-" + arch + "-canonical.tar")
     writer = ImageArchiveWriter() if kind == "docker" else OCIImageWriter()
-    writer.write(original, config, layers, TAG, config_raw=raw)
+    writer.write_image(original, BaseImage(config, layers, [TAG], {}, config_raw=raw), TAG)
     output = root / (kind + "-" + arch + ".tar")
     with tarfile.open(original) as archive:
         members = {member.name: archive.extractfile(member).read() for member in archive}
@@ -154,7 +154,10 @@ class ImageIdentityContractTests(unittest.TestCase):
                     for raw in (None, json.dumps(config).encode()):
                         output = root / "bad.tar"
                         with self.assertRaises(ArchiveError):
-                            writer.write(output, config, [], TAG, config_raw=raw)
+                            if raw is None:
+                                writer.write_new(output, config, [], TAG)
+                            else:
+                                writer.write_image(output, BaseImage(config, [], [TAG], {}, config_raw=raw), TAG)
                         self.assertFalse(output.exists())
 
     def test_combine_preserves_child_blob_bytes_and_descriptor_annotations(self):
@@ -409,7 +412,7 @@ class ImageIdentityContractTests(unittest.TestCase):
                 for writer in (ImageArchiveWriter(), OCIImageWriter()):
                     output = root / "bad.tar"
                     with self.assertRaises(ArchiveError):
-                        writer.write(output, config, [], TAG, config_raw=json.dumps(raw_value).encode())
+                        writer.write_image(output, BaseImage(config, [], [TAG], {}, config_raw=json.dumps(raw_value).encode()), TAG)
                     self.assertFalse(output.exists())
 
     def test_cas_docker_import_uses_the_config_bytes_it_verified(self):

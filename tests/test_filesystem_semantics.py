@@ -200,7 +200,7 @@ class FilesystemSemanticsTests(unittest.TestCase):
                                                                   for path in (first, second)]},
                       "history": [{"created_by": "first"}, {"created_by": "second"}]}
             base = root / "base.tar"
-            ImageArchiveWriter().write(base, config, [first, second], "example/base:1")
+            ImageArchiveWriter().write_new(base, config, [first, second], 'example/base:1')
             cas = CASStore(root / "store")
             cas.import_docker(base, "example/base:1", "linux/amd64")
             source = {"type": "cas", "store": str(root / "store"), "reference": "example/base:1",

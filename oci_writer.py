@@ -48,7 +48,7 @@ class OCIImageWriter:
     def write_new(self, output, config, layers, tag, progress=None,
                   manifest_template=None, index_template=None):
         """明确创建派生 OCI 镜像；扩展元数据模板不能保留原镜像的 digest。"""
-        return self.write(output, config, layers, tag, progress=progress,
+        return self._write(output, config, layers, tag, progress=progress,
                           manifest_template=manifest_template, index_template=index_template)
 
     def write_image(self, output, image, tag, progress=None):
@@ -61,17 +61,17 @@ class OCIImageWriter:
         raw = image.original_config_bytes()
         manifest_raw = image.original_manifest_bytes()
         template = parse_image_json(manifest_raw, "image manifest") if manifest_raw is not None else None
-        return self.write(output, image.config, image.layers, tag, progress=progress, config_raw=raw,
+        return self._write(output, image.config, image.layers, tag, progress=progress, config_raw=raw,
                           manifest_template=template, manifest_raw=manifest_raw)
 
-    def write(self, output, config, layers, tag, progress=None, config_raw=None,
+    def _write(self, output, config, layers, tag, progress=None, config_raw=None,
               manifest_template=None, index_template=None, manifest_raw=None):
         """创建新的未压缩 OCI 布局；模板仅保留派生镜像的扩展元数据。
 
         manifest_raw 与模板绑定；只有最终 manifest 没有变化时才可复用原字节。
         发生转换时 manifest/index 会生成新的字节，模板仅用于保留扩展字段。
         config_raw 只用于保留 ImageID；原样转存 OCI 应复制已验证归档。
-        此低层接口保留兼容性，业务路径选择 write_new 或 write_image 表达实际意图。
+        内部共用实现；公开入口只有 write_new 和 write_image，避免隐式重编码。
         """
         diff_ids = config.get("rootfs", {}).get("diff_ids")
         if not isinstance(diff_ids, list) or len(diff_ids) != len(layers):

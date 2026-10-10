@@ -176,10 +176,11 @@ RUN rm /etc/new.conf && touch /run.txt
              patch.object(main.shutil, "which", return_value="wsl.exe"), \
              patch.object(main.subprocess, "call", return_value=0) as call:
             self.assertEqual(main._run_wsl(args), 0)
-            command = call.call_args.args[0]
+            command = call.call_args[0][0]
             self.assertEqual(command[:5], ["wsl.exe", "--user", "root", "--exec", "python3"])
             self.assertIn("/mnt/c/base.tar", command)
             self.assertIn("--run", command)
+            self.assertEqual(command[command.index("--run-sandbox") + 1], "hardened")
 
 
 if __name__ == "__main__":

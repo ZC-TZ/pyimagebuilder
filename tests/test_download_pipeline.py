@@ -166,7 +166,11 @@ class DownloadPipelineTests(unittest.TestCase):
                     blobs = {config_digest: raw_config}
                     layers = []
                     for name in entry["Layers"]:
-                        raw = gzip.compress(archive.extractfile(name).read(), mtime=0)
+                        # gzip.compress 的 mtime 参数从 3.8 才提供；GzipFile 在 3.7 可固定时间。
+                        buffer = io.BytesIO()
+                        with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0) as compressed:
+                            compressed.write(archive.extractfile(name).read())
+                        raw = buffer.getvalue()
                         digest = "sha256:" + hashlib.sha256(raw).hexdigest()
                         blobs[digest] = raw
                         layers.append({"mediaType": registry.OCI_GZIP_LAYER,

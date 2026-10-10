@@ -100,8 +100,6 @@ def load_profile(config_path, profile_name=None):
         profile["downloadWorkers"] = connection.get("workers", 0)
         if connection.get("caFile") is not None:
             profile["caFile"] = connection["caFile"]
-        if "baseCacheDir" in profile:
-            raise BuildError("Move fast profile baseCacheDir to cache.imageStore in config.json")
         profile["imageStore"] = cache_directory(settings, "imageStore", None)
         username = profile.get("username")
         if username is not None and (not isinstance(username, str) or not username):
@@ -356,7 +354,7 @@ def _init(argv):
     _validate_atom(args.profile, "profile")
     if config.exists():
         load_settings(config, required=True)
-        data = json.loads(config.read_text(encoding="utf-8"))
+        data = json.loads(config.read_text(encoding="utf-8-sig"))
     else:
         data = {"schemaVersion": 2, "repositories": {}, "cache": {},
                 "fast": {"profiles": {}}}

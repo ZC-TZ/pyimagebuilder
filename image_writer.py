@@ -36,7 +36,7 @@ class ImageArchiveWriter:
 
     def write_new(self, output, config, layers, tag, progress=None, fileobj=None):
         """明确创建派生镜像，以稳定 JSON 编码生成新的配置身份。"""
-        return self.write(output, config, layers, tag, progress=progress, fileobj=fileobj)
+        return self._write(output, config, layers, tag, progress=progress, fileobj=fileobj)
 
     def write_image(self, output, image, tag, progress=None, fileobj=None):
         """转存已读取的镜像；原始配置缺失或已修改时，在创建输出前拒绝。
@@ -45,17 +45,17 @@ class ImageArchiveWriter:
         Docker save 的外层 manifest/repositories 是归档索引，可因标签变化重新生成。
         """
         raw = image.original_config_bytes()
-        return self.write(output, image.config, image.layers, tag, progress=progress,
+        return self._write(output, image.config, image.layers, tag, progress=progress,
                           fileobj=fileobj, config_raw=raw)
 
-    def write(self, output, config, layers, tag, progress=None, fileobj=None, config_raw=None):
+    def _write(self, output, config, layers, tag, progress=None, fileobj=None, config_raw=None):
         """以稳定名称和 manifest 引用直接写入指定输出 tar。
 
         本方法不检查输出是否已存在，也不完整核对输入层的内容摘要。
         构建入口负责选择临时输出、调用 verify，再发布到最终交付路径。
         fileobj 指定时写入调用方已打开的二进制流，其关闭及输出所有权由调用方管理。
         config_raw 用于转存现有镜像，保留原始配置字节与 ImageID；新构建省略此参数。
-        这是兼容的低层接口；项目业务路径须明确选择 write_new 或 write_image。
+        内部共用实现；调用方只能通过 write_new 或 write_image 表达写入意图。
         """
         diff_ids = config.get("rootfs", {}).get("diff_ids")
         if not isinstance(diff_ids, list) or len(diff_ids) != len(layers):

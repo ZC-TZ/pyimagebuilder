@@ -39,7 +39,7 @@ class PhaseFourteenTests(unittest.TestCase):
                   "config": {}, "history": [{"created_by": "old"}, {"created_by": "new"}]}
         source = root / (kind + ".tar")
         writer = ImageArchiveWriter() if kind == "docker" else OCIImageWriter()
-        writer.write(source, config, [old, new], "example/phase14:1")
+        writer.write_new(source, config, [old, new], 'example/phase14:1')
         writer.verify(source, "example/phase14:1")
         return source
 
@@ -112,7 +112,7 @@ class PhaseFourteenTests(unittest.TestCase):
                               "rootfs": {"type": "layers", "diff_ids": diffs}}
                     source = root / "image.tar"
                     writer = ImageArchiveWriter() if kind == "docker" else OCIImageWriter()
-                    writer.write(source, config, layers, "example/links:1")
+                    writer.write_new(source, config, layers, 'example/links:1')
                     report = analyze_image(source)
                     self.assertEqual(report["hidden_file_bytes"], 3 if remove_alias else 0)
 
@@ -124,7 +124,7 @@ class PhaseFourteenTests(unittest.TestCase):
             config = {"architecture": "amd64", "os": "linux", "config": {},
                       "rootfs": {"type": "layers", "diff_ids": [diff]}, "history": [None]}
             source, output = root / "source.tar", root / "output.tar"
-            ImageArchiveWriter().write(source, config, [layer], "example/bad:1")
+            ImageArchiveWriter().write_new(source, config, [layer], 'example/bad:1')
             with self.assertRaisesRegex(BuildError, "history"):
                 optimize_image(source, output)
             self.assertFalse(output.exists())

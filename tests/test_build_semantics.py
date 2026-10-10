@@ -232,7 +232,7 @@ class BuildSemanticsTests(unittest.TestCase):
                 config = {"os": "linux", "architecture": "amd64", "history": [],
                           "config": {"OnBuild": [trigger]}, "rootfs": {"type": "layers", "diff_ids": []}}
                 base = root / "base.tar"
-                ImageArchiveWriter().write(base, config, [], "example/base:1")
+                ImageArchiveWriter().write_new(base, config, [], 'example/base:1')
                 output = root / "image.tar"
                 with self.assertRaises(BuildError):
                     build(dockerfile, context, base, None, "example/app:1", output,
@@ -251,7 +251,7 @@ class BuildSemanticsTests(unittest.TestCase):
                       "config": {"OnBuild": ["COPY <<EOF /inline.txt\nhello\nEOF"]},
                       "rootfs": {"type": "layers", "diff_ids": []}}
             base = root / "base.tar"
-            ImageArchiveWriter().write(base, config, [], "example/base:1")
+            ImageArchiveWriter().write_new(base, config, [], 'example/base:1')
             output = root / "image.tar"
             build(dockerfile, context, base, None, "example/app:1", output)
             image, index = self.read_image(output, root)

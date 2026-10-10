@@ -19,6 +19,7 @@ from errors import BuildError
 from image_cli import load_archive, save_archive
 from image_reader import ImageArchiveReader, sha256_file
 from image_store import _archive_path
+from image_reader import BaseImage
 from image_writer import ImageArchiveWriter
 from oci_writer import OCIImageWriter
 from rootfs import RootFSIndex
@@ -74,8 +75,7 @@ def source_at(root, kind="docker", architecture="amd64", empty=False):
               "history": [{"created_by": "source"} for _ in layers], "x-company": {"build": "原始"}}
     output = root / (kind + "-base.tar")
     writer = ImageArchiveWriter() if kind == "docker" else OCIImageWriter()
-    writer.write(output, config, layers, BASE,
-                 config_raw=(json.dumps(config, indent=3) + "\n").encode())
+    writer.write_image(output, BaseImage(config, layers, [BASE], {}, config_raw=(json.dumps(config, indent=3) + '\n').encode()), BASE)
     return output, config
 
 

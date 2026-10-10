@@ -46,9 +46,9 @@ python -m unittest discover -s tests -p test_image_identity_contract.py -v
 | Linux RUN、whiteout、cache/secret mount | 在有 Linux 内核能力的构建机上运行 `conformance.py linux --help`，提供匹配平台的基础 tar、镜像引用及权限 |
 | Registry / Artifactory 下载与鉴权 | 在目标内网用测试账户与测试仓库验证，避免覆盖正式标签 |
 | amd64 / arm64 跨架构 RUN | 验证目标内核、QEMU/binfmt_misc 和基础镜像可执行文件 |
-| Python 3.7 兼容性 | 需要真实 Python 3.7 运行测试；语法解析检查不能替代运行时验收 |
+| Python 3.7 兼容性 | 已在 Windows/Python 3.7.9 运行完整回归；其他解释器版本和操作系统需分别验证，语法解析不能替代运行测试 |
 
-此前本地回归在 Windows/Python 3.12 执行，真实 Docker、Linux RUN、内网鉴权和 Python 3.7 运行时未在该环境验收。报告测试结果时，应同时说明解释器、操作系统、跳过项和外部依赖。
+最近完整回归在 Windows/Python 3.7.9 与 Python 3.12 各运行 325 项测试，各通过 322 项、跳过 3 项；跳过项涉及当前账户不能创建符号链接。真实 Docker、Linux RUN 和内网鉴权尚未在该环境验收。报告测试结果时，应同时说明解释器、操作系统、跳过项和外部依赖。
 
 ## 修改与提交
 

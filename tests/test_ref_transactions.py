@@ -42,7 +42,7 @@ def make_image(root, name, reference=REFERENCE):
     config = {"os": "linux", "architecture": "amd64", "config": {},
               "rootfs": {"type": "layers", "diff_ids": ["sha256:" + sha256_file(layer)]}}
     output = root / (name + ".tar")
-    ImageArchiveWriter().write(output, config, [layer], reference)
+    ImageArchiveWriter().write_new(output, config, [layer], reference)
     return output
 
 

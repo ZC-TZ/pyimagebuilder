@@ -129,7 +129,7 @@ class RegistryIdentityTests(unittest.TestCase):
             store.import_docker(archive, "example/base:1", "linux/amd64")
             output = root / "saved.tar"
 
-            def interrupted(path, _config, _layers, _tag, **kwargs):
+            def interrupted(path, _image, _tag, **kwargs):
                 stream = kwargs.get("fileobj")
                 if stream is None:
                     Path(path).write_bytes(b"partial")
@@ -137,7 +137,7 @@ class RegistryIdentityTests(unittest.TestCase):
                     stream.write(b"partial")
                 raise OSError("export interrupted")
 
-            with patch.object(ImageArchiveWriter, "write", side_effect=interrupted):
+            with patch.object(ImageArchiveWriter, "write_image", side_effect=interrupted):
                 with self.assertRaisesRegex(OSError, "export interrupted"):
                     store.export_docker("example/base:1", output)
             self.assertFalse(output.exists())
