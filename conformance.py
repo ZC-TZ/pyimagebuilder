@@ -222,11 +222,19 @@ def _layer_tree(layers):
             # 独立检查整层的祖先类型，避免复制被测索引的顺序依赖错误。
             declared = {name: member for name, member in members
                         if not posixpath.basename(name).startswith(".wh.")}
-            for name in declared:
+            for name, member in members:
+                base = posixpath.basename(name)
+                if base.startswith(".wh."):
+                    if not member.isfile() or member.size:
+                        raise ArchiveError("Invalid OCI whiteout")
+                    if base != ".wh..wh..opq" and base[4:] in ("", ".", ".."):
+                        raise ArchiveError("Invalid OCI whiteout target")
                 parent = posixpath.dirname(name)
                 while parent:
+                    if posixpath.basename(parent).startswith(".wh."):
+                        raise ArchiveError("Layer member has a whiteout parent: " + name)
                     ancestor = declared.get(parent)
-                    if ancestor is not None and not ancestor.isdir():
+                    if not base.startswith(".wh.") and ancestor is not None and not ancestor.isdir():
                         raise ArchiveError("Layer member has a non-directory parent: " + name)
                     parent = posixpath.dirname(parent)
             for name, member in members:
@@ -234,8 +242,6 @@ def _layer_tree(layers):
                 parent = posixpath.dirname(name)
                 if not base.startswith(".wh."):
                     continue
-                if not member.isfile() or member.size:
-                    raise ArchiveError("Invalid OCI whiteout")
                 if base == ".wh..wh..opq":
                     for key in list(tree):
                         if not parent or key.startswith(parent + "/"):

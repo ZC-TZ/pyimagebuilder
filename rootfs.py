@@ -56,16 +56,25 @@ def clean_path(name):
 def validate_layer_paths(members):
     """在改变索引或磁盘前拒绝同层的非目录父路径，不受成员排列顺序影响。
 
-    members 的路径已规范化且去重。whiteout 描述下层删除，不作为新文件树
-    的成员参与检查；下层目录被本层文件替换仍是允许的跨层操作。
+    members 的路径已规范化且去重。whiteout 不登记为本层文件或目录，
+    仍需预检目标、负载和保留名称。它只作用于下层，不能用本层最终父路径
+    的类型拒绝删除标记；下层目录被本层文件替换是允许的跨层操作。
     """
     declared = {path: member for path, member in members
                 if not posixpath.basename(path).startswith(".wh.")}
-    for path in declared:
+    for path, member in members:
+        base = posixpath.basename(path)
+        if base.startswith(".wh."):
+            if not member.isfile() or member.size != 0:
+                raise ArchiveError("OCI whiteout must be an empty regular file: " + path)
+            if base != ".wh..wh..opq" and base[4:] in ("", ".", ".."):
+                raise ArchiveError("Invalid whiteout target: " + path)
         parent = posixpath.dirname(path)
         while parent:
-            member = declared.get(parent)
-            if member is not None and not member.isdir():
+            if posixpath.basename(parent).startswith(".wh."):
+                raise ArchiveError("Layer member descends through a whiteout parent: " + path)
+            ancestor = declared.get(parent)
+            if not base.startswith(".wh.") and ancestor is not None and not ancestor.isdir():
                 raise ArchiveError("Layer member descends through a non-directory parent: " + path)
             parent = posixpath.dirname(parent)
 
@@ -169,8 +178,6 @@ class RootFSIndex:
             for path, member in members:
                 base = posixpath.basename(path)
                 parent = posixpath.dirname(path)
-                if base.startswith(".wh.") and (not member.isfile() or member.size != 0):
-                    raise ArchiveError("OCI whiteout must be an empty regular file: " + path)
                 if base == ".wh..wh..opq":
                     if parent:
                         self._remove(parent, include=False)
@@ -178,8 +185,6 @@ class RootFSIndex:
                         self.entries.clear()
                 elif base.startswith(".wh."):
                     target = posixpath.join(parent, base[4:])
-                    if not base[4:]:
-                        raise ArchiveError("Invalid empty whiteout")
                     self._remove(target)
             for path, member in members:
                 if posixpath.basename(path).startswith(".wh."):

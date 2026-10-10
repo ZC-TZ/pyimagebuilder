@@ -85,6 +85,19 @@ class RootFSMaterializer:
         elif path.exists():
             path.unlink()
 
+    def _whiteout_directory(self, image_path):
+        """只定位下层真实目录，不跟随其符号链接去删除另一路径的文件。
+
+        缺失或非目录父路径没有可遮蔽的索引子项；本层随后替换成新目录也不应
+        删除旧符号链接目标里的内容。普通新增成员仍由 _parents 处理。
+        """
+        directory = self.root
+        for part in image_path.split("/") if image_path else ():
+            directory = directory / part
+            if directory.is_symlink() or not directory.is_dir():
+                return None
+        return directory
+
     def _validate_ownership(self, member):
         """在修改文件前拒绝无效属主，防止 -1 被系统调用当成保持宿主值。"""
         checked_layer_id(member.uid, "UID")
@@ -136,12 +149,15 @@ class RootFSMaterializer:
             for name, _ in members:
                 base = posixpath.basename(name)
                 parent = posixpath.dirname(name)
+                if not base.startswith(".wh."):
+                    continue
+                directory = self._whiteout_directory(parent)
+                if directory is None:
+                    continue
                 if base == ".wh..wh..opq":
-                    directory = self._real(parent, follow_final=True) if parent else self.root
-                    if directory.is_dir():
-                        for child in list(directory.iterdir()):
-                            self._remove(posixpath.join(parent, child.name))
-                elif base.startswith(".wh."):
+                    for child in list(directory.iterdir()):
+                        self._remove(posixpath.join(parent, child.name))
+                else:
                     self._remove(posixpath.join(parent, base[4:]))
             directories = []
             hardlinks = []
