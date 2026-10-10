@@ -18,7 +18,8 @@ from build_args import expand
 from dockerfile_parser import parse
 from errors import BuildError
 from fast import _require_base_tag
-from image_reader import MAX_JSON, digest_hex, docker_manifest, outer_name, same_json_value
+from image_reader import (MAX_JSON, digest_hex, docker_manifest, outer_name, parse_image_json,
+                          read_image_json_file, same_json_value, verify_layer_tar)
 from platforms import architecture, host_architecture, normalize_platform
 from registry import pull as registry_pull
 from settings import cache_directory, load_settings, repository_settings
@@ -67,7 +68,7 @@ def _check_archive_platform(path, reference, platform, verify_layers=False, with
                         raise BuildError("Missing or oversized pulled image config")
                     with archive.extractfile(config_member) as stream:
                         raw_config = stream.read()
-                    config = json.loads(raw_config)
+                    config = parse_image_json(raw_config, "cached image config")
                     if (config.get("os") == "linux" and
                             config.get("architecture") == architecture(platform)):
                         matches.append((item, config, "sha256:" + hashlib.sha256(raw_config).hexdigest()))
@@ -91,8 +92,9 @@ def _check_archive_platform(path, reference, platform, verify_layers=False, with
                         with archive.extractfile(member) as stream:
                             for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
                                 hasher.update(block)
-                        if hasher.hexdigest() != digest_hex(diff_id):
-                            raise BuildError("Cached image layer DiffID mismatch: " + name)
+                            if hasher.hexdigest() != digest_hex(diff_id):
+                                raise BuildError("Cached image layer DiffID mismatch: " + name)
+                            verify_layer_tar(stream, "cached image layer: " + name)
                 return (config, config_digest) if with_config_digest else config
     except (OSError, tarfile.TarError, ValueError, KeyError, TypeError, AttributeError) as exc:
         raise BuildError("Cannot inspect pulled image platform: " + str(exc)) from exc
@@ -107,7 +109,7 @@ def _check_cached_archive(cas, path, reference, platform, source):
             path, reference, platform, verify_layers=has_ref, with_config_digest=True)
         if has_ref:
             ref = cas.resolve(reference, platform, source)
-            stored_config = json.loads(cas._blob(ref["config"]).read_bytes())
+            stored_config, _ = read_image_json_file(cas._blob(ref["config"]), "cached CAS config")
             if not same_json_value(stored_config, archive_config):
                 raise BuildError("Stored tar and CAS reference disagree for {}; remove the stale tar".format(reference))
             if config_digest != ref["config"]:

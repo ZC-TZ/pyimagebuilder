@@ -148,7 +148,12 @@ class ArchiveVerificationContractTests(unittest.TestCase):
             layer = root / "layer.tar"
             info = tarfile.TarInfo("truncated")
             info.size = 20000
-            for raw in (b"not a tar archive", info.tobuf() + b"x" * 512):
+            valid = io.BytesIO()
+            with tarfile.open(fileobj=valid, mode="w") as archive:
+                add_bytes(archive, "file", b"x")
+            # tarfile 的迭代器会把首个合法成员后的坏头当作结束，校验器须显式拒绝。
+            invalid_tail = valid.getvalue()[:1024] + b"x" * 512
+            for raw in (b"not a tar archive", info.tobuf() + b"x" * 512, invalid_tail):
                 layer.write_bytes(raw)
                 config = empty_config()
                 config["rootfs"]["diff_ids"] = ["sha256:" + hashlib.sha256(raw).hexdigest()]

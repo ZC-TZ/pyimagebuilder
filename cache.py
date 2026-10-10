@@ -11,11 +11,11 @@ from pathlib import Path
 
 from errors import ArchiveError, BuildError
 from compat import is_linked_directory
-from image_reader import digest_hex, sha256_file
+from image_reader import digest_hex, sha256_file, verify_layer_tar
 
 
-# 旧发布器只校验复制前的源文件，旧可信身份可能对应错误层，需重新构建条目。
-CACHE_VERSION = 7
+# 旧条目只识别第一个 tar 头，可能信任负载截断的层，不能沿用可信身份。
+CACHE_VERSION = 8
 
 
 def cache_key(*values):
@@ -67,8 +67,10 @@ class LayerCache:
                 return None
             signature = self._identity(path)
             if self.verify or metadata.get("file_identity") != signature:
-                if sha256_file(path) != digest or not tarfile.is_tarfile(path):
+                if sha256_file(path) != digest:
                     return None
+                with open(path, "rb") as checked_layer:
+                    verify_layer_tar(checked_layer, "instruction cache layer")
                 if not self.verify:
                     metadata["file_identity"] = signature
                     descriptor, pending = tempfile.mkstemp(prefix="entry-", suffix=".part", dir=self.entries)
@@ -96,6 +98,8 @@ class LayerCache:
             source = Path(layer_path)
             if sha256_file(source) != digest:
                 raise BuildError("Generated layer DiffID changed before cache publication")
+            with open(source, "rb") as checked_layer:
+                verify_layer_tar(checked_layer, "generated instruction layer")
             target = self.layers / (digest + ".tar")
             if not target.is_file() or target.stat().st_size != source.stat().st_size or sha256_file(target) != digest:
                 descriptor, temporary = tempfile.mkstemp(prefix="layer-", suffix=".part", dir=self.layers)

@@ -43,11 +43,15 @@ OCI 导入按已验证的原始 manifest 字节入库，保留其 digest、格�
 
 校验器返回 `oci-layout`、index、manifest 和 config 的原始 JSON 字节快照，每份最多 16 MiB。导入重开文件时，先与快照逐字节比对并核对成员集合、类型和层大小，再按快照中的摘要复制层。即使输入被另一份摘要自洽的合法归档替换，也会拒绝发布引用；使用 `--replace` 时失败保留已有引用。校验同时检查层可作为 tar 读取及成员负载是否截断，摘要一致不能代替 tar 结构检查。
 
+CAS 的 manifest/config/ref 文件同样限量读取，每份最多 16 MiB，并拒绝 NaN/Infinity。Registry 拉取会在下载 config 前检查 descriptor 大小；Artifactory 文件在下载后、解析前检查上限。正常 config 的原始字节不会重新序列化，ImageID 保持不变。
+
 此前导入过的 OCI 引用仍可使用；若旧实现曾重建 manifest，重新导入带不同原始摘要的同标签归档时，需要 `--replace` 才更新镜像身份。基础 layer blob 可继续去重复用，不要求清空镜像库。
 
 ## 构建如何复用层
 
 普通 `build` 和 Fast 现在直接从 CAS 读取基础 config 与 layer；首次从 Registry/Artifactory 下载供构建使用时，也可直接校验入库，跳过 Docker tar 的转换与打包。标准 Registry 拉取会解压并核对 diff ID，同时保存压缩 blob 和已验证的未压缩 tar，随后构建直接复用 tar，不重复解压。Artifactory 的 CAS-only 路径保留压缩 blob，首次构建时解压、核对 diff ID，并把未压缩 tar 也按摘要存入 CAS，后续构建复用。两种层表示的磁盘占用会叠加，实际存储量由压缩率决定；保留它们是为了兼顾原始传输摘要和构建速度。显式 `--base-tar`、`--base-map` 的旧式路径仍由 Docker archive reader 读取。独立 `pull`、`save` 和 `cas export` 仍会生成 Docker tar，供 `docker load` 使用；因此仓库中同时存在 CAS 和归档时，磁盘用量还会增加。当前层解码路径支持 gzip 和未压缩 tar，不支持 zstd；遇到 zstd 会明确报错，不能假定安装第三方模块后就会自动接入。
+
+仅识别开头是否像 tar 不足以证明完整性。下载和读取路径共用层结构检查，核对成员负载、padding 及结束位置；CAS 新解码层在入库前检查，已有解码层在使用时再次检查。指令缓存版本为 8、显式 tar 的基础层缓存版本为 2，旧条目自动重新构建或验证。CAS schema 仍为 1，无需清库或重新下载正常镜像。`import_registry` 的低层接口仍允许保存压缩传输 blob，不独立保证 DiffID 和解压成功；标准 Registry pull 和基础镜像消费路径负责这两项验证。
 
 ### 刷新与已有 tar 校验
 

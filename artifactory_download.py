@@ -39,6 +39,8 @@ from urllib.request import (Request, build_opener, HTTPBasicAuthHandler,
 
 from compat import unlink_missing
 from file_publish import publish_new_file
+from errors import ArchiveError
+from image_reader import read_image_json_file, verify_layer_tar
 
 
 class DirectoryLinks(html.parser.HTMLParser):
@@ -410,11 +412,10 @@ def find_blob(root: Path, digest: str, field_name: str) -> Path:
 
 
 def load_json_object(path: Path, description: str) -> dict:
-    """读取 Registry 元数据 JSON，并在结构错误时附上文件用途。"""
+    """有界读取 Registry JSON，拒绝非 JSON 数值，并在错误中附上文件用途。"""
     try:
-        with path.open("r", encoding="utf-8") as source:
-            value = json.load(source)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value, _ = read_image_json_file(path, description)
+    except ArchiveError as exc:
         raise RuntimeError("{} 不是有效 JSON：{}".format(description, exc))
     if not isinstance(value, dict):
         raise RuntimeError("{} 必须是 JSON 对象".format(description))
@@ -490,9 +491,12 @@ def materialize_layer(blob: Path, target: Path, media_type: str,
         raise RuntimeError("第 {} 层 diff_id 校验失败：期望 {}，实际 {}".format(
             index, expected_hex, actual_hex
         ))
-    if not tarfile.is_tarfile(str(target)):
+    try:
+        with target.open("rb") as checked_layer:
+            verify_layer_tar(checked_layer, "Artifactory layer {}".format(index))
+    except ArchiveError as exc:
         target.unlink()
-        raise RuntimeError("第 {} 层解压后不是有效 tar".format(index))
+        raise RuntimeError("第 {} 层解压后不是有效 tar：{}".format(index, exc)) from exc
     return "sha256:" + actual_hex
 
 
@@ -876,8 +880,7 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
             format_size(stats.snapshot()), format_duration(download_elapsed),
             "校验并写入 CAS" if cas_only else "转换 Registry V2 格式"))
         if cas_store is not None:
-            manifest_raw = (raw_root / "manifest.json").read_bytes()
-            manifest = json.loads(manifest_raw)
+            manifest, manifest_raw = read_image_json_file(raw_root / "manifest.json", "Artifactory manifest")
             config_path = find_blob(raw_root, manifest["config"]["digest"], "config.digest")
             layer_paths = [find_blob(raw_root, item["digest"], "layer.digest")
                            for item in manifest["layers"]]

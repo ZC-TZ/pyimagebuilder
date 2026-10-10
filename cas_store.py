@@ -19,7 +19,8 @@ from pathlib import Path
 from compat import is_linked_directory, unlink_missing
 from errors import ArchiveError, BuildError
 from image_reader import (BaseImage, ImageArchiveReader, archive_members, digest_hex,
-                          image_history, sha256_file)
+                          image_history, parse_image_json, read_image_json_file, sha256_file,
+                          verify_layer_tar)
 from image_writer import ImageArchiveWriter
 from oci_writer import OCIImageWriter, CONFIG_TYPE, LAYER_TYPE, MANIFEST_TYPE
 from platforms import architecture, normalize_platform
@@ -84,10 +85,10 @@ class CASStore:
         result = []
         for path in sorted(self.refs.glob("*.json")) if self.refs.is_dir() else []:
             try:
-                value = json.loads(path.read_text(encoding="utf-8"))
+                value, _ = read_image_json_file(path, "CAS ref")
                 if value.get("schemaVersion") == SCHEMA_VERSION:
                     result.append(value)
-            except (OSError, ValueError, AttributeError):
+            except (OSError, ValueError, AttributeError, ArchiveError):
                 continue
         return result
 
@@ -141,9 +142,9 @@ class CASStore:
     def store_decoded_layer(self, path, diff_id):
         """校验并保存拉取阶段已解压的层，避免随后构建再次解压。"""
         path = Path(path)
-        if not tarfile.is_tarfile(path):
-            raise ArchiveError("Decoded CAS layer is not a tar archive: " + diff_id)
         with open(path, "rb") as stream:
+            verify_layer_tar(stream, "decoded CAS layer: " + diff_id)
+            stream.seek(0)
             return self._put_stream(stream, diff_id, path.stat().st_size)
 
     def _publish(self, reference, platform, source, config_digest, layers,
@@ -174,17 +175,19 @@ class CASStore:
         destination = self._ref(reference, platform, source)
         if destination.is_file() and not replace:
             try:
-                previous = json.loads(destination.read_text(encoding="utf-8"))
+                previous, _ = read_image_json_file(destination, "existing CAS ref")
             except (OSError, ValueError) as exc:
                 raise ArchiveError("Invalid existing CAS ref: " + str(destination)) from exc
             if not isinstance(previous, dict):
                 raise ArchiveError("Invalid existing CAS ref: " + str(destination))
             if previous.get("manifest") != manifest_digest:
                 raise BuildError("CAS tag conflicts; use --replace: " + reference)
+        raw = _json(value)
+        parse_image_json(raw, "new CAS ref")
         descriptor, pending = tempfile.mkstemp(prefix="ref-", suffix=".part", dir=self.refs)
         try:
             with os.fdopen(descriptor, "wb") as output:
-                output.write(_json(value))
+                output.write(raw)
                 output.flush()
                 os.fsync(output.fileno())
             os.replace(pending, destination)
@@ -197,7 +200,7 @@ class CASStore:
         """保存当前 ref 的原始字节用于失败恢复；不存在时返回 None。"""
         with self.ref_lock(reference, platform, source):
             path = self._ref(reference, normalize_platform(platform), source)
-            return path.read_bytes() if path.is_file() else None
+            return read_image_json_file(path, "CAS ref snapshot")[1] if path.is_file() else None
 
     def restore_ref(self, reference, platform, source, raw):
         """持锁恢复先前 ref；调用方须从快照开始持有 ref_lock，避免恢复过期快照。"""
@@ -229,10 +232,10 @@ class CASStore:
         """
         platform = normalize_platform(platform)
         try:
-            manifest = json.loads(manifest_raw)
+            manifest = parse_image_json(manifest_raw, "Registry manifest")
             config_entry = manifest["config"]
             descriptors = manifest["layers"]
-            config = json.loads(Path(config_path).read_bytes())
+            config, config_raw = read_image_json_file(config_path, "Registry config")
             diff_ids = config["rootfs"]["diff_ids"]
         except (ValueError, KeyError, TypeError, AttributeError) as exc:
             raise ArchiveError("Invalid Registry manifest or config") from exc
@@ -245,10 +248,11 @@ class CASStore:
         if config.get("os") != "linux" or config.get("architecture") != architecture(platform):
             raise ArchiveError("Registry image platform does not match " + platform)
         config_digest = config_entry.get("digest")
-        if config_entry.get("size") is not None and config_entry["size"] != Path(config_path).stat().st_size:
+        if config_entry.get("size") is not None and config_entry["size"] != len(config_raw):
             raise ArchiveError("Registry config descriptor size mismatch")
-        with open(config_path, "rb") as stream:
-            self._put_stream(stream, config_digest, Path(config_path).stat().st_size)
+        if hashlib.sha256(config_raw).hexdigest() != digest_hex(config_digest):
+            raise ArchiveError("Registry config descriptor digest mismatch")
+        self._put_bytes(config_raw)
         layers = []
         for entry, path, diff_id in zip(descriptors, layer_paths, diff_ids):
             if not isinstance(entry, dict):
@@ -260,7 +264,7 @@ class CASStore:
                 raise ArchiveError("Registry layer descriptor size mismatch")
             with open(path, "rb") as stream:
                 self._put_stream(stream, digest, size)
-            with open(path, "rb") as stream:
+            with self._blob(digest).open("rb") as stream:
                 magic = stream.read(2)
             media_type = entry.get("mediaType") or ("application/vnd.oci.image.layer.v1.tar+gzip"
                      if magic == b"\x1f\x8b" else LAYER_TYPE)
@@ -356,7 +360,7 @@ class CASStore:
             path = self._ref(reference, platform, kind)
             if path.is_file():
                 try:
-                    value = json.loads(path.read_text(encoding="utf-8"))
+                    value, _ = read_image_json_file(path, "CAS ref")
                 except (OSError, ValueError) as exc:
                     raise ArchiveError("Invalid CAS ref: " + str(path)) from exc
                 if (not isinstance(value, dict) or value.get("schemaVersion") != SCHEMA_VERSION or
@@ -397,7 +401,7 @@ class CASStore:
                for item in value["layers"]):
             raise ArchiveError("CAS layer descriptor size mismatch")
         try:
-            manifest = json.loads(self._blob(value["manifest"]).read_bytes())
+            manifest, _ = read_image_json_file(self._blob(value["manifest"]), "CAS manifest")
             config_entry = manifest["config"]
             manifest_layers = manifest["layers"]
             matches = (manifest.get("schemaVersion") == 2 and
@@ -418,7 +422,7 @@ class CASStore:
         if not matches:
             raise ArchiveError("CAS manifest/ref mismatch")
         try:
-            config = json.loads(self._blob(value["config"]).read_bytes())
+            config, _ = read_image_json_file(self._blob(value["config"]), "CAS config")
             rootfs = config["rootfs"]
             if (config.get("os") != "linux" or
                     config.get("architecture") != architecture(platform) or
@@ -446,7 +450,7 @@ class CASStore:
             try:
                 if ref_path.is_symlink():
                     raise ArchiveError("CAS ref path is a symlink")
-                value = json.loads(ref_path.read_text(encoding="utf-8"))
+                value, _ = read_image_json_file(ref_path, "CAS ref for GC")
                 if (not isinstance(value, dict) or value.get("schemaVersion") != SCHEMA_VERSION or
                         not isinstance(value.get("layers"), list) or
                         any(not isinstance(value.get(key), str) or not value[key]
@@ -482,8 +486,7 @@ class CASStore:
         output = Path(output).resolve()
         if output.exists():
             raise BuildError("CAS export output already exists: " + str(output))
-        config_raw = self._blob(value["config"]).read_bytes()
-        config = json.loads(config_raw)
+        config, config_raw = read_image_json_file(self._blob(value["config"]), "CAS export config")
         if (config.get("rootfs", {}).get("diff_ids") !=
                 [item["diff_id"] for item in value["layers"]]):
             raise ArchiveError("CAS config DiffIDs do not match ref")
@@ -505,8 +508,10 @@ class CASStore:
                         raise ArchiveError("Cannot decompress CAS layer: " + str(exc)) from exc
                 else:
                     raise BuildError("Unsupported CAS layer compression: " + media_type)
-                if sha256_file(layer) != digest_hex(item["diff_id"]) or not tarfile.is_tarfile(layer):
+                if sha256_file(layer) != digest_hex(item["diff_id"]):
                     raise ArchiveError("CAS layer DiffID or tar format mismatch")
+                with open(layer, "rb") as checked_layer:
+                    verify_layer_tar(checked_layer, "CAS export layer")
                 layers.append(layer)
             writer = ImageArchiveWriter()
             created = False
@@ -533,8 +538,7 @@ class CASStore:
         """
         value = self.resolve(reference, platform, source)
         try:
-            config_raw = self._blob(value["config"]).read_bytes()
-            config = json.loads(config_raw)
+            config, config_raw = read_image_json_file(self._blob(value["config"]), "CAS base config")
             diff_ids = config["rootfs"]["diff_ids"]
             if (config.get("os") != "linux" or
                     config.get("architecture") != architecture(normalize_platform(platform)) or
@@ -563,6 +567,8 @@ class CASStore:
                             for block in iter(lambda: source_stream.read(BUFFER), b""):
                                 target.write(block)
                         with open(pending, "rb") as source_stream:
+                            verify_layer_tar(source_stream, "decoded CAS base layer")
+                            source_stream.seek(0)
                             self._put_stream(source_stream, diff_id, Path(pending).stat().st_size)
                     except (OSError, EOFError, zlib.error) as exc:
                         raise ArchiveError("Cannot decode CAS base layer: " + str(exc)) from exc
@@ -572,13 +578,13 @@ class CASStore:
                     raise ArchiveError("CAS decoded layer is corrupt: " + diff_id)
             else:
                 raise BuildError("Unsupported CAS layer compression: " + media_type)
-            if not tarfile.is_tarfile(layer):
-                raise ArchiveError("CAS base layer is not a tar archive: " + diff_id)
+            with open(layer, "rb") as checked_layer:
+                verify_layer_tar(checked_layer, "CAS base layer: " + diff_id)
             paths.append(layer)
         return BaseImage(config, paths, [reference],
                          {"CASManifest": value["manifest"], "Source": value["source"]},
                          value["config"], config_raw,
-                         manifest_raw=self._blob(value["manifest"]).read_bytes(),
+                         manifest_raw=read_image_json_file(self._blob(value["manifest"]), "CAS base manifest")[1],
                          manifest_digest=value["manifest"])
 
 

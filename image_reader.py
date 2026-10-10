@@ -18,8 +18,8 @@ from platforms import architecture, normalize_platform
 BUFFER = 4 * 1024 * 1024
 MAX_JSON = 16 * 1024 * 1024
 SHA256 = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
-# 无版本的旧条目没有证明跨磁盘副本经过校验，首次复用必须重新验证。
-BASE_CACHE_VERSION = 1
+# 旧条目只识别首个 tar 头，未证明成员负载完整；首次复用需重新验证。
+BASE_CACHE_VERSION = 2
 
 
 def digest_hex(value):
@@ -75,11 +75,29 @@ def verify_layer_tar(stream, label):
         stream.seek(0)
         with tarfile.open(fileobj=stream, mode="r:") as archive:
             for member in archive:
+                if member.size < 0:
+                    raise ArchiveError("Negative layer member size: " + label)
                 # GNU sparse 的 size 是展开后长度，归档仅存储 sparse 映射中的数据段。
                 stored_size = (sum(length for _, length in member.sparse)
                                if member.sparse is not None else member.size)
-                if member.offset_data + stored_size > size:
+                if member.sparse is not None:
+                    previous_end = 0
+                    for offset, length in member.sparse:
+                        if offset < 0 or length < 0 or offset + length > member.size:
+                            raise ArchiveError("Invalid sparse layer map: " + label)
+                        if length == 0:
+                            continue  # GNU 旧格式用 (0, 0) 填充未使用的 sparse 槽位。
+                        if offset < previous_end:
+                            raise ArchiveError("Overlapping sparse layer map: " + label)
+                        previous_end = offset + length
+                padded_size = (stored_size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE * tarfile.BLOCKSIZE
+                if member.offset_data + padded_size > size:
                     raise ArchiveError("Truncated layer tar: " + label)
+            # TarFile.next 会把后续校验和错误或短头吞成 EOF；只接受真正的 EOF/零结束块。
+            stream.seek(archive.offset)
+            terminal = stream.read(tarfile.BLOCKSIZE)
+            if terminal and terminal != b"\0" * tarfile.BLOCKSIZE:
+                raise ArchiveError("Invalid layer tar header: " + label)
     except (tarfile.TarError, ValueError) as exc:
         raise ArchiveError("Invalid layer tar: " + label) from exc
 
@@ -140,6 +158,17 @@ def parse_image_json(raw, label="image JSON"):
     if not isinstance(decoded, dict):
         raise ArchiveError(label + " must be a JSON object")
     return decoded
+
+
+def read_image_json_file(path, label="image JSON"):
+    """有界读取 JSON 文件，返回 (解析对象, 原始字节)，供身份保持与解析共用。
+
+    不能先 read_bytes 再检查长度，否则超大元数据已经占满内存。
+    同次读取的原始字节也用于入库，避免重开文件混入另一份配置。
+    """
+    with open(path, "rb") as stream:
+        raw = stream.read(MAX_JSON + 1)
+    return parse_image_json(raw, label), raw
 
 
 def image_json_bytes(value, raw=None, label="image JSON"):
@@ -415,8 +444,8 @@ class ImageArchiveReader:
                                 progress(copied, member.size, "Extracting base layer {}/{}".format(index, len(names)))
                     if hasher.hexdigest() != digest_hex(expected):
                         raise ArchiveError("Layer {} DiffID mismatch".format(index))
-                    if not tarfile.is_tarfile(target):
-                        raise ArchiveError("Layer {} is not a tar archive".format(index))
+                    with open(target, "rb") as checked_layer:
+                        verify_layer_tar(checked_layer, "base layer {}".format(index))
                     paths.append(self._publish_layer(target, location, expected))
                 return BaseImage(config, paths, selected.get("RepoTags") or [], selected,
                                  "sha256:" + hashlib.sha256(config_raw).hexdigest(), config_raw)

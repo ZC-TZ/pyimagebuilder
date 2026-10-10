@@ -28,7 +28,8 @@ from errors import ArchiveError, BuildError
 from compat import unlink_missing
 from cas_store import docker_archive_tag
 from image_reader import (BaseImage, ImageArchiveReader, archive_members, digest_hex,
-                          image_history, image_json_bytes, same_json_value, sha256_file)
+                          image_history, image_json_bytes, parse_image_json, read_image_json_file,
+                          same_json_value, sha256_file, verify_layer_tar)
 from image_writer import ImageArchiveWriter
 from file_publish import publish_new_file
 from oci_writer import (CONFIG_TYPE, INDEX_TYPE, LAYER_TYPE, MANIFEST_TYPE,
@@ -100,8 +101,8 @@ def _json(raw, label):
     if len(raw) > MAX_JSON:
         raise BuildError(label + " exceeds 16 MiB")
     try:
-        value = json.loads(raw)
-    except (UnicodeError, ValueError) as exc:
+        value = parse_image_json(raw, label)
+    except ArchiveError as exc:
         raise BuildError("Invalid {} JSON: {}".format(label, exc)) from exc
     if not isinstance(value, dict):
         raise BuildError(label + " must be a JSON object")
@@ -405,11 +406,13 @@ def pull(reference, output, username=None, password=None, ca_file=None,
                     not same_json_value(_json(manifest_raw, "selected Registry manifest"), manifest)):
                 raise BuildError("Registry client did not retain verified selected manifest bytes")
         config_descriptor = _descriptor(manifest.get("config"), (CONFIG_TYPE, DOCKER_CONFIG))
+        # config 走 blob 流下载；响应 JSON 上限不会覆盖这条路径，需在传输前检查。
+        if config_descriptor["size"] > MAX_JSON:
+            raise BuildError("Registry image config exceeds 16 MiB")
         config_path = workspace / "config.json"
         with reporter.timed("Download Registry config") if reporter is not None else nullcontext():
             client.blob(config_descriptor, config_path)
-        config_raw = config_path.read_bytes()
-        config = _json(config_raw, "image config")
+        config, config_raw = read_image_json_file(config_path, "Registry image config")
         if config.get("os") != "linux" or config.get("architecture") != architecture(target_platform):
             raise BuildError("Registry image config does not match " + target_platform)
         rootfs = config.get("rootfs")
@@ -470,8 +473,10 @@ def pull(reference, output, username=None, password=None, ca_file=None,
                         shutil.copyfileobj(source, target, BUFFER)
                 except (OSError, EOFError, zlib.error) as exc:
                     raise BuildError("Invalid compressed Registry layer: " + str(exc)) from exc
-            if sha256_file(layer) != digest_hex(diff_id) or not tarfile.is_tarfile(layer):
+            if sha256_file(layer) != digest_hex(diff_id):
                 raise BuildError("Registry layer DiffID or tar format mismatch")
+            with open(layer, "rb") as checked_layer:
+                verify_layer_tar(checked_layer, "Registry layer {}".format(index + 1))
             return index, layer
 
         # 并发任务完成顺序不固定，必须按 manifest 位置保存结果，

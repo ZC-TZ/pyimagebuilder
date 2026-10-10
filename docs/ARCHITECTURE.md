@@ -82,9 +82,9 @@ WORKDIR 按当前 USER 创建缺失目录，保留已有父目录的属主。具
 
 `cache.py` 为 `COPY/ADD/WORKDIR/VOLUME/RUN` 保存指令级缓存。基础状态由 `FROM` 引用、基础 image config、base diff IDs 得出。每条指令将自身原文及结果 diff ID 加入连续状态键，因此前面的配置变化、文件内容变化或层结果变化会使后续缓存失效。`COPY/ADD` 额外遍历展开后的来源，哈希文件内容及路径、类型、权限、所有权、修改时间、链接关系；`RUN` 额外计入网络模式。源文件被同时修改时，构建目录应由调用方保持稳定。
 
-条目放在 `entries/<key>.json`，实际未压缩层放在 `layers/<diffid>.tar`。当前指令缓存版本为 7，旧条目不能复用。默认命中检查版本、键、大小与文件身份；身份变化或指定 --verify-cache 时重新核对 SHA-256 与 tar 格式。新层副本关闭、刷新后，在发布前重新校验摘要，再原子替换层与条目；失败不能把错误副本记为可信，既有条目保留。条目大小来自实际目标层。空层也能命中。`RUN` 命中后跳过 rootfs 物化、OverlayFS 与命令执行；未命中才进入 Phase 2 执行路径。基础镜像每次仍需读取与校验，最终归档每次仍要重新生成，因此缓存不保证固定倍数的加速。若外部网络资源改变，`RUN` 缓存无法自动感知，需 `--no-cache` 或修改相应构建输入。
+条目放在 `entries/<key>.json`，实际未压缩层放在 `layers/<diffid>.tar`。当前指令缓存版本为 8，旧条目不能复用：旧校验只识别首个 tar 头，可能信任负载截断的层。默认命中检查版本、键、大小与文件身份；身份变化或指定 --verify-cache 时重新核对 SHA-256、成员负载及结束位置。新层先核对结构，新副本关闭、刷新后在发布前重新校验摘要，再原子替换层与条目；失败不能把错误副本记为可信，既有条目保留。条目大小来自实际目标层。空层也能命中。`RUN` 命中后跳过 rootfs 物化、OverlayFS 与命令执行；未命中才进入 Phase 2 执行路径。基础镜像每次仍需读取与校验，最终归档每次仍要重新生成，因此缓存不保证固定倍数的加速。若外部网络资源改变，`RUN` 缓存无法自动感知，需 `--no-cache` 或修改相应构建输入。
 
-显式 tar 的可信基础层缓存由 ImageArchiveReader 单独管理。跨文件系统发布时，临时副本必须核对预期 DiffID 才能移动到共享层路径；失败清理副本，保留 workspace 文件。基础层条目现在包含 version=1，旧无版本条目首次使用会重新提取、验证并写入新记录，避免继续信任旧发布器可能写出的错误身份。首次写入新指令层副本或跨磁盘基础层副本增加一次内容读取；正常命中的快速检查保留。CAS 的读取与入库逻辑不受这次缓存版本更新影响。
+显式 tar 的可信基础层缓存由 ImageArchiveReader 单独管理。跨文件系统发布时，临时副本必须核对预期 DiffID 才能移动到共享层路径；失败清理副本，保留 workspace 文件。基础层条目现在包含 version=2，旧无版本及 version=1 条目首次使用会重新提取、验证结构并写入新记录。旧条目可能对应首个 tar 头可读、实际负载已截断的层，不能继续信任。正常新版本命中的快速检查保留；无需手动清理缓存。CAS ref schema 仍为 1，读取层时另外执行结构检查。
 
 ## 多阶段状态
 
@@ -109,6 +109,8 @@ blobs/sha256/<uncompressed layer digest> ...
 OCI 校验、CAS 导入、Registry 单/多平台推送和多平台合并均通过 `image_reader.archive_members` 索引归档成员。索引允许 `./` 前缀，但拒绝规范化后重复或越界的成员；读取时使用索引中的 TarInfo，不能回到按未规范化名称查找的方式。CAS 导入保存原始 OCI manifest 字节，不因重新 JSON 序列化而改变其身份。Registry push 会将未压缩层转换成确定性的 gzip，因此远端 manifest 摘要可能变化，这是与原样导入 CAS 不同的处理步骤。
 
 Docker 最终校验也使用该成员索引，要求所引用的 JSON 和 layer 为普通文件；manifest/config JSON 有 16 MiB 上限，拒绝非法 rootfs 和非 JSON 数值常量。两种 writer 校验器核对层摘要后，在同一可寻址流上检查 tar 头和成员负载边界，不二次完整读取负载；GNU sparse 使用实际存储的数据段长度。OCI 校验器返回四份元数据的原始字节快照，CAS 导入重开文件时与其比对，防止校验对象被一份同样合法的新归档替换。路径、whiteout 和执行语义仍由后续 rootfs 消费者验证。
+
+`verify_layer_tar` 也用于 Registry 解压、Artifactory 转换、基础归档读取、CAS 解码/复用及指令缓存入库；不能等最终导出才发现坏层。检查包括负载和 padding 边界，以及迭代结束位置是否真为 EOF/零块，防止 `tarfile` 把后续坏文件头吞成结束。`read_image_json_file` 限量读取再解析 JSON，并返回同次读取的原字节；Artifactory 与 CAS 的 manifest/config/ref 共用这一入口。Registry config descriptor 在下载前受 16 MiB 限制，其他文件入口在解析前受该上限限制。拒绝 NaN/Infinity，所有转存仍保留原始字节。
 
 Docker 归档入口共用 docker_manifest 校验 Config、Layers 与 RepoTags 的结构；RepoTags 只允许字符串数组、null 或缺省，不能把字符串子串或对象键当成标签。CLI 先确定唯一标签，再由 ImageArchiveReader 按配置平台选择实际条目。BaseImage 携带原始 config_raw/config_digest，以及来源提供时的 manifest_raw/manifest_digest；inspect 使用原始配置摘要报告 ImageID。业务路径明确选择 write_image 转存或 write_new 派生构建，前者强制检查原始字节、类型敏感的值一致性和摘要绑定，后者才编码新配置。仅 FROM 和无变化的前序阶段转接保留原始配置；ImageConfig 的内部缺省补全不再被误写为构建变更。详见 [镜像身份专项审计](IMAGE_IDENTITY.md)。
 
