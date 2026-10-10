@@ -108,6 +108,8 @@ blobs/sha256/<uncompressed layer digest> ...
 
 OCI 校验、CAS 导入、Registry 单/多平台推送和多平台合并均通过 `image_reader.archive_members` 索引归档成员。索引允许 `./` 前缀，但拒绝规范化后重复或越界的成员；读取时使用索引中的 TarInfo，不能回到按未规范化名称查找的方式。CAS 导入保存原始 OCI manifest 字节，不因重新 JSON 序列化而改变其身份。Registry push 会将未压缩层转换成确定性的 gzip，因此远端 manifest 摘要可能变化，这是与原样导入 CAS 不同的处理步骤。
 
+Docker 最终校验也使用该成员索引，要求所引用的 JSON 和 layer 为普通文件；manifest/config JSON 有 16 MiB 上限，拒绝非法 rootfs 和非 JSON 数值常量。两种 writer 校验器核对层摘要后，在同一可寻址流上检查 tar 头和成员负载边界，不二次完整读取负载；GNU sparse 使用实际存储的数据段长度。OCI 校验器返回四份元数据的原始字节快照，CAS 导入重开文件时与其比对，防止校验对象被一份同样合法的新归档替换。路径、whiteout 和执行语义仍由后续 rootfs 消费者验证。
+
 Docker 归档入口共用 docker_manifest 校验 Config、Layers 与 RepoTags 的结构；RepoTags 只允许字符串数组、null 或缺省，不能把字符串子串或对象键当成标签。CLI 先确定唯一标签，再由 ImageArchiveReader 按配置平台选择实际条目。BaseImage 携带原始 config_raw/config_digest，以及来源提供时的 manifest_raw/manifest_digest；inspect 使用原始配置摘要报告 ImageID。业务路径明确选择 write_image 转存或 write_new 派生构建，前者强制检查原始字节、类型敏感的值一致性和摘要绑定，后者才编码新配置。仅 FROM 和无变化的前序阶段转接保留原始配置；ImageConfig 的内部缺省补全不再被误写为构建变更。详见 [镜像身份专项审计](IMAGE_IDENTITY.md)。
 
 旧 tar 适配文件的配置字段、实际层与 CAS 完全一致，但 config 摘要因旧序列化方式不同而变化时，镜像库在同一引用锁内从 CAS 重建临时 tar，验证后原子替换。该恢复不更新 CAS ref，也不访问远端；失败保留原适配文件。内容不一致的 tar 仍拒绝复用。ImageID 是配置字节的 SHA-256，不能与 manifest digest 或整个交付 tar 的摘要互换，定义见 [OCI ImageID](https://github.com/opencontainers/image-spec/blob/main/config.md#imageid)。

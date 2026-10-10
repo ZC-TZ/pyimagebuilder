@@ -63,6 +63,27 @@ def archive_members(archive):
     return members
 
 
+def verify_layer_tar(stream, label):
+    """检查未压缩层能作为 tar 读取，且成员声明的数据没有越过 blob 边界。
+
+    SHA-256 匹配只证明字节一致；任意垃圾数据同样可以拥有正确的 DiffID。
+    在已核对摘要的可寻址流上遍历 tar 头，跳过文件负载，避免再完整读取大层。
+    此检查不解包文件；路径、whiteout 和文件系统语义仍由 rootfs 消费者核对。
+    """
+    try:
+        size = stream.seek(0, 2)
+        stream.seek(0)
+        with tarfile.open(fileobj=stream, mode="r:") as archive:
+            for member in archive:
+                # GNU sparse 的 size 是展开后长度，归档仅存储 sparse 映射中的数据段。
+                stored_size = (sum(length for _, length in member.sparse)
+                               if member.sparse is not None else member.size)
+                if member.offset_data + stored_size > size:
+                    raise ArchiveError("Truncated layer tar: " + label)
+    except (tarfile.TarError, ValueError) as exc:
+        raise ArchiveError("Invalid layer tar: " + label) from exc
+
+
 def docker_manifest(value):
     """校验 Docker save 索引结构，标签必须按数组元素精确匹配。
 

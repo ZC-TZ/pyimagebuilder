@@ -6,7 +6,9 @@ import json
 import tarfile
 
 from errors import ArchiveError
-from image_reader import digest_hex, docker_manifest, image_config_bytes, image_history, outer_name
+from image_reader import (MAX_JSON, archive_members, digest_hex, docker_manifest,
+                          image_config_bytes, image_history, outer_name, parse_image_json,
+                          verify_layer_tar)
 from reproducible import add_file
 
 
@@ -93,48 +95,62 @@ class ImageArchiveWriter:
                 written_bytes += layer_size
 
     def verify(self, path, expected_tag):
-        """重新读取输出归档，核对配置摘要、标签和各层 DiffID。"""
+        """重新读取输出归档，核对成员结构、有界 JSON、配置摘要及各层 DiffID。"""
         try:
             with tarfile.open(path, "r:") as archive:
-                manifest_stream = archive.extractfile("manifest.json")
-                if manifest_stream is None:
-                    raise ArchiveError("Output missing manifest.json")
-                with manifest_stream:
-                    manifests = docker_manifest(json.load(manifest_stream))
+                # extractfile(name) 会选中重复成员或跟随 tar 链接，不能用于发布门禁。
+                members = archive_members(archive)
+
+                def regular_member(name):
+                    member = members.get(name)
+                    if member is None or not member.isfile():
+                        raise ArchiveError("Output missing regular file: " + name)
+                    return member
+
+                def read_json_bytes(name):
+                    member = regular_member(name)
+                    if member.size > MAX_JSON:
+                        raise ArchiveError("Oversized output JSON: " + name)
+                    with archive.extractfile(member) as stream:
+                        raw = stream.read(MAX_JSON + 1)
+                    if len(raw) != member.size or len(raw) > MAX_JSON:
+                        raise ArchiveError("Invalid output JSON size: " + name)
+                    return raw
+
+                def invalid_constant(token):
+                    raise ValueError("Non-JSON numeric constant: " + token)
+
+                manifests = docker_manifest(json.loads(read_json_bytes("manifest.json"),
+                                                       parse_constant=invalid_constant))
                 if not isinstance(manifests, list) or len(manifests) != 1 or not isinstance(manifests[0], dict):
                     raise ArchiveError("Output manifest must contain exactly one image")
                 manifest = manifests[0]
-                if expected_tag not in manifest.get("RepoTags", []):
+                if expected_tag not in (manifest.get("RepoTags") or []):
                     raise ArchiveError("Output image tag mismatch")
                 config_name = outer_name(manifest["Config"])
-                config_stream = archive.extractfile(config_name)
-                if config_stream is None:
-                    raise ArchiveError("Output missing image config")
-                with config_stream:
-                    raw_config = config_stream.read()
+                raw_config = read_json_bytes(config_name)
                 if hashlib.sha256(raw_config).hexdigest() + ".json" != config_name:
                     raise ArchiveError("Output config SHA-256 mismatch")
-                config = json.loads(raw_config)
-                rootfs = config["rootfs"]
-                if rootfs.get("type") != "layers":
+                config = parse_image_json(raw_config, "output image config")
+                rootfs = config.get("rootfs")
+                if not isinstance(rootfs, dict) or rootfs.get("type") != "layers":
                     raise ArchiveError("Output rootfs.type must be layers")
                 diff_ids = rootfs["diff_ids"]
-                names = manifest["Layers"]
+                names = [outer_name(name) for name in manifest["Layers"]]
                 if not isinstance(diff_ids, list) or not isinstance(names, list) or len(diff_ids) != len(names):
                     raise ArchiveError("Output layer count mismatch")
                 image_history(config, len(diff_ids))
                 if len(set(names)) != len(names):
                     raise ArchiveError("Output manifest contains duplicate layers")
                 for name, expected in zip(names, diff_ids):
-                    name = outer_name(name)
-                    stream = archive.extractfile(name)
-                    if stream is None:
-                        raise ArchiveError("Output missing layer: " + name)
+                    stream = archive.extractfile(regular_member(name))
                     hasher = hashlib.sha256()
                     with stream:
                         for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
                             hasher.update(block)
-                    if hasher.hexdigest() != digest_hex(expected):
-                        raise ArchiveError("Output layer DiffID mismatch: " + name)
-        except (tarfile.TarError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                        if hasher.hexdigest() != digest_hex(expected):
+                            raise ArchiveError("Output layer DiffID mismatch: " + name)
+                        verify_layer_tar(stream, name)
+        except (tarfile.TarError, json.JSONDecodeError, KeyError, TypeError, ValueError,
+                UnicodeDecodeError) as exc:
             raise ArchiveError("Invalid output image archive: {}".format(exc)) from exc

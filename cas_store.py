@@ -293,34 +293,42 @@ class CASStore:
     def import_oci(self, archive, reference, platform, source="local", replace=False):
         """导入单平台未压缩 OCI layout，保留校验过的原始 manifest 字节与摘要。"""
         platform = normalize_platform(platform)
-        OCIImageWriter().verify(archive, docker_archive_tag(reference))
+        snapshot = OCIImageWriter().verify(archive, docker_archive_tag(reference))
         with tarfile.open(archive, "r:") as source_archive:
             members = archive_members(source_archive)
-            with source_archive.extractfile(members["index.json"]) as stream:
-                index = json.load(stream)
+            # 锚定第一次校验的原始身份；替换后的自洽 manifest/config 不能替代快照。
+            for name, raw in snapshot.items():
+                member = members.get(name)
+                if member is None or not member.isfile() or member.size != len(raw):
+                    raise ArchiveError("OCI metadata changed after verification: " + name)
+                with source_archive.extractfile(member) as stream:
+                    if stream.read(len(raw) + 1) != raw:
+                        raise ArchiveError("OCI metadata changed after verification: " + name)
+            index = json.loads(snapshot["index.json"])
             descriptor = index["manifests"][0]
             if descriptor["platform"] != {"os": "linux", "architecture": architecture(platform)}:
                 raise ArchiveError("OCI archive platform does not match " + platform)
             manifest_name = "blobs/sha256/" + digest_hex(descriptor["digest"])
-            with source_archive.extractfile(members[manifest_name]) as stream:
-                manifest_raw = stream.read()
-            if (len(manifest_raw) != descriptor["size"] or
-                    "sha256:" + hashlib.sha256(manifest_raw).hexdigest() != descriptor["digest"]):
-                raise ArchiveError("OCI manifest changed after verification")
+            manifest_raw = snapshot[manifest_name]
             manifest = json.loads(manifest_raw)
             config_entry = manifest["config"]
             config_name = "blobs/sha256/" + digest_hex(config_entry["digest"])
-            with source_archive.extractfile(members[config_name]) as stream:
-                config_raw = stream.read()
-            if (len(config_raw) != config_entry["size"] or
-                    "sha256:" + hashlib.sha256(config_raw).hexdigest() != config_entry["digest"]):
-                raise ArchiveError("OCI config changed after verification")
+            config_raw = snapshot[config_name]
             config = json.loads(config_raw)
             if config.get("architecture") != architecture(platform) or config.get("os") != "linux":
                 raise ArchiveError("OCI config platform does not match " + platform)
             diff_ids = config.get("rootfs", {}).get("diff_ids")
             if not isinstance(diff_ids, list) or len(diff_ids) != len(manifest["layers"]):
                 raise ArchiveError("OCI config/layer count mismatch")
+            expected_members = set(snapshot)
+            expected_members.update("blobs/sha256/" + digest_hex(entry["digest"])
+                                    for entry in manifest["layers"])
+            if set(members) != expected_members or any(not member.isfile() for member in members.values()):
+                raise ArchiveError("OCI members changed after verification")
+            for entry in manifest["layers"]:
+                name = "blobs/sha256/" + digest_hex(entry["digest"])
+                if members[name].size != entry["size"]:
+                    raise ArchiveError("OCI layer size changed after verification: " + name)
             config_digest = self._put_bytes(config_raw)
             layers = []
             for entry, diff_id in zip(manifest["layers"], diff_ids):

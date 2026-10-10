@@ -87,7 +87,7 @@ CAS 的统一 ref 发布入口在落盘 blob 与 ref 之间核对 manifest/confi
 | `attest.py` / `sbom.py` | 签名校验使用原始 DSSE payload/provenance 字节；subject 绑定实际归档 SHA-256 | 新 SBOM、provenance、信封的确定性编码；没有把它们的 ID 当成 ImageID |
 | `conformance.py` / `progress/renderer_json.py` | 不负责转存现有身份 | 构造验收镜像、测试报告、进度事件 |
 
-更新后全项目生产代码的实际镜像写入调用都明确选择了新建或转存接口；低层 writer 内部的 `write` 只承担归档实现和兼容职责。
+更新后全项目生产代码的实际镜像写入调用都明确选择了 `write_new` 新建或 `write_image` 转存接口；writer 内部的 `_write` 仅承担共用归档实现。
 
 ## 5. 本轮修复的剩余问题
 
@@ -100,6 +100,7 @@ CAS 的统一 ref 发布入口在落盘 blob 与 ref 之间核对 manifest/confi
 | push-index 无变化也重建 index，或丢失扩展字段 | 完全相同时复用 index raw；有变化时复制扩展字段后更新引用 |
 | push、优化和多平台合并丢失部分描述符注解 | 保留注解及扩展字段；只移除不再对应新 blob 的内联 data/外部 urls |
 | CAS 使用校验后的另一份 config，或发布不匹配 manifest/ref | 原始快照复用、再消费时核对描述符、统一发布预检 |
+| OCI 校验后整份归档被另一合法镜像替换，自洽的新摘要绕过复核 | 校验返回原始 JSON 快照，重开归档逐字节核对，按快照绑定层摘要；失败不更新 ref |
 | 布尔、整数、浮点和正负零被宽松比较混同 | 类型敏感的值比较；拒绝修改后的解析对象转存 |
 | 新 config 可以编码 NaN/Infinity | 新 JSON 禁止这些非 JSON 常量；原始 blob 的共同解析辅助函数也拒绝它们 |
 | 优化器对 `./` 归档成员解释与其他入口不同 | 共用规范化归档成员索引 |
@@ -109,6 +110,8 @@ CAS 的统一 ref 发布入口在落盘 blob 与 ref 之间核对 manifest/confi
 新增 `tests/test_image_identity_contract.py` 的 21 项测试，样例包含非规范键顺序、缩进、末尾换行、中文转义、额外字段、布尔/整数/浮点和正负零。断言同时比较原始字节与 digest，不只比较 dict。
 
 覆盖 Docker/OCI 无变化优化、实际裁层、FROM-only 与多阶段构建、缺省 history / config:null、真实 COPY 派生、load→tag→CAS→save、Artifactory 转换、真实本地 HTTP 拉取压缩/未压缩层→CAS→多阶段构建、零层 push、多平台 index、错误原始字节/声明摘要/对象变更、CAS 验证后的受控输入替换、签署和核对真实输出。
+
+`tests/test_archive_verification_contract.py` 补充发布门禁测试，覆盖重复成员、链接层、异常 rootfs、JSON 上限、非 JSON 常量、合法归档整体替换、失败保留既有引用、原始字节快照、摘要正确但非 tar 的层，以及 GNU sparse 层的物理长度。完整回归的最新解释器和数量见 [开发与维护](../CONTRIBUTING.md)，下面的数字是首次专项审查记录。
 
 首次专项测试的 13 项包含 15 个失败子样例和 7 个错误子样例；其中 4 个错误是计划新增的转存接口当时尚不存在，不能当作旧功能 bug 统计。随后增加贯通及真实变更测试，验证修复不强行保留已修改镜像的旧身份。
 

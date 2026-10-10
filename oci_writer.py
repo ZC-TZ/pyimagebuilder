@@ -7,8 +7,8 @@ import json
 import tarfile
 
 from errors import ArchiveError
-from image_reader import (archive_members, digest_hex, image_config_bytes, image_history, image_json_bytes,
-                          parse_image_json, same_json_value)
+from image_reader import (MAX_JSON, archive_members, digest_hex, image_config_bytes, image_history, image_json_bytes,
+                          parse_image_json, same_json_value, verify_layer_tar)
 from reproducible import add_file
 
 
@@ -137,7 +137,11 @@ class OCIImageWriter:
                     seen.add(descriptor["digest"])
 
     def verify(self, path, expected_tag):
-        """导出后检查 OCI descriptor、平台、blob 大小与摘要。"""
+        """检查 OCI 引用与 blob，返回四份元数据的原始字节快照。
+
+        导入者重开归档时必须与快照比对，防止替换后的合法 descriptor 改写校验对象。
+        快照只保留有大小上限的 JSON，不复制 layer，也不重新编码镜像身份。
+        """
         try:
             with tarfile.open(path, "r:") as archive:
                 members = archive_members(archive)
@@ -145,15 +149,26 @@ class OCIImageWriter:
                     if not member.isfile():
                         raise ArchiveError("OCI layout member is not a file: " + name)
 
-                def read_json(name):
+                snapshot = {}
+
+                def read_json(name, descriptor=None):
                     member = members.get(name)
-                    if member is None or member.size > 16 * 1024 * 1024:
+                    if member is None or member.size > MAX_JSON:
                         raise ArchiveError("Missing or oversized OCI JSON: " + name)
                     stream = archive.extractfile(member)
                     if stream is None:
                         raise ArchiveError("Unreadable OCI JSON: " + name)
                     with stream:
-                        return json.load(stream)
+                        raw = stream.read(MAX_JSON + 1)
+                    if len(raw) != member.size or len(raw) > MAX_JSON:
+                        raise ArchiveError("Invalid OCI JSON size: " + name)
+                    # JSON 读取发生在 blob 流校验之后；这次读取的字节也要绑定同一摘要。
+                    if descriptor is not None and (
+                            len(raw) != descriptor["size"] or
+                            hashlib.sha256(raw).hexdigest() != digest_hex(descriptor["digest"])):
+                        raise ArchiveError("OCI JSON changed during verification: " + name)
+                    snapshot[name] = raw
+                    return parse_image_json(raw, "OCI JSON: " + name)
 
                 def verify_blob(descriptor, media_type):
                     if not isinstance(descriptor, dict) or descriptor.get("mediaType") != media_type:
@@ -172,8 +187,10 @@ class OCIImageWriter:
                     with stream:
                         for block in iter(lambda: stream.read(BUFFER), b""):
                             hasher.update(block)
-                    if hasher.hexdigest() != digest_hex(digest):
-                        raise ArchiveError("OCI blob digest mismatch: " + name)
+                        if hasher.hexdigest() != digest_hex(digest):
+                            raise ArchiveError("OCI blob digest mismatch: " + name)
+                        if media_type == LAYER_TYPE:
+                            verify_layer_tar(stream, name)
                     return name
 
                 if read_json("oci-layout") != {"imageLayoutVersion": "1.0.0"}:
@@ -191,13 +208,13 @@ class OCIImageWriter:
                         annotations.get("org.opencontainers.image.ref.name") != expected_tag):
                     raise ArchiveError("OCI image reference mismatch")
                 manifest_name = verify_blob(reference, MANIFEST_TYPE)
-                manifest = read_json(manifest_name)
+                manifest = read_json(manifest_name, reference)
                 if (not isinstance(manifest, dict) or manifest.get("schemaVersion") != 2 or
                         manifest.get("mediaType") != MANIFEST_TYPE or
                         not isinstance(manifest.get("layers"), list)):
                     raise ArchiveError("Invalid OCI manifest")
                 config_name = verify_blob(manifest.get("config"), CONFIG_TYPE)
-                config = read_json(config_name)
+                config = read_json(config_name, manifest["config"])
                 if (not isinstance(config, dict) or not isinstance(config.get("rootfs"), dict) or
                         config["rootfs"].get("type") != "layers"):
                     raise ArchiveError("Invalid OCI image config")
@@ -218,6 +235,7 @@ class OCIImageWriter:
                 expected.update(_blob_name(item["digest"]) for item in manifest["layers"])
                 if set(members) != expected:
                     raise ArchiveError("Unexpected or missing OCI layout members")
+                return snapshot
         except (tarfile.TarError, json.JSONDecodeError, KeyError, TypeError, ValueError,
                 UnicodeDecodeError) as exc:
             raise ArchiveError("Invalid OCI layout archive: {}".format(exc)) from exc
