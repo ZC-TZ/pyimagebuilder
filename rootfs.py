@@ -83,6 +83,8 @@ class RootFSIndex:
     def read_file(self, path, limit=2 * 1024 * 1024):
         """直接读取镜像中较小的配置文件，无需物化 Linux rootfs。"""
         pending = clean_path(path.lstrip("/")).split("/")
+        if path.endswith("/"):
+            pending.append("")
         resolved = []
         hops = 0
         while pending:
@@ -103,6 +105,12 @@ class RootFSIndex:
                     resolved = []
                 pending = entry.linkname.split("/") + pending
             else:
+                if entry is None:
+                    return None
+                # '..' 不能抵消一个不存在或非目录的中间组件；真实内核会先报错。
+                # 尾部斜杠也要求目录，否则虚拟 passwd 读取会与 chroot 内结果不一致。
+                if pending and entry.kind != "dir":
+                    raise ArchiveError("Rootfs path traverses a non-directory: " + path)
                 resolved.append(part)
         current = "/".join(resolved)
         for _ in range(40):

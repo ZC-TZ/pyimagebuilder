@@ -8,6 +8,7 @@ import tarfile
 from pathlib import Path
 
 from errors import ArchiveError, BuildError
+from image_identity import checked_layer_id
 from rootfs import clean_path, validate_layer_paths
 
 
@@ -84,11 +85,17 @@ class RootFSMaterializer:
         elif path.exists():
             path.unlink()
 
+    def _validate_ownership(self, member):
+        """在修改文件前拒绝无效属主，防止 -1 被系统调用当成保持宿主值。"""
+        checked_layer_id(member.uid, "UID")
+        checked_layer_id(member.gid, "GID")
+        if self.rootless and (member.uid != 0 or member.gid != 0):
+            raise BuildError("Rootless RUN supports only uid/gid 0 in image layers: " + member.name)
+
     def _metadata(self, path, member, symlink=False):
+        self._validate_ownership(member)
         try:
             if self.rootless:
-                if member.uid != 0 or member.gid != 0:
-                    raise BuildError("Rootless RUN supports only uid/gid 0 in image layers: " + str(path))
                 if hasattr(os, "chown"):
                     # setgid 父目录可使新节点继承另一个宿主组；单 GID 映射只允许主组。
                     # 所有者仍是当前用户，非 root 也可将自己文件的组改为自己的主组。
@@ -98,7 +105,7 @@ class RootFSMaterializer:
             if not symlink:
                 os.chmod(path, member.mode, follow_symlinks=False)
             os.utime(path, (member.mtime, member.mtime), follow_symlinks=False)
-        except (OSError, NotImplementedError) as exc:
+        except (OSError, NotImplementedError, OverflowError, ValueError) as exc:
             raise BuildError("Cannot preserve layer metadata for {}: {}".format(path, exc)) from exc
         for key, value in member.pax_headers.items():
             if key.startswith("SCHILY.xattr."):
@@ -122,6 +129,10 @@ class RootFSMaterializer:
                     raise ArchiveError("Duplicate path in layer: " + name)
                 seen.add(name)
             validate_layer_paths(members)
+            # 先检查整层；不能在此前的成员已写入或 whiteout 已删除之后才发现坏 UID。
+            for name, member in members:
+                if not posixpath.basename(name).startswith(".wh."):
+                    self._validate_ownership(member)
             for name, _ in members:
                 base = posixpath.basename(name)
                 parent = posixpath.dirname(name)

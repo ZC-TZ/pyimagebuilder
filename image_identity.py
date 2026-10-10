@@ -6,6 +6,17 @@ from errors import BuildError
 
 
 MAX_ID = (1 << 31) - 1
+MAX_LAYER_ID = (1 << 32) - 2
+
+
+def checked_layer_id(value, label):
+    """检查 Linux 文件属主范围，排除 chown 的 -1/UINT_MAX 保持原值哨兵。
+
+    层文件属主可超过执行 USER 的有符号范围，不能复用账户名称解析的上限。
+    """
+    if type(value) is not int or not 0 <= value <= MAX_LAYER_ID:
+        raise BuildError("Invalid layer {}: {}; expected 0..{}".format(label, value, MAX_LAYER_ID))
+    return value
 
 
 def checked_identity_id(value, label):

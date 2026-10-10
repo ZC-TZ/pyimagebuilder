@@ -54,6 +54,10 @@ sudo python3 main.py build /data/project --base-tar /data/images/base.tar \
 
 secret 来自显式文件，不经 ARG 传递。临时挂载本身不进入 layer；命令若主动将秘密复制到其他路径，仍会留在结果中。支持的挂载选项见兼容表。
 
+### RUN 元数据边界
+
+物化镜像层前检查 Linux 文件属主：UID/GID 必须为 0..4294967294，`-1`、`4294967295` 或更大的值会失败，防止它们被 chown 当作“保留现有属主”。rootless 仍只接受镜像 0:0。执行 USER 的范围按账户解析规则检查，不能把文件属主与执行身份的上限混用。无法在宿主表示的时间戳会报告构建错误。纯归档转存不执行这些系统调用，也不会改写原始配置字节。
+
 ## 平台与双格式
 
 无 RUN 的文件打包可在 Windows 上生成 amd64 或 arm64 镜像；基础镜像和最终目标平台必须一致。存在 RUN 时，跨架构执行需要宿主预先配置 QEMU/binfmt_misc，显式 `--allow-emulated-run` 才允许；工具不会自动安装这些组件。

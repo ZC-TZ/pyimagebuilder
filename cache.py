@@ -17,7 +17,8 @@ from image_reader import digest_hex, sha256_file, verify_layer_tar
 # 旧 RUN 层可能依赖宿主组、错误的附加组或被 umask 削减的 /tmp 权限。
 # 更早版本还遗漏 COPY/ADD 目录元数据和完整 tar 校验，不能复用旧指令层。
 # 版本 10 及更早的跨阶段 COPY 忽略硬链接共享权限，并遗漏源 PAX xattr。
-CACHE_VERSION = 11
+# 版本 11 及更早可能根据无效 passwd 链接或带哨兵 UID/GID 的基础层生成错误结果。
+CACHE_VERSION = 12
 
 
 def cache_key(*values):
