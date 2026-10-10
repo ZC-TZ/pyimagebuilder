@@ -395,6 +395,7 @@ def _fixtures(root):
     for name, dockerfile, files in (
         ("copy_metadata", "FROM scratch\nARG DEST=/opt/app\nENV APP_MODE=prod\n"
          "WORKDIR ${DEST}\nCOPY --chown=1001:1002 --chmod=0640 payload.txt /opt/app/data.txt\n"
+         "COPY --chown=1001:1002 --chmod=0750 payload.txt /created/nested/data.txt\n"
          "LABEL org.example.case=copy\nEXPOSE 8080/tcp\nUSER 1001:1002\n"
          "CMD [\"/opt/app/data.txt\"]\n", {"payload.txt": b"phase15 payload\n"}),
         ("add_multistage", "FROM scratch AS assets\nADD bundle.tar /bundle/\n"
@@ -429,6 +430,13 @@ def _expect(name, current):
             errors.append("Wrong file metadata at /" + path)
     if name == "copy_metadata":
         file_at("opt/app/data.txt", b"phase15 payload\n", 0o640, 1001, 1002)
+        file_at("created/nested/data.txt", b"phase15 payload\n", 0o750, 1001, 1002)
+        # 使用独立读取器检查自动创建的目录，不能只核对最终文件。
+        for path in ("created", "created/nested"):
+            item = tree.get(path, {})
+            if (item.get("type"), item.get("mode"), item.get("uid"), item.get("gid")) != \
+                    ("dir", 0o750, 1001, 1002):
+                errors.append("Wrong created directory metadata at /" + path)
         if runtime["env"].get("APP_MODE") != "prod" or runtime["workdir"] != "/opt/app":
             errors.append("ENV/WORKDIR configuration differs from expected")
         if runtime["user"] != "1001:1002" or runtime["cmd"] != ["/opt/app/data.txt"]:

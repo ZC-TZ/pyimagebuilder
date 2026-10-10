@@ -269,7 +269,8 @@ class LayerBuilder:
         added[name] = kind
         return name
 
-    def _ensure_directories(self, archive, destination, added, ownership=None):
+    def _ensure_directories(self, archive, destination, added, ownership=None, chmod=None):
+        """缺失的目标目录继承传输选项，已有目录保留原有权限和属主。"""
         path = destination.strip("/")
         if not path:
             return
@@ -287,7 +288,7 @@ class LayerBuilder:
                 continue
             info = tarfile.TarInfo(name + "/")
             info.type = tarfile.DIRTYPE
-            info.mode = 0o755
+            info.mode = 0o755 if chmod is None else chmod
             info.uid, info.gid = ownership if ownership is not None else (0, 0)
             info.mtime = self.source_date_epoch
             archive.addfile(info)
@@ -302,7 +303,7 @@ class LayerBuilder:
 
     def _source_node(self, archive, source, name, added, ownership, chmod, hardlinks):
         name = _safe_name(name.strip("/"))
-        self._ensure_directories(archive, posixpath.dirname(name), added)
+        self._ensure_directories(archive, posixpath.dirname(name), added, ownership, chmod)
         data = source.lstat()
         mode = stat.S_IMODE(data.st_mode)
         info = self._info(name, mode, data.st_mtime, 0, 0, ownership, chmod)
@@ -335,7 +336,7 @@ class LayerBuilder:
 
     def _tree(self, archive, source, destination, added, ownership, chmod, hardlinks,
               transfer=None):
-        self._ensure_directories(archive, destination, added)
+        self._ensure_directories(archive, destination, added, ownership, chmod)
 
         def walk(directory, prefix):
             self._check_context_path(Path(directory))
@@ -353,7 +354,7 @@ class LayerBuilder:
 
     def _add_archive(self, archive, source, destination, added, ownership, chmod,
                      exclude=()):
-        self._ensure_directories(archive, destination, added)
+        self._ensure_directories(archive, destination, added, ownership, chmod)
         with tarfile.open(source, "r:*") as original:
             members = []
             seen = set()
@@ -384,7 +385,7 @@ class LayerBuilder:
                                            pair[0].count("/"), pair[0]))
             for name, member in members:
                 target = posixpath.join(destination, name).lstrip("/")
-                self._ensure_directories(archive, posixpath.dirname(target), added)
+                self._ensure_directories(archive, posixpath.dirname(target), added, ownership, chmod)
                 kind = "dir" if member.isdir() else "file"
                 self._reserve(target, kind, added)
                 info = self._info(target, member.mode, member.mtime, member.uid, member.gid,
@@ -489,7 +490,7 @@ class LayerBuilder:
         added = {}
         with tarfile.open(target, "w", format=tarfile.PAX_FORMAT) as archive:
             name = destination.lstrip("/")
-            self._ensure_directories(archive, posixpath.dirname(name), added)
+            self._ensure_directories(archive, posixpath.dirname(name), added, ownership, transfer.chmod)
             self._reserve(name, "file", added)
             info = self._info(name, 0o644, self.source_date_epoch, 0, 0,
                               ownership, transfer.chmod)
@@ -514,7 +515,7 @@ class LayerBuilder:
             else:
                 output_name = posixpath.join(destination, filename) if directory_target else destination
                 name = _safe_name(output_name.strip("/"))
-                self._ensure_directories(archive, posixpath.dirname(name), added)
+                self._ensure_directories(archive, posixpath.dirname(name), added, ownership, transfer.chmod)
                 self._reserve(name, "file", added)
                 info = self._info(name, 0o600, self.source_date_epoch, 0, 0, ownership,
                                   transfer.chmod)
@@ -581,7 +582,7 @@ class LayerBuilder:
         def write_node(archive, source, output):
             entry = source_rootfs.entries[source]
             output = _safe_name(output.strip("/"))
-            self._ensure_directories(archive, posixpath.dirname(output), added)
+            self._ensure_directories(archive, posixpath.dirname(output), added, ownership, transfer.chmod)
             kind = "dir" if entry.kind == "dir" else "file"
             self._reserve(output, kind, added)
             original_info = member_info(source)
@@ -630,7 +631,7 @@ class LayerBuilder:
                 if is_directory:
                     root_destination = (posixpath.join(destination, parent_source) if transfer.parents
                                         else destination)
-                    self._ensure_directories(archive, root_destination, added)
+                    self._ensure_directories(archive, root_destination, added, ownership, transfer.chmod)
                     prefix = source + "/" if source else ""
                     descendants = sorted((path for path in source_rootfs.entries
                                           if path.startswith(prefix) and path != source),

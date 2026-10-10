@@ -14,8 +14,9 @@ from compat import is_linked_directory
 from image_reader import digest_hex, sha256_file, verify_layer_tar
 
 
-# 旧条目只识别第一个 tar 头，可能信任负载截断的层，不能沿用可信身份。
-CACHE_VERSION = 8
+# 旧条目可能包含忽略 COPY/ADD 目录属主、权限的层，必须重新执行指令。
+# 更早版本还缺少完整 tar 结构校验，因此不能沿用旧条目的可信身份。
+CACHE_VERSION = 9
 
 
 def cache_key(*values):

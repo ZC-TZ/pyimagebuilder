@@ -48,7 +48,7 @@ python -m unittest discover -s tests -p test_image_identity_contract.py -v
 | amd64 / arm64 跨架构 RUN | 验证目标内核、QEMU/binfmt_misc 和基础镜像可执行文件 |
 | Python 3.7 兼容性 | 已在 Windows/Python 3.7.9 运行完整回归；其他解释器版本和操作系统需分别验证，语法解析不能替代运行测试 |
 
-最近完整回归在 Windows/Python 3.7.9 与 Python 3.12 各运行 342 项测试，各通过 339 项、跳过 3 项；跳过项涉及当前账户不能创建符号链接。真实 Docker、Linux RUN 和内网鉴权尚未在该环境验收。报告测试结果时，应同时说明解释器、操作系统、跳过项和外部依赖。
+最近完整回归在 Windows/Python 3.7.9 与 Python 3.12 各运行 352 项测试，各通过 349 项、跳过 3 项；跳过项涉及当前账户不能创建符号链接。真实 Docker、Linux RUN 和内网鉴权尚未在该环境验收。报告测试结果时，应同时说明解释器、操作系统、跳过项和外部依赖。
 
 ## 修改与提交
 
