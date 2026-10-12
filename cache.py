@@ -11,6 +11,7 @@ from pathlib import Path
 
 from errors import ArchiveError, BuildError
 from compat import is_linked_directory
+from store_lock import file_lock
 from path_policy import cache_entry_key
 from image_reader import digest_hex, sha256_file, verify_layer_tar
 
@@ -26,7 +27,8 @@ from image_reader import digest_hex, sha256_file, verify_layer_tar
 # 版本 16 及更早可把另一 xattr namespace 的普通属性误当删除，并遗漏目录 xattr 删除。
 # 版本 17 及更早在层应用前发布缓存，失败指令也可能留下无效链接或权限层。
 # 版本 18 及更早会丢失跨阶段目录的硬链接，并将独立本地源错误地合成硬链接。
-CACHE_VERSION = 19
+# 版本 20 排除源输入在生成 COPY/ADD 层期间变化后，仍按旧指纹发布的条目。
+CACHE_VERSION = 20
 
 
 def cache_key(*values):
@@ -50,10 +52,17 @@ class LayerCache:
         self.verify = verify
         self.entries = self.root / "entries"
         self.layers = self.root / "layers"
-        if is_linked_directory(self.entries) or is_linked_directory(self.layers):
+        self.locks = self.root / "locks"
+        if any(is_linked_directory(path) for path in (self.entries, self.layers, self.locks)):
             raise BuildError("Cache entries/layers directories must not be symlinks")
-        for path in (self.root, self.entries, self.layers):
+        for path in (self.root, self.entries, self.layers, self.locks):
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    def _entry_lock(self, key):
+        """同一键的验证回写与发布共用锁，避免旧校验结果覆盖新的构建结果。"""
+        if is_linked_directory(self.locks):
+            raise BuildError("Layer cache locks directory must not be a link")
+        return file_lock(self.locks / (key + ".lock"), "Layer cache entry")
 
     def lookup(self, key):
         """返回有效缓存结果；元数据过期、缺失或内容损坏时返回 None。
@@ -63,6 +72,11 @@ class LayerCache:
         这只适用于可信本地缓存，不能抵御同时修改内容和缓存元数据的攻击者。
         """
         key = cache_entry_key(key)
+        with self._entry_lock(key):
+            return self._lookup_locked(key)
+
+    def _lookup_locked(self, key):
+        """持条目锁完成验证及文件身份刷新；忙时由调用方重试。"""
         entry = self.entries / (key + ".json")
         if entry.is_symlink():
             raise BuildError("Instruction cache entry must not be a symlink")
@@ -106,6 +120,11 @@ class LayerCache:
         新副本关闭并刷新后再次核对摘要，不能把复制前的源校验当成副本校验。
         """
         key = cache_entry_key(key)
+        with self._entry_lock(key):
+            self._store_locked(key, diff_id, layer_path)
+
+    def _store_locked(self, key, diff_id, layer_path):
+        """持条目锁发布完整层和元数据；不同缓存键仍可并发写入。"""
         if diff_id is None:
             metadata = {"version": CACHE_VERSION, "key": key, "empty": True, "diff_id": None}
         else:

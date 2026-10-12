@@ -21,6 +21,7 @@ from errors import ArchiveError, BuildError
 from file_publish import publish_new_file
 from image_reader import (BaseImage, ImageArchiveReader, archive_members, digest_hex,
                           docker_manifest, image_history, sha256_file)
+from image_reader import verify_layer_tar
 from image_writer import ImageArchiveWriter
 from oci_writer import OCIImageWriter
 from reproducible import parse_epoch
@@ -335,11 +336,14 @@ def audit_cache(directory, excluding=()):
             else:
                 digest = digest_hex(data.get("diff_id"))
                 layer = layers_dir / (digest + ".tar")
-                if (not layer.is_file() or type(data.get("size")) is not int or
-                        layer.stat().st_size != data["size"] or sha256_file(layer) != digest or
-                        not tarfile.is_tarfile(layer)):
+                if (path.is_symlink() or layer.is_symlink() or not layer.is_file() or
+                        type(data.get("size")) is not int or
+                        layer.stat().st_size != data["size"] or sha256_file(layer) != digest):
                     reason = "missing or corrupt layer"
                 else:
+                    # is_tarfile 只检查开头；与缓存读取共用完整负载及结束位置检查。
+                    with open(layer, "rb") as stream:
+                        verify_layer_tar(stream, "cache audit layer")
                     valid += 1
                     referenced.add(layer.name)
         except (OSError, ValueError, TypeError, ArchiveError, tarfile.TarError) as exc:

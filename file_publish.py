@@ -24,7 +24,7 @@ def _copy_exclusive(source, destination):
             shutil.copyfileobj(stream, output, BUFFER)
             output.flush()
             os.fsync(output.fileno())
-    except Exception:
+    except BaseException:
         if created:
             unlink_missing(destination)
         raise

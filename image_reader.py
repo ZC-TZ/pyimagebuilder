@@ -8,6 +8,7 @@ import re
 import shutil
 import tarfile
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,7 +22,8 @@ BUFFER = 4 * 1024 * 1024
 MAX_JSON = 16 * 1024 * 1024
 SHA256 = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
 # 旧条目只识别首个 tar 头，未证明成员负载完整；首次复用需重新验证。
-BASE_CACHE_VERSION = 2
+# 版本 3 将可信身份绑定到实际读取的归档句柄，排除读取中换源产生的旧条目。
+BASE_CACHE_VERSION = 3
 
 
 def digest_hex(value):
@@ -268,11 +270,35 @@ class ImageArchiveReader:
     @staticmethod
     def _identity(path):
         data = path.stat()
+        return ImageArchiveReader._stat_identity(data)
+
+    @staticmethod
+    def _stat_identity(data):
         return [data.st_dev, data.st_ino, data.st_size, data.st_mtime_ns, data.st_ctime_ns]
+
+    def _check_source_unchanged(self):
+        """归档身份取自已打开的文件，后续路径变化不能授权复用旧层。"""
+        expected = getattr(self, "_source_identity", None)
+        if expected is not None and self._identity(self.path) != expected:
+            raise ArchiveError("Base image archive changed while reading; retry with a stable archive")
+
+    @contextmanager
+    def _open_archive(self):
+        with open(self.path, "rb") as source:
+            self._source_identity = self._identity(self.path)
+            # Windows 部分 Python 版本的 stat/fstat 对 ctime 定义不同。
+            # 设备、inode、大小及 mtime 绑定实际句柄，ctime 使用路径侧的一致语义。
+            if self._stat_identity(os.fstat(source.fileno()))[:4] != self._source_identity[:4]:
+                raise ArchiveError("Base image archive changed while opening")
+            self._check_source_unchanged()
+            with tarfile.open(fileobj=source, mode="r:*") as archive:
+                yield archive
+            self._check_source_unchanged()
 
     def _cached_layer(self, name, expected):
         if self.trusted_layer_store is None:
             return None, None
+        self._check_source_unchanged()
         key = hashlib.sha256((str(self.path.resolve()) + "\0" + name + "\0" +
                               expected).encode("utf-8")).hexdigest()
         if is_linked_directory(self.trusted_layer_store):
@@ -287,7 +313,7 @@ class ImageArchiveReader:
         try:
             entry = json.loads(metadata.read_text(encoding="utf-8"))
             if (entry.get("version") == BASE_CACHE_VERSION and
-                    entry.get("source") == self._identity(self.path) and
+                    entry.get("source") == getattr(self, "_source_identity", self._identity(self.path)) and
                     entry.get("layer") == self._identity(layer) and
                     entry.get("diff_id") == expected):
                 return layer, (layer, metadata)
@@ -296,6 +322,7 @@ class ImageArchiveReader:
         return None, (layer, metadata)
 
     def _publish_layer(self, target, location, expected):
+        self._check_source_unchanged()
         if location is None:
             return target
         layer, metadata = location
@@ -329,8 +356,9 @@ class ImageArchiveReader:
                 finally:
                     if os.path.exists(pending):
                         os.unlink(pending)
+        self._check_source_unchanged()
         entry = {"version": BASE_CACHE_VERSION,
-                 "source": self._identity(self.path), "layer": self._identity(layer),
+                 "source": getattr(self, "_source_identity", self._identity(self.path)), "layer": self._identity(layer),
                  "diff_id": expected}
         descriptor, pending = tempfile.mkstemp(prefix="base-entry-", suffix=".part", dir=metadata.parent)
         try:
@@ -353,7 +381,7 @@ class ImageArchiveReader:
         if not self.path.is_file():
             raise BaseImageNotFound("Local base image archive not found: " + str(self.path))
         try:
-            with tarfile.open(self.path, "r:*") as archive:
+            with self._open_archive() as archive:
                 members = archive_members(archive)
 
                 def json_member(name):

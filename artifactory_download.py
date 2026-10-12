@@ -991,7 +991,7 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
                 pack_elapsed = pack_files(archive_root, output, display)
                 if reporter is not None:
                     reporter.record_timing("Pack Artifactory base archive", pack_elapsed)
-            except Exception:
+            except BaseException:
                 if cas_store is not None:
                     cas_store.restore_ref(image_reference, target_platform, "artifactory", previous_ref)
                 raise

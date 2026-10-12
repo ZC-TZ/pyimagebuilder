@@ -15,7 +15,7 @@ _locks = {}
 _active = threading.local()
 
 
-def _lock_file(stream):
+def _lock_file(stream, subject):
     """尝试立即取得内核文件锁；仅将锁冲突转为可重试的构建错误。"""
     stream.seek(0)
     try:
@@ -27,7 +27,7 @@ def _lock_file(stream):
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
         if exc.errno in (errno.EACCES, errno.EAGAIN):
-            raise BuildError("Image reference is busy; retry after the other operation completes") from exc
+            raise BuildError(subject + " is busy; retry after the other operation completes") from exc
         raise
 
 
@@ -42,7 +42,7 @@ def _unlock_file(stream):
 
 
 @contextmanager
-def file_lock(path):
+def file_lock(path, subject="Image reference"):
     """对同一锁路径互斥更新；忙时立即报错，同线程的嵌套调用可重入。
 
     线程锁弥补 POSIX 文件锁的进程内语义差异；内核锁保护独立 CLI 进程。
@@ -54,7 +54,7 @@ def file_lock(path):
     with _guard:
         local_lock = _locks.setdefault(key, threading.RLock())
     if not local_lock.acquire(blocking=False):
-        raise BuildError("Image reference is busy; retry after the other operation completes")
+        raise BuildError(subject + " is busy; retry after the other operation completes")
     active = getattr(_active, "paths", None)
     if active is None:
         active = _active.paths = set()
@@ -74,7 +74,7 @@ def file_lock(path):
         if os.fstat(stream.fileno()).st_size == 0:
             stream.write(b"\0")
             stream.flush()
-        _lock_file(stream)
+        _lock_file(stream, subject)
         locked = True
         active.add(key)
         yield

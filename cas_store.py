@@ -550,7 +550,7 @@ class CASStore:
                     image = BaseImage(config, layers, [archive_tag], {}, value["config"], config_raw)
                     writer.write_image(output, image, archive_tag, fileobj=sink)
                 writer.verify(output, archive_tag)
-            except Exception:
+            except BaseException:
                 if created:
                     unlink_missing(output)
                 raise

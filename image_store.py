@@ -283,7 +283,7 @@ def _pull_image_locked(cas, reference, platform, source, store, refresh, offline
                 os.replace(pending, archive)
             else:
                 unlink_missing(archive)
-    except Exception:
+    except BaseException:
         cas.restore_ref(reference, platform, source, previous_ref)
         raise
     return (archive if materialize_tar else _cas_source(store, reference, platform, source)), True

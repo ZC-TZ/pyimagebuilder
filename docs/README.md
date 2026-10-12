@@ -24,6 +24,7 @@
 | --- | --- |
 | [Dockerfile 兼容表](DOCKERFILE_COMPAT.md) | 指令、现代 flag、变量、链接与不支持的语法 |
 | [本地 CAS 镜像库](CAS_STORE.md) | 镜像落盘、构建复用、来源冲突、转换与清理 |
+| [缓存与复用规则](CACHE_POLICY.md) | 缓存类型、命中输入、升级、并发、中断恢复及清理 |
 | [构建进度输出](PROGRESS.md) | 普通终端、CI、JSON 事件和各阶段输出示例 |
 | [配置模板](../config.example.json) | schemaVersion 2 的可编辑 JSON 示例 |
 

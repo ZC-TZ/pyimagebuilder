@@ -236,7 +236,8 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
             config.record(instruction, diff_id)
             state_key = cache_key("state", state_key, instruction.raw, diff_id)
 
-        def resolve_layer(instruction, target, produce, extra=None, independent=False):
+        def resolve_layer(instruction, target, produce, extra=None, independent=False,
+                          validate_inputs=None):
             """查找或生成层，应用成功后才发布新缓存，返回已接受的层。
 
             返回 (layer_path, diff_id)；未产生文件变化时二者均为 None。
@@ -267,6 +268,8 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                                 else "RUN layer creation" if instruction.op == "RUN"
                                 else "Other layer creation") if reporter is not None else nullcontext():
                 diff_id = produce(target)
+            if validate_inputs is not None:
+                validate_inputs()
             # 先让实际消费者检查链接、whiteout、权限及 RUN 写盘条件。
             # 否则失败的指令也会留下可命中的条目，后续构建无法重新执行和恢复。
             accept_layer(target if diff_id is not None else None, diff_id)
@@ -560,6 +563,14 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                                source_stage.state_key if source_stage is not None else
                                cache_key("inline", transfer.inline) if transfer.inline is not None else
                                transfer_builder.fingerprint_sources(transfer) if cache is not None else None)
+                context_fingerprint = (fingerprint if cache is not None and remote_url is None and
+                                       source_stage is None and transfer.inline is None else None)
+
+                def validate_transfer_inputs():
+                    """源文件变化后不能把新内容挂到旧键；失败层不应用、不入缓存。"""
+                    if (context_fingerprint is not None and
+                            transfer_builder.fingerprint_sources(transfer) != context_fingerprint):
+                        raise BuildError("COPY/ADD inputs changed while creating the layer; retry with a stable context")
                 if transfer.link:
                     # 独立层虽不依赖基础 rootfs，仍依赖展开后的目标与权限参数、
                     # WORKDIR 和规范化时间戳，缓存键不能遗漏这些输入。
@@ -593,7 +604,8 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                         if source_stage is not None else
                         (lambda target: transfer_builder.transfer_layer(transfer, workdir, target,
                                                                      add=(op == "ADD"))),
-                        fingerprint, independent=transfer.link)
+                        fingerprint, independent=transfer.link,
+                        validate_inputs=validate_transfer_inputs)
                 record(instruction, diff_id)
             elif op == "RUN":
                 run_command = instruction.value.command

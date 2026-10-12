@@ -195,7 +195,7 @@ def _load_archive_locked(archive, root, cas, selected, platform, digest, replace
         cas.import_docker(pending, selected, platform, "local", replace=True)
         ref_published = True
         os.replace(pending, target)
-    except Exception:
+    except BaseException:
         # 创建失败或复制失败时，本次尚未改变 ref，不能回滚别人的导入。
         if ref_published:
             cas.restore_ref(selected, platform, "local", previous_ref)
@@ -218,7 +218,7 @@ def save_archive(reference, output, store=None, platform="linux/amd64", source=N
         with open(archive, "rb") as source_stream, open(output, "xb") as target:
             created = True
             shutil.copyfileobj(source_stream, target, 4 * 1024 * 1024)
-    except Exception:
+    except BaseException:
         # 退出 with 后句柄才关闭，Windows 此时才能删除残片。
         # 排他创建失败时不能删除别的进程已创建的同名输出。
         if created:
@@ -264,7 +264,7 @@ def remove_image(reference, store=None, platform="linux/amd64", source=None):
         try:
             if has_archive:
                 archive.unlink()
-        except Exception:
+        except BaseException:
             cas.restore_ref(reference, platform, kind, previous_ref)
             raise
     return {"removed": reference, "platform": platform, "source": kind}
@@ -422,7 +422,7 @@ def tag_archive(archive, new_tag, output, source_tag=None):
                         member.size = len(raw)
                         target.addfile(member, io.BytesIO(raw))
         verify_archive(output, new_tag)
-    except Exception:
+    except BaseException:
         if created:
             unlink_missing(output)
         raise
