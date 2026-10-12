@@ -21,7 +21,7 @@ from pathlib import Path
 from compat import is_linked_directory, unlink_missing
 from errors import ArchiveError, BuildError
 from image_reader import (BaseImage, ImageArchiveReader, archive_members, digest_hex,
-                          image_history, parse_image_json, read_image_json_file, sha256_file,
+                          image_history, parse_image_json, read_image_json_file, same_json_value, sha256_file,
                           verify_layer_tar)
 from image_writer import ImageArchiveWriter
 from oci_writer import OCIImageWriter, CONFIG_TYPE, LAYER_TYPE, MANIFEST_TYPE
@@ -99,10 +99,11 @@ class CASStore:
                 continue
         return result
 
-    def _put_stream(self, stream, digest, size):
+    def _put_stream(self, stream, digest, size, verify_existing_input=False):
         """写入新 blob 时核对输入长度和摘要，再原子发布。
 
-        同摘要文件已存在时，校验该文件后直接复用，不再读取传入的 stream。
+        同摘要文件已存在时，默认校验该文件后复用。
+        保存新解码结果还需 verify_existing_input=True，不能以旧内容证明新输入的摘要。
         """
         expected = digest_hex(digest)
         target = self._blob(digest)
@@ -114,6 +115,14 @@ class CASStore:
                 raise ArchiveError("CAS blob path is a symlink: " + digest)
             if target.stat().st_size != size or sha256_file(target) != expected:
                 raise ArchiveError("CAS blob is corrupt: " + digest)
+            if verify_existing_input:
+                hasher = hashlib.sha256()
+                written = 0
+                for block in iter(lambda: stream.read(BUFFER), b""):
+                    written += len(block)
+                    hasher.update(block)
+                if written != size or hasher.hexdigest() != expected:
+                    raise ArchiveError("CAS input size or digest mismatch: " + digest)
             return target
         descriptor, pending = tempfile.mkstemp(prefix="blob-", suffix=".part", dir=target.parent)
         hasher = hashlib.sha256()
@@ -154,7 +163,7 @@ class CASStore:
         with open(path, "rb") as stream:
             verify_layer_tar(stream, "decoded CAS layer: " + diff_id)
             stream.seek(0)
-            return self._put_stream(stream, diff_id, path.stat().st_size)
+            return self._put_stream(stream, diff_id, path.stat().st_size, verify_existing_input=True)
 
     def _publish(self, reference, platform, source, config_digest, layers,
                  replace=False, manifest_raw=None):
@@ -234,11 +243,16 @@ class CASStore:
                 os.unlink(pending)
 
     def import_registry(self, manifest_raw, config_path, layer_paths,
-                        reference, platform, source="artifactory", replace=False):
+                        reference, platform, source="artifactory", replace=False,
+                        verified_diff_ids=False):
         """按 descriptor 摘要保存原始 Registry blob，包括 config 和层。
 
         层可以是压缩或未压缩内容；本方法不解压，也不独立核对层的 DiffID。
+        verified_diff_ids=True 仅供已完成本次 blob→解码 tar 校验的内部下载器使用，
+        记录可信本地校验状态；外部/低层导入默认由 open_base 首次使用时补验。
         """
+        if type(verified_diff_ids) is not bool:
+            raise ArchiveError("verified_diff_ids must be a boolean")
         platform = normalize_platform(platform)
         try:
             manifest = parse_image_json(manifest_raw, "Registry manifest")
@@ -281,6 +295,8 @@ class CASStore:
                 raise ArchiveError("Invalid Registry layer media type")
             layers.append({"digest": digest, "diff_id": diff_id,
                            "mediaType": media_type, "size": size})
+            if verified_diff_ids:
+                layers[-1]["diff_id_verified"] = True
         return self._publish(reference, platform, source, config_digest, layers,
                              replace, manifest_raw)
 
@@ -395,7 +411,8 @@ class CASStore:
                 if (not isinstance(item, dict) or
                         type(item.get("size")) is not int or item["size"] < 0 or
                         not isinstance(item.get("mediaType"), str) or
-                        not item["mediaType"]):
+                        not item["mediaType"] or
+                        ("diff_id_verified" in item and type(item["diff_id_verified"]) is not bool)):
                     raise ArchiveError("CAS ref has invalid layer descriptor")
                 digest_hex(item["diff_id"])
             digests = [value["manifest"], value["config"]] + [item["digest"] for item in value["layers"]]
@@ -539,10 +556,28 @@ class CASStore:
                 raise
         return output
 
+    def _record_verified_diff_ids(self, value, indices):
+        """仅为本次仍有效的 ref 记录绑定校验，不能复活已删除标签或覆盖竞争更新。"""
+        if not indices:
+            return
+        reference, platform, source = value["reference"], value["platform"], value["source"]
+        with self.ref_lock(reference, platform, source):
+            path = self._ref(reference, platform, source)
+            if not path.is_file():
+                return
+            current, _ = read_image_json_file(path, "CAS binding ref")
+            if not same_json_value(current, value):
+                return
+            updated = dict(value, layers=[dict(item) for item in value["layers"]])
+            for index in indices:
+                updated["layers"][index]["diff_id_verified"] = True
+            self._publish_ref(updated, replace=True)
+
     def open_base(self, reference, platform="linux/amd64", source=None):
         """返回含配置和有序 layer.tar 路径的 BaseImage，供 builder 直接消费 CAS。
 
-        缺少解压缓存时，先解压、核对 DiffID，再按内容摘要入库。
+        缺少解码层或 blob→DiffID 校验记录时，先解压并核对本次结果，再入库。
+        旧 ref 没有校验记录，首次使用会补验；成功后仍复用解码层。
         不生成中间 Docker save tar；不支持的压缩格式明确报错。
         """
         value = self.resolve(reference, platform, source)
@@ -558,7 +593,8 @@ class CASStore:
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             raise ArchiveError("Invalid CAS base config") from exc
         paths = []
-        for item in value["layers"]:
+        verified_indices = []
+        for index, item in enumerate(value["layers"]):
             media_type = item["mediaType"]
             diff_id = item["diff_id"]
             digest_hex(diff_id)
@@ -566,7 +602,7 @@ class CASStore:
                 layer = self._blob(diff_id)
             elif media_type.endswith("+gzip") or media_type.endswith(".gzip"):
                 layer = self._blob(diff_id)
-                if not layer.is_file():
+                if not layer.is_file() or item.get("diff_id_verified") is not True:
                     self.blobs.mkdir(parents=True, exist_ok=True)
                     descriptor, pending = tempfile.mkstemp(prefix="decoded-", suffix=".part",
                                                             dir=self.blobs)
@@ -575,10 +611,10 @@ class CASStore:
                                 gzip.open(self._blob(item["digest"]), "rb") as source_stream:
                             for block in iter(lambda: source_stream.read(BUFFER), b""):
                                 target.write(block)
-                        with open(pending, "rb") as source_stream:
-                            verify_layer_tar(source_stream, "decoded CAS base layer")
-                            source_stream.seek(0)
-                            self._put_stream(source_stream, diff_id, Path(pending).stat().st_size)
+                        # 即使同 DiffID 的旧文件存在，也必须验证新解码结果，
+                        # 否则 _put_stream 的去重捷径会掩盖错误的 blob→DiffID 对应关系。
+                        self.store_decoded_layer(pending, diff_id)
+                        verified_indices.append(index)
                     except (OSError, EOFError, zlib.error) as exc:
                         raise ArchiveError("Cannot decode CAS base layer: " + str(exc)) from exc
                     finally:
@@ -590,6 +626,7 @@ class CASStore:
             with open(layer, "rb") as checked_layer:
                 verify_layer_tar(checked_layer, "CAS base layer: " + diff_id)
             paths.append(layer)
+        self._record_verified_diff_ids(value, verified_indices)
         return BaseImage(config, paths, [reference],
                          {"CASManifest": value["manifest"], "Source": value["source"]},
                          value["config"], config_raw,

@@ -65,6 +65,8 @@ CAS 导入 Docker archive 直接复用 reader 已验证的 config 字节，不�
 
 CAS 的统一 ref 发布入口在落盘 blob 与 ref 之间核对 manifest/config/layer 元数据绑定，失败不发布引用。层在入库时已经校验，发布预检不重复完整哈希大层。
 
+`diff_id_verified` 只记录在本地 CAS ref 的层元数据中，不写入原始 manifest/config。旧引用补验后更新此状态不会改变 manifest digest、ImageID 或层 digest；下载器不能把远端同名字段当作校验结果。
+
 ## 4. 全项目编码位置的判定
 
 | 路径 / 模块 | 原始 JSON 如何处理 | 何时允许生成新 JSON |

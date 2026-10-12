@@ -980,7 +980,8 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
                     reporter.record_timing("Convert Artifactory layers", conversion_elapsed)
                 if cas_store is not None:
                     cas_store.import_registry(manifest_raw, config_path, layer_paths,
-                                              image_reference, target_platform, replace=True)
+                                              image_reference, target_platform, replace=True,
+                                              verified_diff_ids=True)
                 if cas_only:
                     # 保留基础镜像入口对 media type 与配置的检查；层内容已在发布前验证。
                     cas_store.open_base(image_reference, target_platform, "artifactory")

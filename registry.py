@@ -530,7 +530,7 @@ def pull(reference, output, username=None, password=None, ca_file=None,
             cas_store.import_registry(
                 manifest_raw,
                 config_path, raw_layers, stored_reference, target_platform,
-                source="registry", replace=True)
+                source="registry", replace=True, verified_diff_ids=True)
 
         if cas_only:
             publish_cas()
