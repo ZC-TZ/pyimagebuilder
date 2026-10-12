@@ -58,6 +58,8 @@ CAS blobs/ref ────────────► CASStore.open_base ──�
 
 Artifactory 下载器先校验本次传输 blob 与解压后 DiffID 的绑定，再保存解码层及发布引用；已有解码缓存不能代替本次下载内容的验证。CAS-only 逐层处理临时 tar，归档路径复用转换出的已验证层。下载接口自身用引用锁覆盖快照、校验、发布和打包失败恢复，直接调用时同样保留旧引用；原始 manifest/config 字节继续原样入库。
 
+Registry 的直接拉取接口在下载、解码及私有归档验证后取得引用锁，覆盖 CAS 提交、交付文件发布和失败恢复；CAS-only 共用同一提交逻辑。发布失败或发布阶段中断时恢复旧 ref，并只清理本次成功发布的文件。清理失败通过 finally 仍尝试恢复引用；竞争更新在提交窗口内报 busy，避免失败恢复覆盖另一写入者。受管理 pull 的外层引用锁可与此锁重入。双格式文件逐个出现，没有面向读者的全局原子可见性。
+
 `rootfs_archive.py` 为 export/import/flatten 提供独立入口，并由 main.py 分派。归档输入复用既有验证器；引用输入持 CAS 引用锁直接读取层。RootFSIndex 应用 whiteout 后，合并器只为最终可见 inode 预读 TarInfo，以偏移流式读取内容；最多保留 8 个 tar 句柄，不因逐文件查找或句柄淘汰重新扫描整层。RootFSIndex 也保存特殊文件的来源，合并器保留设备号/FIFO/PAX 元数据而不物化宿主文件系统。`image_changes.py` 复用 Dockerfile 解析与展开，只更新允许的运行配置；WORKDIR/VOLUME 不调用构建目录层逻辑。导入和扁平化显式使用 write_new，生成新的单层 history/配置身份，并经 writer.verify 后排他发布。export 的二进制 stdout 与进度 stderr 分开，import 可以从 stdin 落到私有工作区。详见 [rootfs 与扁平化](ROOTFS_COMMANDS.md)。
 
 `store_lock.py` 用进程内 RLock 和内核文件锁保护同一引用：Windows 使用 msvcrt 字节锁，POSIX 使用 flock。CAS 引用锁按来源、引用及平台计算键，支持同线程跨 CASStore 对象的嵌套调用；竞争时立即报 busy。pull/load 的锁覆盖快照、下载或复制、tar/ref 发布和失败恢复；受管理归档的按需生成也持锁。rmi 在锁内先删除 ref，再删除 tar，tar 删除失败则恢复 ref；不会隐式执行全库 GC。CAS 发布在锁内重新检查 --replace 冲突，不能仅靠原子替换来保证“不覆盖”。锁文件保持稳定，不在释放时删除，进程退出后内核锁自然释放。现有全局 prune 仍要求避开其他存储操作。

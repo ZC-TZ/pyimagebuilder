@@ -390,6 +390,7 @@ def pull(reference, output, username=None, password=None, ca_file=None,
     并发下载后解压并核对 DiffID；按 manifest 原始顺序组装，不按完成先后排列。
     提供 cas_store 时同时保存原始压缩 blob 与已验证的未压缩层；ref 最后发布。
     cas_only=True 不生成输出 tar，返回的 output 仅保持 API 的路径返回约定。
+    CAS ref 更新与归档发布处于同一引用锁内，失败恢复旧 ref 并清理本次已发布产物。
     """
     target_platform = normalize_platform(target_platform)
     client = RegistryClient(reference, username, password, ca_file, insecure_http, auth_host)
@@ -532,8 +533,33 @@ def pull(reference, output, username=None, password=None, ca_file=None,
                 config_path, raw_layers, stored_reference, target_platform,
                 source="registry", replace=True, verified_diff_ids=True)
 
+        def publish_products(products):
+            """对同一引用串行提交 CAS 与交付文件，直接调用也具有失败恢复能力。"""
+            lock = (cas_store.ref_lock(stored_reference, target_platform, "registry")
+                    if cas_store is not None else nullcontext())
+            with lock:
+                previous_ref = (cas_store.snapshot_ref(stored_reference, target_platform, "registry")
+                                if cas_store is not None else None)
+                published = []
+                try:
+                    if cas_store is not None:
+                        publish_cas()
+                    for partial, destination in products:
+                        publish_new_file(partial, destination)
+                        published.append(destination)
+                except BaseException:
+                    # 中断与普通失败都需要撤销；只清理成功发布过的路径，
+                    # 目标冲突时不能删除竞争任务的文件。清理失败也必须恢复 ref。
+                    try:
+                        for destination in published:
+                            unlink_missing(destination)
+                    finally:
+                        if cas_store is not None:
+                            cas_store.restore_ref(stored_reference, target_platform, "registry", previous_ref)
+                    raise
+
         if cas_only:
-            publish_cas()
+            publish_products([])
             return output
         products = []
         if image_format in ("docker", "both"):
@@ -556,17 +582,7 @@ def pull(reference, output, username=None, password=None, ca_file=None,
             with reporter.timed("Verify pulled OCI archive") if reporter is not None else nullcontext():
                 writer.verify(partial, local_tag)
             products.append((partial, second or output))
-        if cas_store is not None:
-            publish_cas()
-        published = []
-        try:
-            for partial, destination in products:
-                publish_new_file(partial, destination)
-                published.append(destination)
-        except Exception:
-            for destination in published:
-                unlink_missing(destination)
-            raise
+        publish_products(products)
     return output
 
 
