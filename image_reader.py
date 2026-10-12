@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from errors import ArchiveError, BaseImageNotFound
+from path_policy import archive_path
+from compat import is_linked_directory
 from platforms import architecture, normalize_platform
 
 
@@ -40,14 +42,8 @@ def sha256_file(path):
 
 
 def outer_name(name):
-    """规范化外层 tar 成员名，供重复成员与路径越界检查使用。"""
-    while name.startswith("./"):
-        name = name[2:]
-    if name in ("", "."):
-        return ""
-    if not name or name.startswith("/") or "\\" in name or ".." in name.split("/"):
-        raise ArchiveError("Unsafe outer archive path: " + name)
-    return name.rstrip("/")
+    """规范化外层 tar 成员名，确保等价名字不能绕过重复检测。"""
+    return archive_path(name)
 
 
 def archive_members(archive):
@@ -56,6 +52,8 @@ def archive_members(archive):
     for member in archive:
         name = outer_name(member.name)
         if not name:
+            if not member.isdir():
+                raise ArchiveError("Outer archive root must be a directory")
             continue
         if name in members:
             raise ArchiveError("Duplicate outer archive member: " + name)
@@ -277,9 +275,15 @@ class ImageArchiveReader:
             return None, None
         key = hashlib.sha256((str(self.path.resolve()) + "\0" + name + "\0" +
                               expected).encode("utf-8")).hexdigest()
+        if is_linked_directory(self.trusted_layer_store):
+            raise ArchiveError("Base layer store must not be a link")
         directory = self.trusted_layer_store.resolve()
+        if any(is_linked_directory(directory / name) for name in ("entries", "layers")):
+            raise ArchiveError("Base cache internal directories must not be links")
         layer = directory / "layers" / (digest_hex(expected) + ".tar")
         metadata = directory / "entries" / (key + ".json")
+        if metadata.is_symlink() or layer.is_symlink():
+            raise ArchiveError("Base cache entry/layer must not be a link")
         try:
             entry = json.loads(metadata.read_text(encoding="utf-8"))
             if (entry.get("version") == BASE_CACHE_VERSION and
@@ -295,6 +299,9 @@ class ImageArchiveReader:
         if location is None:
             return target
         layer, metadata = location
+        if (any(is_linked_directory(path) for path in (layer.parent, metadata.parent)) or
+                layer.is_symlink() or metadata.is_symlink()):
+            raise ArchiveError("Base cache publication through a link")
         layer.parent.mkdir(parents=True, exist_ok=True)
         metadata.parent.mkdir(parents=True, exist_ok=True)
         if layer.is_file() and sha256_file(layer) == digest_hex(expected):

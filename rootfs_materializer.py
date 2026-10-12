@@ -9,7 +9,9 @@ from pathlib import Path
 
 from errors import ArchiveError, BuildError
 from image_identity import checked_layer_id
+from compat import is_linked_directory
 from rootfs import clean_path, validate_layer_paths
+from path_policy import host_components, host_path_aliases
 
 
 class RootFSMaterializer:
@@ -45,16 +47,20 @@ class RootFSMaterializer:
             if part in ("", "."):
                 continue
             if part == "..":
-                if not resolved:
-                    raise ArchiveError("Path escapes image rootfs: " + image_path)
-                resolved.pop()
+                if resolved:
+                    resolved.pop()
                 continue
+            host_components([part])
             candidate = self.root.joinpath(*resolved, part)
+            if not candidate.is_symlink() and candidate.is_dir() and is_linked_directory(candidate):
+                raise ArchiveError("Rootfs directory junction is unsupported: " + str(candidate))
             if candidate.is_symlink() and (parts or follow_final):
                 hops += 1
                 if hops > 40:
                     raise ArchiveError("Too many rootfs symlinks: " + image_path)
-                target = os.readlink(candidate).replace("\\", "/")
+                target = os.readlink(candidate)
+                if "\\" in target or "\0" in target:
+                    raise ArchiveError("Unsupported rootfs symlink target: " + repr(target))
                 if target.startswith("/"):
                     resolved = []
                 parts = target.split("/") + parts
@@ -94,7 +100,7 @@ class RootFSMaterializer:
         directory = self.root
         for part in image_path.split("/") if image_path else ():
             directory = directory / part
-            if directory.is_symlink() or not directory.is_dir():
+            if is_linked_directory(directory) or not directory.is_dir():
                 return None
         return directory
 
@@ -145,6 +151,14 @@ class RootFSMaterializer:
             for name, member in members:
                 if not posixpath.basename(name).startswith(".wh."):
                     self._validate_ownership(member)
+            host_path_aliases(name for name, _ in members)
+            for name, member in members:
+                host_components(name.split("/") if name else ())
+                if member.islnk():
+                    linked = clean_path(member.linkname.lstrip("/"))
+                    host_components(linked.split("/") if linked else ())
+                if member.issym() and ("\\" in member.linkname or "\0" in member.linkname):
+                    raise ArchiveError("Unsupported rootfs symlink target: " + repr(member.linkname))
             for name, _ in members:
                 base = posixpath.basename(name)
                 parent = posixpath.dirname(name)

@@ -12,13 +12,15 @@ import tempfile
 import tarfile
 import time
 import zipfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from builder import build
 from errors import BuildError
 from reproducible import parse_epoch
 from settings import cache_directory, config_path, load_settings, repository_settings
 from compat import unlink_missing
+from path_policy import (archive_path as safe_archive_path, container_path, host_components,
+                         host_path_aliases, output_path)
 
 
 DEFAULTS = {
@@ -36,12 +38,11 @@ def _config_path(candidate):
 
 
 def _validate_path(value, field):
-    if not isinstance(value, str) or not value.startswith("/") or "\\" in value:
-        raise BuildError(field + " must be an absolute Linux path")
-    parts = PurePosixPath(value).parts
-    if ".." in parts or "\n" in value or "\r" in value:
-        raise BuildError(field + " contains an unsafe path")
-    return value.rstrip("/")
+    """部署目录必须为非根目录，并避免生成 Dockerfile 时再次解释特殊字符。"""
+    if (not isinstance(value, str) or not value.startswith("/") or
+            ".." in value.split("/") or any(char in value for char in ("\n", "\r", "$", '"'))):
+        raise BuildError(field + " contains an unsafe absolute Linux path")
+    return container_path(value, non_root=True)
 
 
 def _validate_atom(value, field, pattern=PROJECT):
@@ -194,14 +195,14 @@ def _extract_dist(archive_path, destination, reporter=None):
             name = item.filename
             if "\\" in name or "\x00" in name or name.startswith("/") or re.match(r"^[A-Za-z]:", name):
                 raise BuildError("Unsafe dist.zip entry: " + name)
-            parts = PurePosixPath(name).parts
-            if not parts or any(part in (".", "..") for part in parts):
-                raise BuildError("Unsafe dist.zip entry: " + name)
+            parts = tuple(safe_archive_path(name, allow_root=False).split("/"))
+            host_components(parts)
             mode = (item.external_attr >> 16) & 0xFFFF
             kind = stat.S_IFMT(mode)
             if kind not in (0, stat.S_IFREG, stat.S_IFDIR):
                 raise BuildError("dist.zip contains a link or special file: " + name)
             normalized.append((item, parts))
+        host_path_aliases("/".join(parts) for _, parts in normalized)
         strip_dist = all(parts[0] == "dist" for _, parts in normalized)
         planned = []
         files = set()
@@ -260,9 +261,9 @@ def quick_build(artifact, project, version, config_path=None, *,
     front, project, version = _validate_request(artifact, project, version)
     suffix = "front" if front else "back"
     tag = tag or "{}_{}:{}".format(project, suffix, version)
-    output = Path(output).resolve() if output is not None else (
+    output = Path(output) if output is not None else (
         profile.get("outputDir") or artifact.parent) / "{}_{}-{}.tar".format(project, suffix, version)
-    output = output.resolve()
+    output = output_path(output)
     if output == artifact or output == config_path or output == profile.get("baseTar"):
         raise BuildError("Output must differ from the inputs")
     if output.exists():
@@ -304,7 +305,7 @@ def quick_build(artifact, project, version, config_path=None, *,
             source = "app.war"
             destination = profile["deployDir"] + "/" + project + ".war"
         lines = ["FROM " + profile["baseImage"],
-                 "COPY --chown={} {} {}".format(profile["owner"], source, destination)]
+                 "COPY --chown={} {}".format(profile["owner"], json.dumps([source, destination], ensure_ascii=False))]
         if profile.get("serverConfig") is not None:
             shutil.copyfile(profile["serverConfig"], context / "tongweb.xml")
             lines.append("COPY --chown={} tongweb.xml /soft/TongWeb7.0/conf/tongweb.xml".format(

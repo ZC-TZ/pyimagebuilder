@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from errors import BuildError
+from path_policy import output_path
 
 
 _guard = threading.Lock()
@@ -48,8 +49,8 @@ def file_lock(path):
     锁文件永久保留，不能在释放时删除，否则新旧 inode 上可能出现两把有效锁。
     进程退出时内核自动释放锁，文件仍存在不代表引用处于忙状态。
     """
-    path = Path(path)
-    key = os.path.normcase(str(path.absolute()))
+    path = output_path(path)
+    key = os.path.normcase(str(path))
     with _guard:
         local_lock = _locks.setdefault(key, threading.RLock())
     if not local_lock.acquire(blocking=False):

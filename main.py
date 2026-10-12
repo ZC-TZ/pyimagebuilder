@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 
 from builder import build
+from path_policy import output_path
 from errors import BuildError
 from reproducible import parse_epoch
 from build_args import arguments
@@ -279,6 +280,9 @@ def main(argv=None):
                                              else os.environ.get("SOURCE_DATE_EPOCH", "0"))
         parsed_args = arguments(args.build_arg)
         parsed_secrets = secrets(args.secret)
+        args.output = output_path(args.output)
+        if args.oci_output is not None:
+            args.oci_output = output_path(args.oci_output)
         if args.output.exists():
             raise BuildError("Output already exists: " + str(args.output))
         if args.format == "both":

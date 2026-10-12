@@ -15,6 +15,7 @@ from pathlib import Path
 
 from build_args import arguments
 from dockerfile_parser import parse
+from path_policy import output_path
 from errors import BuildError
 from file_publish import publish_new_file
 from image_reader import sha256_file
@@ -243,10 +244,11 @@ def build_locked(lock_path, dockerfile, context, base_tar, base_map, tag, output
 
     lock_path = Path(lock_path).resolve()
     context = Path(context).resolve()
-    output = Path(output).resolve()
-    second = (Path(oci_output).resolve() if oci_output is not None else
+    output = output_path(output)
+    second = (output_path(oci_output) if oci_output is not None else
               output.with_name(output.stem + ".oci.tar")) if image_format == "both" else None
-    report_path = Path(str(output) + ".hermetic.json")
+    second = output_path(second) if second is not None else None
+    report_path = output_path(str(output) + ".hermetic.json")
     for candidate in (lock_path, output, second, report_path):
         if candidate is not None and _inside(candidate, context):
             raise BuildError("Hermetic lock/output must be outside the build context")
@@ -335,6 +337,7 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True, help="New input-lock JSON path")
     args = parser.parse_args(argv)
     try:
+        args.output = output_path(args.output)
         if _inside(args.output, args.context) or args.output.exists():
             raise BuildError("Input lock must be a new file outside context")
         lock = make_lock(args.dockerfile, args.context, args.base_tar, args.base_map,

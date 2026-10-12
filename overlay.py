@@ -9,6 +9,7 @@ from pathlib import Path
 
 from errors import BuildError, UnsupportedInstruction
 from image_reader import sha256_file
+from path_policy import overlay_path
 
 
 _LIBC = ctypes.CDLL(None, use_errno=True) if os.name == "posix" else None
@@ -118,6 +119,8 @@ class OverlayManager:
 
     def mount_in_child(self):
         """在子进程私有 mount namespace 中挂载 merged rootfs。"""
+        for path in (self.rootfs, self.upper, self.work):
+            overlay_path(path)
         options = "lowerdir={},upperdir={},workdir={},metacopy=off,redirect_dir=off,index=off".format(
             self.rootfs, self.upper, self.work)
         if self.rootless:

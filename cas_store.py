@@ -5,6 +5,8 @@ config、manifest 和层 blob 先校验落盘，ref 最后原子发布。
 读取引用时核对关联 blob 的摘要；构建通过 open_base 取得有序的未压缩层。
 """
 
+from path_policy import output_path
+
 import hashlib
 import argparse
 import gzip
@@ -64,7 +66,10 @@ class CASStore:
 
     def _ref(self, reference, platform, source):
         key = hashlib.sha256((source + "\0" + reference + "\0" + platform).encode("utf-8")).hexdigest()
-        return self.refs / (key + ".json")
+        path = self.refs / (key + ".json")
+        if path.is_symlink():
+            raise ArchiveError("CAS ref path must not be a symlink")
+        return path
 
     def ref_lock(self, reference, platform, source):
         """按引用、平台及来源互斥更新；调用方应覆盖快照、发布和失败恢复全过程。"""
@@ -85,6 +90,8 @@ class CASStore:
         result = []
         for path in sorted(self.refs.glob("*.json")) if self.refs.is_dir() else []:
             try:
+                if path.is_symlink():
+                    raise ArchiveError("CAS ref path must not be a symlink")
                 value, _ = read_image_json_file(path, "CAS ref")
                 if value.get("schemaVersion") == SCHEMA_VERSION:
                     result.append(value)
@@ -99,6 +106,8 @@ class CASStore:
         """
         expected = digest_hex(digest)
         target = self._blob(digest)
+        if target.is_symlink():
+            raise ArchiveError("CAS blob path is a symlink: " + digest)
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.is_file():
             if target.is_symlink():
@@ -483,7 +492,7 @@ class CASStore:
     def export_docker(self, reference, output, platform="linux/amd64", source=None):
         """从 CAS 生成 Docker save tar，并校验解压后的 DiffID 与最终归档。"""
         value = self.resolve(reference, platform, source)
-        output = Path(output).resolve()
+        output = output_path(output)
         if output.exists():
             raise BuildError("CAS export output already exists: " + str(output))
         config, config_raw = read_image_json_file(self._blob(value["config"]), "CAS export config")

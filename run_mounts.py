@@ -8,6 +8,7 @@ from pathlib import Path
 from errors import BuildError, UnsupportedInstruction
 from compat import is_linked_directory
 from layer import container_path
+from path_policy import output_path
 
 
 def secrets(items):
@@ -33,7 +34,7 @@ def normalize_mount_target(target, targets):
     """
     if not isinstance(target, str) or not target.startswith("/") or "\0" in target:
         raise BuildError("RUN mount target must be an absolute non-root path")
-    target = "/" + container_path(target).lstrip("/")
+    target = container_path(target, non_root=True)
     if target == "/":
         raise BuildError("RUN mount target must be an absolute non-root path")
     if target in ("/proc", "/sys", "/dev") or target.startswith(
@@ -115,7 +116,7 @@ def locked_caches(mounts):
     import fcntl
     with ExitStack() as stack:
         for source in sources:
-            stream = stack.enter_context(open(source.parent / (source.name + ".lock"), "a+b"))
+            stream = stack.enter_context(open(output_path(source.parent / (source.name + ".lock")), "a+b"))
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
             stack.callback(fcntl.flock, stream.fileno(), fcntl.LOCK_UN)
         yield

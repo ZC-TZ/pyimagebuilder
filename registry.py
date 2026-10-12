@@ -24,6 +24,7 @@ from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import parse_http_list
 
+from path_policy import output_path
 from errors import ArchiveError, BuildError
 from compat import unlink_missing
 from cas_store import docker_archive_tag
@@ -318,6 +319,13 @@ class RegistryClient:
         location = response_headers.get("location")
         if not location:
             raise BuildError("Registry upload response has no Location")
+        if any(ord(char) < 32 or ord(char) == 127 for char in location):
+            raise BuildError("Control character in Registry upload Location")
+        raw_location = urlsplit(location)
+        if raw_location.fragment:
+            raise BuildError("Registry upload Location must not contain a fragment")
+        # 先检查原始路径，urljoin 本身会折叠字面 ..；不能丢掉证据后才判断。
+        validate_upload_path(raw_location.path)
         upload_url = urljoin(self.origin, location)
         parsed = urlsplit(upload_url)
         if (parsed.scheme != self.scheme or
@@ -335,6 +343,20 @@ class RegistryClient:
         remote = result.get("docker-content-digest")
         if remote and remote.lower() != digest.lower():
             raise BuildError("Registry upload digest confirmation mismatch")
+
+
+def validate_upload_path(path):
+    """只对 URL 路径解码校验，不改变 Location 查询串或重新编码上传状态。"""
+    from urllib.parse import unquote
+    try:
+        decoded = unquote(path, errors="strict")
+    except UnicodeError as exc:
+        raise BuildError("Invalid encoding in Registry upload Location") from exc
+    if ("\\" in decoded or "%" in decoded or
+            any(ord(char) < 32 or ord(char) == 127 for char in decoded) or
+            any(part in (".", "..") for part in decoded.split("/")) or
+            re.search(r"%2f|%5c", path, re.IGNORECASE) or "//" in decoded):
+        raise BuildError("Unsafe Registry upload Location path")
 
 
 def _selected_manifest(client, target_platform="linux/amd64"):
@@ -373,7 +395,7 @@ def pull(reference, output, username=None, password=None, ca_file=None,
     client = RegistryClient(reference, username, password, ca_file, insecure_http, auth_host)
     if reporter is not None:
         client.progress = reporter.progress
-    output = Path(output).resolve()
+    output = output_path(output)
     if output.exists():
         raise BuildError("Output already exists: " + str(output))
     if output.suffix.lower() != ".tar":
@@ -386,8 +408,9 @@ def pull(reference, output, username=None, password=None, ca_file=None,
         raise BuildError("CAS-only pull requires a CAS store")
     if oci_output is not None and image_format != "both":
         raise BuildError("--oci-output requires --format both")
-    second = (Path(oci_output).resolve() if oci_output else
+    second = (output_path(oci_output) if oci_output else
               output.with_name(output.stem + ".oci.tar")) if image_format == "both" else None
+    second = output_path(second) if second is not None else None
     if second is not None and (second == output or second.exists() or second.suffix.lower() != ".tar"):
         raise BuildError("OCI output already exists or conflicts with primary output")
     output.parent.mkdir(parents=True, exist_ok=True)

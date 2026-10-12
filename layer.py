@@ -16,17 +16,7 @@ from errors import ArchiveError, BuildError, UnsupportedInstruction
 from image_reader import sha256_file
 from image_identity import checked_identity_id
 from rootfs import clean_path
-
-
-def container_path(value, workdir="/"):
-    """按 WORKDIR 解析 Dockerfile 路径，并限制在镜像根目录内。"""
-    if not value:
-        raise BuildError("Empty container path")
-    joined = value if value.startswith("/") else posixpath.join(workdir, value)
-    result = posixpath.normpath(joined)
-    if not result.startswith("/") or result.startswith("/../"):
-        raise BuildError("Invalid container path: " + value)
-    return result
+from path_policy import container_path, host_components
 
 
 def _safe_name(name):
@@ -83,6 +73,7 @@ def context_sources(context, pattern):
     if (pattern.startswith("/") or "\\" in pattern or Path(pattern).drive or
             any(part == ".." for part in pattern.split("/"))):
         raise BuildError("Source escapes build context: " + pattern)
+    host_components([part for part in pattern.split("/") if part not in ("", ".", "**")], wildcards=True)
     if "://" in pattern or pattern.startswith("git@"):
         raise UnsupportedInstruction("Remote sources are unsupported: " + pattern)
 

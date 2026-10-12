@@ -13,6 +13,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from path_policy import output_path
 from errors import ArchiveError, BuildError
 from cas_store import CASStore, docker_archive_tag
 from compat import is_linked_directory, remove_suffix, unlink_missing
@@ -208,7 +209,7 @@ def _load_archive_locked(archive, root, cas, selected, platform, digest, replace
 def save_archive(reference, output, store=None, platform="linux/amd64", source=None):
     """将指定存储镜像导出到新路径；需要时由 CAS 生成 Docker tar。"""
     kind, archive = locate_archive(store, reference, platform, source)
-    output = Path(output).resolve()
+    output = output_path(output)
     if output.exists() or output == archive:
         raise BuildError("Save output must be a new, distinct file")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -322,7 +323,14 @@ def disk_usage(store=None, cache_dir=None):
         seen = set()
         total = files = 0
         if root.is_dir():
-            for path in root.rglob("*"):
+            def walk(directory):
+                for path in directory.iterdir():
+                    if path.is_symlink() or (path.is_dir() and is_linked_directory(path)):
+                        continue
+                    yield path
+                    if path.is_dir():
+                        yield from walk(path)
+            for path in walk(root):
                 if not path.is_file() or path.is_symlink():
                     continue
                 data = path.stat()
@@ -376,7 +384,7 @@ def _check_tag(tag):
 def tag_archive(archive, new_tag, output, source_tag=None):
     """生成替换标签后的单镜像 Docker tar，保留输入归档。"""
     _check_tag(new_tag)
-    archive, output = Path(archive).resolve(), Path(output).resolve()
+    archive, output = Path(archive).resolve(), output_path(output)
     if output.exists() or output == archive:
         raise BuildError("Tag output must be a new, distinct file")
     if output.suffix.lower() != ".tar":

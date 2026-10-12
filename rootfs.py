@@ -6,6 +6,7 @@ import tarfile
 from dataclasses import dataclass
 
 from errors import ArchiveError
+from path_policy import archive_path, container_path
 
 
 @dataclass
@@ -42,15 +43,8 @@ class Entry:
 
 
 def clean_path(name):
-    """规范化层内相对路径，拒绝绝对路径及父目录跳转。"""
-    name = name.replace("\\", "/")
-    while name.startswith("./"):
-        name = name[2:]
-    if not name or name == ".":
-        return ""
-    if name.startswith("/") or any(part == ".." for part in name.split("/")):
-        raise ArchiveError("Layer member escapes rootfs: " + name)
-    return posixpath.normpath(name).rstrip("/")
+    """规范化层内相对路径；反斜杠不能被悄悄改成目录分隔符。"""
+    return archive_path(name)
 
 
 def validate_layer_paths(members):
@@ -63,6 +57,11 @@ def validate_layer_paths(members):
     declared = {path: member for path, member in members
                 if not posixpath.basename(path).startswith(".wh.")}
     for path, member in members:
+        # 链接声明也属于整层预检；无效目标不能在 whiteout 已改变索引后才失败。
+        if member.islnk():
+            archive_path(member.linkname.lstrip("/"), allow_root=False)
+        if member.issym() and ("\0" in member.linkname or "\\" in member.linkname):
+            raise ArchiveError("Unsupported rootfs symlink target: " + repr(member.linkname))
         if not path and not member.isdir():
             raise ArchiveError("Root tar member must be a directory")
         base = posixpath.basename(path)
@@ -90,7 +89,7 @@ class RootFSIndex:
 
     def kind(self, path):
         """返回镜像路径当前可见的文件类型；路径不存在时返回 None。"""
-        entry = self.entries.get(path.strip("/"))
+        entry = self.entries.get(container_path(path).lstrip("/"))
         return entry.kind if entry else None
 
     def read_file(self, path, limit=2 * 1024 * 1024):

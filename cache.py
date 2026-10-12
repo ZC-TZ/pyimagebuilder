@@ -11,6 +11,7 @@ from pathlib import Path
 
 from errors import ArchiveError, BuildError
 from compat import is_linked_directory
+from path_policy import cache_entry_key
 from image_reader import digest_hex, sha256_file, verify_layer_tar
 
 
@@ -20,7 +21,8 @@ from image_reader import digest_hex, sha256_file, verify_layer_tar
 # 版本 11 及更早可能根据无效 passwd 链接或带哨兵 UID/GID 的基础层生成错误结果。
 # 版本 12 及更早的 RUN 可能通过下层符号链接误应用 whiteout 删除。
 # 版本 13 及更早遗漏根目录属性与根 opaque，并可将 RUN 的 .wh.* 实体误作删除。
-CACHE_VERSION = 14
+# 版本 14 及更早的路径规则允许双前导斜杠或改写反斜杠，不能复用旧结果。
+CACHE_VERSION = 15
 
 
 def cache_key(*values):
@@ -56,7 +58,10 @@ class LayerCache:
         文件身份变化或 verify=True 时重新核对 DiffID 与 tar 格式。
         这只适用于可信本地缓存，不能抵御同时修改内容和缓存元数据的攻击者。
         """
+        key = cache_entry_key(key)
         entry = self.entries / (key + ".json")
+        if entry.is_symlink():
+            raise BuildError("Instruction cache entry must not be a symlink")
         try:
             metadata = json.loads(entry.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -68,7 +73,7 @@ class LayerCache:
         try:
             digest = digest_hex(metadata["diff_id"])
             path = self.layers / (digest + ".tar")
-            if not path.is_file() or path.stat().st_size != metadata["size"]:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size != metadata["size"]:
                 return None
             signature = self._identity(path)
             if self.verify or metadata.get("file_identity") != signature:
@@ -96,6 +101,7 @@ class LayerCache:
         同一 DiffID 的层只保存一份；diff_id=None 时记录无文件变化的缓存结果。
         新副本关闭并刷新后再次核对摘要，不能把复制前的源校验当成副本校验。
         """
+        key = cache_entry_key(key)
         if diff_id is None:
             metadata = {"version": CACHE_VERSION, "key": key, "empty": True, "diff_id": None}
         else:
@@ -106,6 +112,8 @@ class LayerCache:
             with open(source, "rb") as checked_layer:
                 verify_layer_tar(checked_layer, "generated instruction layer")
             target = self.layers / (digest + ".tar")
+            if target.is_symlink():
+                raise BuildError("Instruction cache layer must not be a symlink")
             if not target.is_file() or target.stat().st_size != source.stat().st_size or sha256_file(target) != digest:
                 descriptor, temporary = tempfile.mkstemp(prefix="layer-", suffix=".part", dir=self.layers)
                 try:

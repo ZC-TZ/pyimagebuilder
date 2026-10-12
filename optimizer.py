@@ -16,6 +16,7 @@ from pathlib import Path
 
 from cache import CACHE_VERSION
 from compat import is_linked_directory, unlink_missing
+from path_policy import output_path
 from errors import ArchiveError, BuildError
 from file_publish import publish_new_file
 from image_reader import (BaseImage, ImageArchiveReader, archive_members, digest_hex,
@@ -229,7 +230,7 @@ def optimize_image(path, output, tag=None, source_date_epoch=0):
 
     不是文件级压缩；遇到硬链接或特殊文件等无法保守验证的结构时拒绝优化。
     """
-    output = Path(output).resolve()
+    output = output_path(output)
     path = Path(path).resolve()
     if output == path or output.exists() or output.suffix.lower() != ".tar":
         raise BuildError("Optimization output must be a new .tar file")
@@ -381,10 +382,11 @@ def main(argv=None):
                 raise BuildError("--large-mib must be nonnegative")
             result = analyze_image(args.archive, args.tag, args.large_mib)
             if args.output:
+                args.output = output_path(args.output)
                 if args.output.exists():
                     raise BuildError("Report output already exists")
-                args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n",
-                                       encoding="utf-8")
+                with open(args.output, "x", encoding="utf-8") as stream:
+                    stream.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
         elif args.command == "optimize":
             result = optimize_image(args.archive, args.output, args.tag, args.source_date_epoch)
         else:

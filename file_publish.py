@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 from compat import unlink_missing
+from path_policy import output_path
 
 
 BUFFER = 4 * 1024 * 1024
@@ -37,7 +38,7 @@ def publish_new_file(source, destination):
     文件系统不支持硬链接时使用 xb 复制，仍禁止覆盖，但复制期间目标可见。
     此函数不提供多文件事务；调用方负责回滚自己已成功发布的其他产物。
     """
-    source, destination = Path(source), Path(destination)
+    source, destination = Path(source), output_path(destination)
     try:
         os.link(source, destination)
         return destination

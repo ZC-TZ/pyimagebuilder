@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 import ed25519
-from compat import unlink_missing
+from compat import unlink_missing, is_linked_directory
 from errors import BuildError
 from image_reader import sha256_file
 from sbom import canonical_json
@@ -31,7 +31,16 @@ def context_digest(context):
     """将上下文的路径、权限、链接目标和内容规范化后计算整体摘要。"""
     root = Path(context)
     entries = []
-    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+    def walk(directory):
+        # rglob 在部分 Python/Windows 版本会穿过 junction；读取目录前就必须检查。
+        for path in sorted(directory.iterdir(), key=lambda item: item.name):
+            yield path
+            if not path.is_symlink() and path.is_dir():
+                if is_linked_directory(path):
+                    raise BuildError("Context directory junction in provenance: " + str(path))
+                yield from walk(path)
+
+    for path in sorted(walk(root), key=lambda item: item.relative_to(root).as_posix()):
         relative = path.relative_to(root).as_posix()
         details = path.lstat()
         mode = stat.S_IMODE(details.st_mode)

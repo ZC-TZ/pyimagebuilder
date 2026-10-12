@@ -18,6 +18,7 @@ import uuid
 from pathlib import Path
 
 from builder import build
+from path_policy import output_path
 from errors import ArchiveError, BuildError
 
 
@@ -50,14 +51,12 @@ def _sha(stream):
 
 
 def _path(name):
-    value = name
-    while value.startswith("./"):
-        value = value[2:]
-    if not value or value == ".":
-        return ""
-    if value.startswith("/") or "\\" in value or ".." in value.split("/"):
+    if not isinstance(name, str) or name.startswith("/") or "\\" in name or "\0" in name:
+        raise ArchiveError("Unsafe layer path: " + repr(name))
+    parts = name.split("/")
+    if ".." in parts:
         raise ArchiveError("Unsafe layer path: " + name)
-    return posixpath.normpath(value).rstrip("/")
+    return "/".join(part for part in parts if part not in ("", "."))
 
 
 def _blob(archive, descriptor, temp_path):
@@ -785,9 +784,11 @@ def main(argv=None):
                            args.platform)
         raw = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
         if args.report:
+            args.report = output_path(args.report)
             if args.report.exists():
                 raise BuildError("Report already exists: " + str(args.report))
-            args.report.write_text(raw, encoding="utf-8")
+            with open(args.report, "x", encoding="utf-8") as stream:
+                stream.write(raw)
         print(raw, end="")
         return 0 if result["passed"] else 1
     except (ArchiveError, BuildError, OSError, tarfile.TarError,

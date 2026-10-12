@@ -11,6 +11,7 @@ import tempfile
 from contextlib import ExitStack
 from pathlib import Path
 
+from path_policy import output_path
 from errors import ArchiveError, BuildError
 from file_publish import publish_new_file
 from image_reader import archive_members, digest_hex
@@ -69,7 +70,7 @@ def _source(path, expected_architecture):
 def combine(amd64_archive, arm64_archive, output, tag, source_date_epoch=0):
     """合并 amd64 与 arm64 归档，生成确定性的多平台 OCI index tar。"""
     epoch = parse_epoch(source_date_epoch)
-    output = Path(output).resolve()
+    output = output_path(output)
     if output.suffix.lower() != ".tar" or output.exists():
         raise BuildError("Multi-platform output must be a new .tar file")
     paths = [Path(amd64_archive).resolve(), Path(arm64_archive).resolve()]

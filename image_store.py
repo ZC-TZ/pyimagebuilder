@@ -16,6 +16,7 @@ from cas_store import CASStore, docker_archive_tag
 from compat import unlink_missing
 from build_args import expand
 from dockerfile_parser import parse
+from path_policy import output_path
 from errors import BuildError
 from fast import _require_base_tag
 from image_reader import (MAX_JSON, digest_hex, docker_manifest, outer_name, parse_image_json,
@@ -405,6 +406,7 @@ def pull_main(argv=None):
         connection = repository_settings(settings, args.reference)
         args.image_store = args.image_store or cache_directory(settings, "imageStore", None)
         if args.output is not None:
+            args.output = output_path(args.output)
             if args.output.suffix.lower() != ".tar":
                 raise BuildError("--output must end in .tar")
             if args.output.exists():
@@ -425,7 +427,7 @@ def pull_main(argv=None):
                                               args.source or connection.get("source", "registry")))
         reporter.phase_success("Pulling base image")
         if args.output is not None:
-            output = args.output.resolve()
+            output = output_path(args.output)
             if output == archive:
                 raise BuildError("--output must be a distinct .tar path")
             output.parent.mkdir(parents=True, exist_ok=True)

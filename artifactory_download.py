@@ -37,9 +37,10 @@ from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 from urllib.request import (Request, build_opener, HTTPBasicAuthHandler,
                             HTTPPasswordMgrWithDefaultRealm, HTTPRedirectHandler, HTTPSHandler)
 
-from compat import unlink_missing
+from compat import unlink_missing, is_linked_directory
 from file_publish import publish_new_file
-from errors import ArchiveError
+from path_policy import archive_path, host_components, output_path
+from errors import ArchiveError, BuildError
 from image_reader import read_image_json_file, verify_layer_tar
 
 
@@ -274,10 +275,16 @@ def safe_relative_name(href: str) -> Optional[str]:
     if parsed.scheme or parsed.netloc or href.endswith("/"):
         return None
     name = unquote(parsed.path)
+    if name.endswith("/"):
+        return None
     pure = PurePosixPath(name)
     if (not pure.parts or "\\" in name or ":" in name or
             any(ord(char) < 32 for char in name) or
             pure.is_absolute() or ".." in pure.parts):
+        return None
+    try:
+        host_components(pure.parts)
+    except BuildError:
         return None
     return str(pure)
 
@@ -304,7 +311,7 @@ def list_files(opener, directory_url: str) -> List[str]:
 
 def probe_file_size(opener, directory_url: str, name: str) -> Optional[int]:
     """读取单个文件大小；服务器不支持 HEAD 时返回 None。"""
-    url = urljoin(directory_url, quote(name, safe="/%:@"))
+    url = urljoin(directory_url, quote(name, safe="/"))
     try:
         with request(opener, url, method="HEAD", timeout=5) as response:
             value = response.headers.get("Content-Length")
@@ -587,7 +594,18 @@ def convert_registry_to_docker_archive(raw_root: Path, archive_root: Path,
 
 def pack_files(root: Path, output: Path, display: ProgressDisplay) -> float:
     """写入独占临时 tar，并显示进度；通过公共发布器交付到新目标。"""
-    files = sorted(path for path in root.rglob("*") if path.is_file())
+    output = output_path(output)
+    root = Path(root).resolve()
+    def collect(directory):
+        # 制品 tar 只装普通文件；不能通过链接扫描/读取临时目录之外的数据。
+        for path in directory.iterdir():
+            if path.is_symlink() or (path.is_dir() and is_linked_directory(path)):
+                raise BuildError("Linked artifact entry is unsupported: " + str(path))
+            if path.is_dir():
+                yield from collect(path)
+            elif path.is_file():
+                yield path
+    files = sorted(collect(root))
     total_size = sum(path.stat().st_size for path in files)
     part_output = None
 
@@ -639,9 +657,18 @@ def download_one(opener, directory_url: str, name: str, root: Path,
     续传前核对 Content-Range，响应忽略 Range 时覆盖重下；范围或响应长度错误时丢弃前缀。
     这里只验证传输范围和大小，镜像 blob 摘要由后续导入或转换过程核对。
     """
-    destination = root / Path(*PurePosixPath(name).parts)
+    # 此函数也可被独立调用，不能只依赖目录列表阶段的 href 校验。
+    name = archive_path(name, allow_root=False)
+    host_components(name.split("/"))
+    root = Path(root).resolve()
+    destination = root.joinpath(*name.split("/"))
+    current = root
+    for part in name.split("/"):
+        current = current / part
+        if current.is_symlink() or (current.exists() and current.resolve() != current.absolute()):
+            raise BuildError("Download destination traverses a link: " + str(current))
     destination.parent.mkdir(parents=True, exist_ok=True)
-    url = urljoin(directory_url, quote(name, safe="/%:@"))
+    url = urljoin(directory_url, quote(name, safe="/"))
     limiter.acquire()
     try:
         for attempt in range(1, 4):
@@ -904,7 +931,6 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
 
 def main(argv=None) -> int:
     """运行独立的 Artifactory 下载与镜像归档转换命令。"""
-    from errors import BuildError
     from settings import load_settings, repository_settings
     parser = argparse.ArgumentParser(description="下载 Artifactory Registry 制品并生成 docker load 可用的 tar")
     parser.add_argument("url", help="Artifactory 浏览页面或 /artifactory 制品目录 URL")
@@ -936,7 +962,7 @@ def main(argv=None) -> int:
         print(f"镜像名称：{image_reference}")
         files = list_files(opener, directory_url)
         default_name = PurePosixPath(unquote(urlsplit(directory_url).path).rstrip("/")).name + ".tar"
-        output = args.output or Path.cwd() / default_name
+        output = output_path(args.output or Path.cwd() / default_name)
         if output.suffix.lower() != ".tar":
             output = output.with_suffix(".tar")
         if output.exists():

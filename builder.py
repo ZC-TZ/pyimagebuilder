@@ -1,5 +1,7 @@
 """协调基础镜像读取、Dockerfile 执行、层缓存与归档发布；RUN 需要 Linux。"""
 
+from path_policy import output_path
+
 import copy
 from contextlib import nullcontext
 import json
@@ -115,7 +117,7 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
         raise BuildError("RUN sandbox must be legacy, hardened, or rootless")
     dockerfile = Path(dockerfile).resolve()
     context = Path(context).resolve()
-    output = Path(output).resolve()
+    output = output_path(output)
     if not dockerfile.is_file():
         raise BuildError("Dockerfile not found: " + str(dockerfile))
     if not context.is_dir():
@@ -139,8 +141,9 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
     if oci_output is not None and image_format != "both":
         raise BuildError("--oci-output is only valid with --format both")
     if image_format == "both":
-        oci_output = (Path(oci_output).resolve() if oci_output is not None else
+        oci_output = (output_path(oci_output) if oci_output is not None else
                       output.with_name(output.stem + ".oci.tar"))
+        oci_output = output_path(oci_output)
         if oci_output == output or oci_output.suffix.lower() != ".tar":
             raise BuildError("OCI output must be a different .tar file")
         if oci_output.exists():
@@ -149,7 +152,7 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
         raise BuildError("Output already exists: " + str(output))
     if sign_key is not None:
         attest = True
-    sidecars = tuple(artifact_paths(output)) if attest else ()
+    sidecars = tuple(output_path(path) for path in artifact_paths(output)) if attest else ()
     for destination in sidecars:
         if destination.exists():
             raise BuildError("Attestation output already exists: " + str(destination))

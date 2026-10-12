@@ -17,6 +17,7 @@ from pathlib import Path
 
 from cas_store import CASStore, docker_archive_tag
 from compat import remove_suffix
+from path_policy import output_path
 from errors import ArchiveError, BuildError
 from file_publish import publish_new_file
 from image_changes import apply_changes, parse_changes
@@ -261,7 +262,7 @@ def _output_path(output):
     requested = Path(output)
     if requested.exists() or requested.is_symlink():
         raise BuildError("Output must be a new file: " + str(requested))
-    path = requested.resolve()
+    path = output_path(requested)
     if path.exists():
         raise BuildError("Output must be a new file: " + str(path))
     path.parent.mkdir(parents=True, exist_ok=True)
