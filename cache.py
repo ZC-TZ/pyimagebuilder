@@ -25,7 +25,8 @@ from image_reader import digest_hex, sha256_file, verify_layer_tar
 # 版本 15 及更早会丢失目录扩展属性，且 RUN 默认 umask/cache 挂载权限受宿主影响。
 # 版本 16 及更早可把另一 xattr namespace 的普通属性误当删除，并遗漏目录 xattr 删除。
 # 版本 17 及更早在层应用前发布缓存，失败指令也可能留下无效链接或权限层。
-CACHE_VERSION = 18
+# 版本 18 及更早会丢失跨阶段目录的硬链接，并将独立本地源错误地合成硬链接。
+CACHE_VERSION = 19
 
 
 def cache_key(*values):

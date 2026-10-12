@@ -60,10 +60,11 @@ Fast 的 dist.zip 当前不按 ZIP 的 Unix 外部权限字段恢复 mode，解�
 
 - 有效层 UID/GID 范围为 0..4294967294；拒绝 chown 哨兵值。mode 只接受 0000..7777 的 Unix 权限位，包含 setuid/setgid/sticky。
 - 在应用 whiteout、改变索引或物化整层前检查权限声明；生产层也在 tar 编码前检查，避免 tarfile 静默截掉非法 mode 高位。
-- 指令缓存版本为 **18**，旧版本的构建结果失效；CAS schema 仍为 1，基础层缓存版本仍为 2，不要求重下载合法基础镜像 blob。
+- 指令缓存版本为 **19**，旧版本的构建结果失效；CAS schema 仍为 1，基础层缓存版本仍为 2，不要求重下载合法基础镜像 blob。
 - `tests/test_permission_contract.py` 覆盖目录继承、opaque、重建、COPY、CAS/cache、双格式 flatten、优化与系统调用顺序；其他权限测试覆盖 inode、root、USER、链接和自动目录。
 - `tests/test_overlay_xattrs.py` 覆盖实际挂载 namespace 的标记识别、非活动 namespace 属性保留、非法 whiteout、目录 xattr 删除拒绝，以及构建失败不发布或缓存。
 - `tests/test_layer_acceptance_cache.py` 覆盖无效链接/属主、RUN 写盘失败不发布该指令缓存，以及修复执行条件后重试、有效命中和先前成功指令缓存保留。
+- `tests/test_copy_inode_groups.py` 覆盖 COPY 目录内部 inode 分组、独立源复制、排除/删除后的别名、覆盖导致的 inode 分离，以及 CAS、多阶段、缓存和双格式归档。
 - `tests/linux_phase13_smoke.py` 在真实 Linux 上以宿主 umask=077 验证 RUN 新文件与 cache 来源目录的权限，可通过 `conformance.py linux` 执行。
 
 Windows 上的系统调用模拟不能证明 Linux ACL、capability、user namespace、OverlayFS 或设备节点已通过内核验收。Windows chmod 也不等同于 Unix mode 或 Windows ACL 管理。真实 Linux/WSL 及 Docker 对照须在目标环境运行；输入、缓存和私有工作目录应由构建用户控制并保持稳定。

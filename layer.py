@@ -446,11 +446,13 @@ class LayerBuilder:
             raise BuildError("Multiple sources require a directory destination")
         ownership = resolve_chown(transfer.chown, self.rootfs)
         added = {}
-        hardlinks = {}
         with tarfile.open(target, "w", format=tarfile.PAX_FORMAT) as archive:
             for source, expression in expanded:
                 if self._excluded(source, transfer):
                     continue
+                # BuildKit 为每个展开后的源独立复制；只保留该目录树内部的硬链接。
+                # 多个文件参数不能因宿主 inode 相同而意外共享后续 RUN 的写入。
+                hardlinks = {}
                 data = source.lstat()
                 if stat.S_ISDIR(data.st_mode):
                     directory_target_path = (posixpath.join(destination,
@@ -554,6 +556,9 @@ class LayerBuilder:
         ownership = resolve_chown(transfer.chown, self.rootfs)
         added = {}
 
+        # 每个展开后的源重置分组；同一目录树中才共享新建目标 inode。
+        hardlinks = {}
+
         def member_info(path):
             entry = source_rootfs.entries.get(path)
             if entry is None:
@@ -606,6 +611,11 @@ class LayerBuilder:
                 info.linkname = entry.linkname
                 archive.addfile(info)
             elif entry.kind in ("file", "hardlink"):
+                identity = id(entry.inode) if entry.inode is not None else None
+                if identity is not None and identity in hardlinks:
+                    info.type, info.linkname, info.size = tarfile.LNKTYPE, hardlinks[identity], 0
+                    archive.addfile(info)
+                    return
                 data_entry = file_entry(source)
                 with tarfile.open(data_entry.layer, "r:") as original:
                     member = original.getmember(data_entry.member)
@@ -615,6 +625,9 @@ class LayerBuilder:
                     info.size = member.size
                     with stream:
                         self._add_data(archive, info, stream)
+                if identity is not None:
+                    # 用源 inode 分组，不能按字节摘要或 backing member 合并独立文件。
+                    hardlinks[identity] = output
             else:
                 raise UnsupportedInstruction("Cannot COPY prior-stage special file: /" + source)
 
@@ -622,6 +635,7 @@ class LayerBuilder:
             for source, expression in expanded:
                 if _matches_exclude(source, transfer.exclude):
                     continue
+                hardlinks.clear()
                 parent_source = source
                 if "/./" in expression:
                     prefix_name = clean_path(expression.split("/./", 1)[0].lstrip("/"))
