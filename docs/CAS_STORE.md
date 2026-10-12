@@ -25,7 +25,7 @@ image-store/
 
 ## 存储位置与内容
 
-`cache.imageStore` 下的 `cas/` 保存按 SHA-256 命名的 config、manifest 和 layer blob；`cas/refs/` 用版本为 1 的 JSON 文件把镜像引用、平台和来源映射到这些 blob。引用文件最后以原子替换发布。重复 blob 只保存一份；读取和导出时重新核对摘要。`cas prune --dry-run` 可查看无引用 blob，确认后运行 `cas prune` 清理。被现存镜像引用的压缩层及其已校验的未压缩 diff ID 层会保留。清理期间不要同时导入、拉取或构建。
+`cache.imageStore` 下的 `cas/` 保存按 SHA-256 命名的 config、manifest 和 layer blob；`cas/refs/` 用版本为 1 的 JSON 文件把镜像引用、平台和来源映射到这些 blob。引用文件最后以原子替换发布。重复 blob 只保存一份；读取和导出时重新核对摘要。重复导入仍完整核对本次输入的大小和 SHA-256，不能用旧 blob 的正确内容代替新输入校验；不匹配或读取失败时不发布新 ref。正确输入复用旧文件，不重复写盘。`cas prune --dry-run` 可查看无引用 blob，确认后运行 `cas prune` 清理。被现存镜像引用的压缩层及其已校验的未压缩 diff ID 层会保留。清理期间不要同时导入、拉取或构建。
 
 ## 并发与引用锁
 

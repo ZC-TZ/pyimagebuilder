@@ -100,11 +100,11 @@ class CASStore:
                 continue
         return result
 
-    def _put_stream(self, stream, digest, size, verify_existing_input=False):
+    def _put_stream(self, stream, digest, size):
         """写入新 blob 时核对输入长度和摘要，再原子发布。
 
-        同摘要文件已存在时，默认校验该文件后复用。
-        保存新解码结果还需 verify_existing_input=True，不能以旧内容证明新输入的摘要。
+        同摘要文件已存在时仍核对本次输入的长度和摘要，再复用旧文件而不重复写盘。
+        旧 blob 校验成功只证明旧内容正确，不能掩盖新输入损坏或校验后被替换。
         """
         expected = digest_hex(digest)
         target = self._blob(digest)
@@ -116,14 +116,13 @@ class CASStore:
                 raise ArchiveError("CAS blob path is a symlink: " + digest)
             if target.stat().st_size != size or sha256_file(target) != expected:
                 raise ArchiveError("CAS blob is corrupt: " + digest)
-            if verify_existing_input:
-                hasher = hashlib.sha256()
-                written = 0
-                for block in iter(lambda: stream.read(BUFFER), b""):
-                    written += len(block)
-                    hasher.update(block)
-                if written != size or hasher.hexdigest() != expected:
-                    raise ArchiveError("CAS input size or digest mismatch: " + digest)
+            hasher = hashlib.sha256()
+            written = 0
+            for block in iter(lambda: stream.read(BUFFER), b""):
+                written += len(block)
+                hasher.update(block)
+            if written != size or hasher.hexdigest() != expected:
+                raise ArchiveError("CAS input size or digest mismatch: " + digest)
             return target
         descriptor, pending = tempfile.mkstemp(prefix="blob-", suffix=".part", dir=target.parent)
         hasher = hashlib.sha256()
@@ -164,7 +163,7 @@ class CASStore:
         with open(path, "rb") as stream:
             verify_layer_tar(stream, "decoded CAS layer: " + diff_id)
             stream.seek(0)
-            return self._put_stream(stream, diff_id, path.stat().st_size, verify_existing_input=True)
+            return self._put_stream(stream, diff_id, path.stat().st_size)
 
     def _publish(self, reference, platform, source, config_digest, layers,
                  replace=False, manifest_raw=None):
@@ -613,7 +612,7 @@ class CASStore:
                             for block in iter(lambda: source_stream.read(BUFFER), b""):
                                 target.write(block)
                         # 即使同 DiffID 的旧文件存在，也必须验证新解码结果，
-                        # 否则 _put_stream 的去重捷径会掩盖错误的 blob→DiffID 对应关系。
+                        # 否则仅复用旧解码层会掩盖错误的 blob→DiffID 对应关系。
                         self.store_decoded_layer(pending, diff_id)
                         verified_indices.append(index)
                     except (OSError, EOFError, zlib.error) as exc:
