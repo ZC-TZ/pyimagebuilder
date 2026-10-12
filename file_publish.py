@@ -4,6 +4,7 @@ import errno
 import os
 import shutil
 import tempfile
+from contextlib import contextmanager, ExitStack, nullcontext
 from pathlib import Path
 
 from compat import unlink_missing
@@ -13,6 +14,31 @@ from path_policy import output_path
 BUFFER = 4 * 1024 * 1024
 LINK_FALLBACK = {errno.EXDEV, errno.EPERM, errno.EACCES, errno.ENOSYS,
                  errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}
+
+
+@contextmanager
+def publication_transaction(cas_store=None, reference=None, platform=None, source=None):
+    """保护引用与本次创建的交付文件，作用域必须覆盖临时目录退出和收尾操作。
+
+    调用方在排他创建/发布成功后将路径加入返回列表，不能登记尚未取得所有权的路径。
+    引用锁从快照持续到退出，防止失败恢复覆盖其他操作；没有 CAS 时只保护交付文件。
+    """
+    lock = cas_store.ref_lock(reference, platform, source) if cas_store is not None else nullcontext()
+    with lock:
+        previous = cas_store.snapshot_ref(reference, platform, source) if cas_store is not None else None
+        published = []
+        try:
+            yield published
+        except BaseException:
+            try:
+                # ExitStack 在某个删除失败后仍尝试其余文件；引用恢复也不能被删除异常跳过。
+                with ExitStack() as cleanup:
+                    for path in published:
+                        cleanup.callback(unlink_missing, path)
+            finally:
+                if cas_store is not None:
+                    cas_store.restore_ref(reference, platform, source, previous)
+            raise
 
 
 def _copy_exclusive(source, destination):
@@ -46,17 +72,25 @@ def publish_new_file(source, destination):
         if exc.errno not in LINK_FALLBACK:
             raise
     descriptor, pending = tempfile.mkstemp(prefix="publish-", suffix=".part", dir=destination.parent)
+    published = False
     try:
-        with os.fdopen(descriptor, "wb") as output, open(source, "rb") as stream:
-            shutil.copyfileobj(stream, output, BUFFER)
-            output.flush()
-            os.fsync(output.fileno())
         try:
-            os.link(pending, destination)
-        except OSError as exc:
-            if exc.errno not in LINK_FALLBACK:
-                raise
-            _copy_exclusive(pending, destination)
-    finally:
-        unlink_missing(pending)
+            with os.fdopen(descriptor, "wb") as output, open(source, "rb") as stream:
+                shutil.copyfileobj(stream, output, BUFFER)
+                output.flush()
+                os.fsync(output.fileno())
+            try:
+                os.link(pending, destination)
+            except OSError as exc:
+                if exc.errno not in LINK_FALLBACK:
+                    raise
+                _copy_exclusive(pending, destination)
+            published = True
+        finally:
+            unlink_missing(pending)
+    except BaseException:
+        # 目标已发布后清理临时副本也可能失败；不能让调用方错过这个已创建的目标。
+        if published:
+            unlink_missing(destination)
+        raise
     return destination

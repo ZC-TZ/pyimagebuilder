@@ -99,13 +99,13 @@ WORKDIR 按当前 USER 创建缺失目录，保留已有父目录的属主。具
 
 条目放在 `entries/<key>.json`，实际未压缩层放在 `layers/<diffid>.tar`。当前指令缓存版本为 22，排除输入在生成层期间变化后仍按旧键发布的条目，以及旧 Windows 基础缓存误命中后生成的后续层；路径规则已统一（见 [路径处理规则](PATH_POLICY.md)）；旧条目不能复用：版本 13 及更早遗漏根目录元数据和根 opaque，且可能把 RUN 创建的 .wh.* 实体当成删除标记；版本 12 及更早的 RUN 物化可能通过下层符号链接误应用 whiteout 删除；版本 11 及更早可能根据无效账户文件链接或带 chown 哨兵值的层属主生成错误权限；版本 10 及更早的跨阶段 COPY 未读取硬链接 inode 的最终权限，COPY/ADD 还会遗漏源 PAX 扩展属性；版本 9 及更早的 RUN 可能使用宿主组、错误附加组或受 umask 影响的目录权限；版本 8 及更早的 COPY/ADD 可能遗漏新目录的属主与权限；版本 7 及更早的校验只识别首个 tar 头，可能信任负载截断的层。默认命中检查版本、键、大小与文件身份；Windows 增加 ChangeTime，无法读取该字段时使用内容摘要兜底，旧五字段身份自动重新验证；身份变化或指定 --verify-cache 时重新核对 SHA-256、成员负载及结束位置。新层先核对结构，新副本关闭、刷新后在发布前重新校验摘要，再原子替换层与条目；失败不能把错误副本记为可信，既有条目保留。条目大小来自实际目标层。空层也能命中。`RUN` 命中后跳过 rootfs 物化、OverlayFS 与命令执行；未命中才进入 Phase 2 执行路径。基础镜像每次仍需读取与校验，最终归档每次仍要重新生成，因此缓存不保证固定倍数的加速。若外部网络资源改变，`RUN` 缓存无法自动感知，需 `--no-cache` 或修改相应构建输入。
 
-显式 tar 的可信基础层缓存由 ImageArchiveReader 单独管理。跨文件系统发布时，临时副本必须核对预期 DiffID 才能移动到共享层路径；失败清理副本，保留 workspace 文件。基础层条目现在包含 version=2，旧无版本及 version=1 条目首次使用会重新提取、验证结构并写入新记录。旧条目可能对应首个 tar 头可读、实际负载已截断的层，不能继续信任。正常新版本命中的快速检查保留；无需手动清理缓存。CAS ref schema 仍为 1，读取层时另外执行结构检查。
+显式 tar 的可信基础层缓存由 ImageArchiveReader 单独管理。跨文件系统发布时，临时副本必须核对预期 DiffID 才能移动到共享层路径；失败清理副本，保留 workspace 文件。基础层条目现在包含 version=3，旧无版本及 version=1/2 条目首次使用会重新提取、验证结构并写入新记录。Windows 文件身份额外检查 ChangeTime，无法读取时采用内容摘要；旧五字段身份自动重新验证。旧条目可能对应首个 tar 头可读、实际负载已截断的层，不能继续信任。正常新版本命中的快速检查保留；无需手动清理缓存。CAS ref schema 仍为 1，读取层时另外执行结构检查。
 
 ## 多阶段状态
 
 每条 `FROM` 开始新的 `ImageConfig`、layer 列表、`RootFSIndex`、工作目录、用户、shell 与缓存状态；前一阶段保存为不可再变的快照。`FROM <前序阶段>` 复制该快照的配置和层链，再继续添加新层。`FROM scratch` 从指定目标平台的空 rootfs 开始。`--target` 让构建在指定阶段结束，最终只输出该阶段的镜像。多个外部基础镜像可由 main.py 按 FROM 查库/自动拉取，也可用显式 `--base-map` 提供本地 tar；纯离线场景使用本地输入或 `--offline`。
 
-`COPY --from` 从快照的**可见**文件树取源，因而先前的 whiteout 生效；普通文件内容从所属层流式读取，目录、权限、UID/GID 和符号链接按可表示的元数据写入目标层，mtime 归一化到固定 epoch。跨阶段硬链接会复制为普通文件，以免输出层引用未复制的硬链接目标。来源阶段状态键进入目标 `COPY` 的缓存键。
+`COPY --from` 从快照的**可见**文件树取源，因而先前的 whiteout 生效；普通文件内容从所属层流式读取，目录、权限、UID/GID 和符号链接按可表示的元数据写入目标层，mtime 归一化到固定 epoch。同一目录源内保留硬链接关系，每个独立展开源重新分组；若先前别名未被复制，则先写普通文件，避免引用未输出的目标。来源阶段状态键进入目标 `COPY` 的缓存键。
 
 文件内容位置与 inode 元数据分开维护：创建硬链接后，链接头中的属主、mode、mtime 作用于所有仍可见的同 inode 名字；之后覆盖原路径会创建新 inode，旧别名保留原内容及更新后的权限。同一层重复出现也不能把新旧 inode 按内容成员重新合并。跨阶段 COPY 和 rootfs 导出/flatten 读取最终 inode 元数据。
 
@@ -277,3 +277,12 @@ pyimagebuilder/
 严格封闭模式先校验完整 context、Dockerfile、基础 tar 和构建参数的输入锁，再复制所有文件到独立临时工作区。快照自身再次校验后，禁用 RUN 与持久缓存，并用显式时间戳构建；发布前复核原输入，输出归档 SHA-256 写入伴随报告。对不变的输入、源码、Python/平台指纹，这给出可重现的本地文件输入闭包。普通 RUN 模式仍可使用，但严格模式拒绝任意 RUN，因为命令能观察和读取超出文件快照的宿主状态。此设计不构成针对恶意宿主进程的 OS 安全沙箱。
 
 参考：[OCI image layout](https://github.com/opencontainers/image-spec/blob/main/image-layout.md)、[OCI manifest](https://github.com/opencontainers/image-spec/blob/main/manifest.md)、[OCI image config](https://github.com/opencontainers/image-spec/blob/main/config.md)、[OCI layer](https://github.com/opencontainers/image-spec/blob/main/layer.md)、[Linux OverlayFS](https://docs.kernel.org/filesystems/overlayfs.html)、[chroot(2)](https://man7.org/linux/man-pages/man2/chroot.2.html)。
+
+## 发布事务作用域
+
+file_publish.publication_transaction 统一保护引用快照与本次创建的交付文件。
+构建、Fast、封闭构建、多平台合并、Registry/Artifactory、CAS 导出和 rootfs/优化产物的工作目录退出均位于事务内；
+普通异常及中断触发恢复。CAS Docker 导入先清理工作目录再发布引用，
+load 在调用导入之前即承担恢复责任。主入口的基础映射清理与最终摘要计算也受保护，WSL 启动器只登记成功子进程产物。
+多文件回滚继续尝试其他删除，并在 finally 恢复引用。
+规则、重试和限制见 [缓存与镜像复用规则](CACHE_POLICY.md)。

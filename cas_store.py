@@ -20,7 +20,7 @@ from pathlib import Path
 
 from compat import is_linked_directory, unlink_missing
 from errors import ArchiveError, BuildError
-from image_reader import (BaseImage, ImageArchiveReader, archive_members, digest_hex,
+from image_reader import (MAX_JSON, BaseImage, ImageArchiveReader, archive_members, digest_hex,
                           image_history, parse_image_json, read_image_json_file, same_json_value, sha256_file,
                           verify_layer_tar)
 from image_writer import ImageArchiveWriter
@@ -28,6 +28,7 @@ from oci_writer import OCIImageWriter, CONFIG_TYPE, LAYER_TYPE, MANIFEST_TYPE
 from platforms import architecture, normalize_platform
 from settings import cache_directory, load_settings
 from store_lock import file_lock
+from file_publish import publication_transaction
 
 
 SCHEMA_VERSION = 1
@@ -182,7 +183,7 @@ class CASStore:
         # 写入前就核对 raw manifest、config 与 ref 的绑定；不能发布后等 resolve 才发现。
         # 层已由 _put_stream 校验，这里避免再次完整读取大层。
         self._validate_ref_blobs(value, platform, verify_layers=False)
-        with self.ref_lock(reference, platform, source):
+        with publication_transaction(self, reference, platform, source):
             return self._publish_ref(value, replace)
 
     def _publish_ref(self, value, replace):
@@ -215,10 +216,16 @@ class CASStore:
         return value
 
     def snapshot_ref(self, reference, platform, source):
-        """保存当前 ref 的原始字节用于失败恢复；不存在时返回 None。"""
+        """有界保存 ref 原始字节；不解析内容，允许 --replace 修复损坏的旧元数据。"""
         with self.ref_lock(reference, platform, source):
             path = self._ref(reference, normalize_platform(platform), source)
-            return read_image_json_file(path, "CAS ref snapshot")[1] if path.is_file() else None
+            if not path.is_file():
+                return None
+            with open(path, "rb") as stream:
+                raw = stream.read(MAX_JSON + 1)
+            if len(raw) > MAX_JSON:
+                raise ArchiveError("Oversized CAS ref snapshot")
+            return raw
 
     def restore_ref(self, reference, platform, source, raw):
         """持锁恢复先前 ref；调用方须从快照开始持有 ref_lock，避免恢复过期快照。"""
@@ -317,7 +324,8 @@ class CASStore:
                     self._put_stream(stream, diff_id, size)
                 layers.append({"digest": diff_id, "diff_id": diff_id,
                                "mediaType": LAYER_TYPE, "size": size})
-            return self._publish(reference, platform, source, config_digest, layers, replace)
+        # 临时目录退出失败时只留下未引用 blob；不能先更新 ref 再让清理异常逃逸。
+        return self._publish(reference, platform, source, config_digest, layers, replace)
 
     def import_oci(self, archive, reference, platform, source="local", replace=False):
         """导入单平台未压缩 OCI layout，保留校验过的原始 manifest 字节与摘要。"""
@@ -517,7 +525,7 @@ class CASStore:
                 [item["diff_id"] for item in value["layers"]]):
             raise ArchiveError("CAS config DiffIDs do not match ref")
         output.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="cas-export-") as temporary:
+        with publication_transaction() as published, tempfile.TemporaryDirectory(prefix="cas-export-") as temporary:
             layers = []
             for index, item in enumerate(value["layers"]):
                 blob = self._blob(item["digest"])
@@ -540,20 +548,13 @@ class CASStore:
                     verify_layer_tar(checked_layer, "CAS export layer")
                 layers.append(layer)
             writer = ImageArchiveWriter()
-            created = False
-            try:
-                archive_tag = docker_archive_tag(reference)
-                # 预检不能代替排他创建，两个导出者可能同时看到路径不存在。
-                # 已创建的句柄传给 writer，避免再次以覆盖模式打开路径。
-                with open(output, "xb") as sink:
-                    created = True
-                    image = BaseImage(config, layers, [archive_tag], {}, value["config"], config_raw)
-                    writer.write_image(output, image, archive_tag, fileobj=sink)
-                writer.verify(output, archive_tag)
-            except BaseException:
-                if created:
-                    unlink_missing(output)
-                raise
+            archive_tag = docker_archive_tag(reference)
+            # 在排他创建成功后登记路径，临时解码目录清理失败也能撤销本次输出。
+            with open(output, "xb") as sink:
+                published.append(output)
+                image = BaseImage(config, layers, [archive_tag], {}, value["config"], config_raw)
+                writer.write_image(output, image, archive_tag, fileobj=sink)
+            writer.verify(output, archive_tag)
         return output
 
     def _record_verified_diff_ids(self, value, indices):

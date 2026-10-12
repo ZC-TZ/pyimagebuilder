@@ -188,19 +188,20 @@ def _load_archive_locked(archive, root, cas, selected, platform, digest, replace
         raise BuildError("Incomplete image import already exists: " + str(pending))
     previous_ref = cas.snapshot_ref(selected, platform, "local")
     created = False
-    ref_published = False
+    ref_attempted = False
     try:
         with open(archive, "rb") as source, open(pending, "xb") as output:
             created = True
             shutil.copyfileobj(source, output, 4 * 1024 * 1024)
         if sha256_file(pending) != digest:
             raise ArchiveError("Imported archive changed while copying")
+        # import 内部可能已发布 ref 后才被中断，必须在调用前开始负责恢复。
+        ref_attempted = True
         cas.import_docker(pending, selected, platform, "local", replace=True)
-        ref_published = True
         os.replace(pending, target)
     except BaseException:
-        # 创建失败或复制失败时，本次尚未改变 ref，不能回滚别人的导入。
-        if ref_published:
+        # 调用导入前的失败尚未改变 ref；开始导入后即使未返回，也可能已更新 ref。
+        if ref_attempted:
             cas.restore_ref(selected, platform, "local", previous_ref)
         raise
     finally:

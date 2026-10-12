@@ -18,7 +18,7 @@ from cache import CACHE_VERSION
 from compat import is_linked_directory, unlink_missing
 from path_policy import output_path
 from errors import ArchiveError, BuildError
-from file_publish import publish_new_file
+from file_publish import publication_transaction, publish_new_file
 from image_reader import (BaseImage, ImageArchiveReader, archive_members, digest_hex,
                           docker_manifest, image_history, sha256_file)
 from image_reader import verify_layer_tar
@@ -246,7 +246,8 @@ def optimize_image(path, output, tag=None, source_date_epoch=0):
         raise BuildError("Optimization output must be a new .tar file")
     epoch = parse_epoch(source_date_epoch)
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="pyimagebuilder-optimize-", dir=output.parent) as temp:
+    with publication_transaction() as published, \
+            tempfile.TemporaryDirectory(prefix="pyimagebuilder-optimize-", dir=output.parent) as temp:
         kind, tag, image = load_image(path, Path(temp) / "input", tag, with_image=True)
         config, layers = image.config, image.layers
         for layer in layers:
@@ -303,6 +304,7 @@ def optimize_image(path, output, tag=None, source_date_epoch=0):
         original_size = path.stat().st_size
         optimized_size = partial.stat().st_size
         publish_new_file(partial, output)
+        published.append(output)
         return {"output": str(output), "format": kind, "tag": tag,
                 "removed_layer_numbers": [item + 1 for item in removed],
                 "before_bytes": original_size, "after_bytes": optimized_size,

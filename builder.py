@@ -18,7 +18,7 @@ from image_config import ImageConfig
 from image_reader import BaseImage, ImageArchiveReader
 from cas_store import CASStore
 from image_writer import ImageArchiveWriter
-from file_publish import publish_new_file
+from file_publish import publication_transaction, publish_new_file
 from oci_writer import OCIImageWriter
 from layer import LayerBuilder, container_path
 from rootfs import RootFSIndex
@@ -29,7 +29,6 @@ from attest import artifact_paths, create_provenance, read_private_key, sign_env
 from sbom import canonical_json, create_sbom
 from build_args import expand
 from run_mounts import prepare as prepare_run_mounts, locked_caches
-from compat import unlink_missing
 
 
 @dataclass
@@ -202,7 +201,8 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
     if cache_stats is not None:
         cache_stats.update(hits=0, misses=0, stored=0)
     workspace_parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="pyimagebuilder-", dir=workspace_parent) as temp:
+    with publication_transaction() as published, \
+            tempfile.TemporaryDirectory(prefix="pyimagebuilder-", dir=workspace_parent) as temp:
         workspace = Path(temp)
         if reporter is not None and reporter.debug:
             reporter.log("Workspace: " + str(workspace))
@@ -757,15 +757,9 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                 envelope_part.write_bytes(canonical_json(sign_envelope(provenance_bytes, seed)))
                 products.append(("signature", envelope_part, sidecars[2]))
 
-        published = []
-        try:
-            for _, partial, destination in products:
-                publish_new_file(partial, destination)
-                published.append(destination)
-        except Exception:
-            for destination in published:
-                unlink_missing(destination)
-            raise
+        for _, partial, destination in products:
+            publish_new_file(partial, destination)
+            published.append(destination)
         if reporter is not None:
             reporter.phase_success("Exporting image archive")
         if build_info is not None:

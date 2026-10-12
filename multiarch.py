@@ -13,7 +13,7 @@ from pathlib import Path
 
 from path_policy import output_path
 from errors import ArchiveError, BuildError
-from file_publish import publish_new_file
+from file_publish import publication_transaction, publish_new_file
 from image_reader import archive_members, digest_hex
 from oci_writer import (CONFIG_TYPE, INDEX_TYPE, LAYER_TYPE, MANIFEST_TYPE,
                         OCIImageWriter, _json_bytes)
@@ -83,7 +83,8 @@ def combine(amd64_archive, arm64_archive, output, tag, source_date_epoch=0):
     index_raw = _json_bytes({"schemaVersion": 2, "mediaType": INDEX_TYPE,
                              "manifests": entries})
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="pyimagebuilder-multiarch-", dir=output.parent) as temp:
+    with publication_transaction() as published, \
+            tempfile.TemporaryDirectory(prefix="pyimagebuilder-multiarch-", dir=output.parent) as temp:
         partial = Path(temp) / "multiarch.tar"
         with ExitStack() as stack:
             sources = [stack.enter_context(tarfile.open(path, "r:")) for path in paths]
@@ -110,6 +111,7 @@ def combine(amd64_archive, arm64_archive, output, tag, source_date_epoch=0):
                         target.addfile(info, stream)
         verify(partial, tag)
         publish_new_file(partial, output)
+        published.append(output)
     return output
 
 

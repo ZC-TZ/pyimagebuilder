@@ -17,10 +17,10 @@ from build_args import arguments
 from dockerfile_parser import parse
 from path_policy import output_path
 from errors import BuildError
-from file_publish import publish_new_file
+from file_publish import publication_transaction, publish_new_file
 from image_reader import sha256_file
 from reproducible import parse_epoch
-from compat import is_linked_directory, unlink_missing
+from compat import is_linked_directory
 
 
 VERSION = 1
@@ -270,7 +270,8 @@ def build_locked(lock_path, dockerfile, context, base_tar, base_map, tag, output
     output.parent.mkdir(parents=True, exist_ok=True)
     if second is not None:
         second.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="pyimagebuilder-hermetic-", dir=output.parent) as temp:
+    with publication_transaction() as published, \
+            tempfile.TemporaryDirectory(prefix="pyimagebuilder-hermetic-", dir=output.parent) as temp:
         root = Path(temp)
         staged_context = root / "context"
         _copy_context(context, staged_context)
@@ -305,17 +306,11 @@ def build_locked(lock_path, dockerfile, context, base_tar, base_map, tag, output
                               "ociSha256": sha256_file(partial_oci) if partial_oci else None}}
         report_temp = root / "report.json"
         report_temp.write_bytes(_json(report) + b"\n")
-        published = []
-        try:
-            for source, destination in ((partial, output), (partial_oci, second),
-                                        (report_temp, report_path)):
-                if source is not None:
-                    publish_new_file(source, destination)
-                    published.append(destination)
-        except OSError:
-            for destination in published:
-                unlink_missing(destination)
-            raise
+        for source, destination in ((partial, output), (partial_oci, second),
+                                    (report_temp, report_path)):
+            if source is not None:
+                publish_new_file(source, destination)
+                published.append(destination)
     return output, report_path
 
 

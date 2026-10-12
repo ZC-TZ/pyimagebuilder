@@ -26,13 +26,12 @@ from urllib.request import parse_http_list
 
 from path_policy import output_path
 from errors import ArchiveError, BuildError
-from compat import unlink_missing
 from cas_store import docker_archive_tag
 from image_reader import (BaseImage, ImageArchiveReader, archive_members, digest_hex,
                           image_history, image_json_bytes, parse_image_json, read_image_json_file,
                           same_json_value, sha256_file, verify_layer_tar)
 from image_writer import ImageArchiveWriter
-from file_publish import publish_new_file
+from file_publish import publication_transaction, publish_new_file
 from oci_writer import (CONFIG_TYPE, INDEX_TYPE, LAYER_TYPE, MANIFEST_TYPE,
                         OCIImageWriter)
 from platforms import architecture, normalize_platform
@@ -417,7 +416,9 @@ def pull(reference, output, username=None, password=None, ca_file=None,
     output.parent.mkdir(parents=True, exist_ok=True)
     if second is not None:
         second.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="pyimagebuilder-pull-") as temporary:
+    stored_reference = cas_reference or client.reference.full
+    with publication_transaction(cas_store, stored_reference, target_platform, "registry") as published, \
+            tempfile.TemporaryDirectory(prefix="pyimagebuilder-pull-") as temporary:
         workspace = Path(temporary)
         with reporter.timed("Registry auth and manifest") if reporter is not None else nullcontext():
             manifest, manifest_digest = _selected_manifest(client, target_platform)
@@ -516,7 +517,6 @@ def pull(reference, output, username=None, password=None, ca_file=None,
                     if reporter is not None:
                         reporter.log("Verified Registry layer {}/{}".format(index + 1, len(descriptors)))
         local_tag = docker_archive_tag(client.reference.full)
-        stored_reference = cas_reference or client.reference.full
 
         def publish_cas():
             """先保存已验证的未压缩层，再导入传输 blob，所有数据落盘后发布 ref。
@@ -534,29 +534,12 @@ def pull(reference, output, username=None, password=None, ca_file=None,
                 source="registry", replace=True, verified_diff_ids=True)
 
         def publish_products(products):
-            """对同一引用串行提交 CAS 与交付文件，直接调用也具有失败恢复能力。"""
-            lock = (cas_store.ref_lock(stored_reference, target_platform, "registry")
-                    if cas_store is not None else nullcontext())
-            with lock:
-                previous_ref = (cas_store.snapshot_ref(stored_reference, target_platform, "registry")
-                                if cas_store is not None else None)
-                published = []
-                try:
-                    if cas_store is not None:
-                        publish_cas()
-                    for partial, destination in products:
-                        publish_new_file(partial, destination)
-                        published.append(destination)
-                except BaseException:
-                    # 中断与普通失败都需要撤销；只清理成功发布过的路径，
-                    # 目标冲突时不能删除竞争任务的文件。清理失败也必须恢复 ref。
-                    try:
-                        for destination in published:
-                            unlink_missing(destination)
-                    finally:
-                        if cas_store is not None:
-                            cas_store.restore_ref(stored_reference, target_platform, "registry", previous_ref)
-                    raise
+            """发布结果并登记本次取得的文件所有权；外围事务覆盖下载目录退出。"""
+            if cas_store is not None:
+                publish_cas()
+            for partial, destination in products:
+                publish_new_file(partial, destination)
+                published.append(destination)
 
         if cas_only:
             publish_products([])

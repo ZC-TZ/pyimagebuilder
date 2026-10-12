@@ -11,8 +11,10 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from contextlib import ExitStack
 
 from builder import build
+from file_publish import publication_transaction
 from path_policy import output_path
 from errors import BuildError
 from reproducible import parse_epoch
@@ -44,6 +46,22 @@ def _wsl_path(path, mount_root):
         raise BuildError("WSL bridge requires a drive-letter Windows path: " + str(value))
     remainder = value.as_posix()[2:].lstrip("/")
     return "{}/{}/{}".format(mount_root.rstrip("/"), drive[0].lower(), remainder)
+
+
+
+def _build_products(args):
+    """仅在构建成功返回后登记所属产物，供外层映射目录清理失败时撤销。"""
+    output = Path(args.output)
+    products = [output]
+    if getattr(args, "format", "docker") == "both":
+        products.append(getattr(args, "oci_output", None) or
+                        output.with_name(output.stem + ".oci.tar"))
+    if getattr(args, "attest", False) or getattr(args, "sign_key", None) is not None:
+        products.extend(Path(str(output) + suffix) for suffix in
+                        (".spdx.json", ".provenance.json"))
+    if getattr(args, "sign_key", None) is not None:
+        products.append(Path(str(output) + ".dsse.json"))
+    return products
 
 
 def _run_wsl(args, trusted_base_cache=False):
@@ -133,10 +151,14 @@ def _run_wsl(args, trusted_base_cache=False):
             translated[key] = {platform: translate(path) for platform, path in value.items()}
         else:
             translated[key] = translate(value)
-    with tempfile.TemporaryDirectory(prefix="pyimagebuilder-wsl-map-") as temporary:
+    with publication_transaction() as published, \
+            tempfile.TemporaryDirectory(prefix="pyimagebuilder-wsl-map-") as temporary:
         linux_map = Path(temporary) / "base-map.json"
         linux_map.write_text(json.dumps(translated), encoding="utf-8")
-        return subprocess.call(command + ["--base-map", _wsl_path(linux_map, args.wsl_mount_root)])
+        status = subprocess.call(command + ["--base-map", _wsl_path(linux_map, args.wsl_mount_root)])
+        if status == 0:
+            published.extend(_build_products(args))
+        return status
 
 
 def main(argv=None):
@@ -258,110 +280,108 @@ def main(argv=None):
         parser.error("build requires -t/--tag and -o/--output (unless --check is used)")
     reporter = make_reporter(args.progress, args.quiet, args.verbose, args.debug, args.no_color)
     reporter.start(args.tag, args.platform)
-    temporary_map = None
     try:
-        settings, _ = load_settings(args.config)
-        if not args.hermetic:
-            args.image_store = args.image_store or cache_directory(settings, "imageStore", None)
-            args.cache_dir = args.cache_dir or cache_directory(settings, "layerCache", None)
-        if args.context_path is not None and args.context is not None:
-            raise BuildError("Specify build context once: positional PATH or --context")
-        args.context = args.context_path or args.context
-        if args.context is None:
-            raise BuildError("Build context required: use positional PATH or --context")
-        args.dockerfile = args.dockerfile or args.context / "Dockerfile"
-        if args.hermetic and args.source_date_epoch is None:
-            raise BuildError("--hermetic requires an explicit --source-date-epoch")
-        if args.hermetic and args.input_lock is None:
-            raise BuildError("--hermetic requires --input-lock")
-        if args.input_lock is not None and not args.hermetic:
-            raise BuildError("--input-lock requires --hermetic")
-        args.source_date_epoch = parse_epoch(args.source_date_epoch if args.source_date_epoch is not None
-                                             else os.environ.get("SOURCE_DATE_EPOCH", "0"))
-        parsed_args = arguments(args.build_arg)
-        parsed_secrets = secrets(args.secret)
-        args.output = output_path(args.output)
-        if args.oci_output is not None:
-            args.oci_output = output_path(args.oci_output)
-        if args.output.exists():
-            raise BuildError("Output already exists: " + str(args.output))
-        if args.format == "both":
-            secondary = args.oci_output or args.output.with_name(args.output.stem + ".oci.tar")
-            if secondary.exists():
-                raise BuildError("OCI output already exists: " + str(secondary))
-        if args.pull and args.offline:
-            raise BuildError("--pull and --offline cannot be combined")
-        if args.pull and (args.base_tar is not None or args.base_map is not None):
-            raise BuildError("--pull cannot refresh an explicitly supplied local base tar/map")
-        if args.hermetic:
-            if (args.run or args.wsl or args.secret or args.cache_dir is not None or
-                    args.attest or args.sign_key is not None or args.allow_emulated_run or
-                    args.run_network != "none" or args.workspace is not None or args.pull or
-                    args.username is not None or args.password_env is not None or
-                    args.ca_file is not None or args.insecure_http or args.auth_host is not None):
-                raise BuildError("--hermetic rejects RUN, WSL, secrets, cache, attestation, "
-                                 "emulation, network, and custom workspace options")
-            from hermetic import build_locked
-            result, report = build_locked(
-                args.input_lock, args.dockerfile, args.context, args.base_tar, args.base_map,
-                args.tag, args.output, target_platform=args.platform, target_stage=args.target,
-                image_format=args.format, oci_output=args.oci_output,
-                source_date_epoch=args.source_date_epoch, build_args=parsed_args)
+        with publication_transaction() as published:
+            with ExitStack() as cleanup:
+                settings, _ = load_settings(args.config)
+                if not args.hermetic:
+                    args.image_store = args.image_store or cache_directory(settings, "imageStore", None)
+                    args.cache_dir = args.cache_dir or cache_directory(settings, "layerCache", None)
+                if args.context_path is not None and args.context is not None:
+                    raise BuildError("Specify build context once: positional PATH or --context")
+                args.context = args.context_path or args.context
+                if args.context is None:
+                    raise BuildError("Build context required: use positional PATH or --context")
+                args.dockerfile = args.dockerfile or args.context / "Dockerfile"
+                if args.hermetic and args.source_date_epoch is None:
+                    raise BuildError("--hermetic requires an explicit --source-date-epoch")
+                if args.hermetic and args.input_lock is None:
+                    raise BuildError("--hermetic requires --input-lock")
+                if args.input_lock is not None and not args.hermetic:
+                    raise BuildError("--input-lock requires --hermetic")
+                args.source_date_epoch = parse_epoch(args.source_date_epoch if args.source_date_epoch is not None
+                                                     else os.environ.get("SOURCE_DATE_EPOCH", "0"))
+                parsed_args = arguments(args.build_arg)
+                parsed_secrets = secrets(args.secret)
+                args.output = output_path(args.output)
+                if args.oci_output is not None:
+                    args.oci_output = output_path(args.oci_output)
+                if args.output.exists():
+                    raise BuildError("Output already exists: " + str(args.output))
+                if args.format == "both":
+                    secondary = args.oci_output or args.output.with_name(args.output.stem + ".oci.tar")
+                    if secondary.exists():
+                        raise BuildError("OCI output already exists: " + str(secondary))
+                if args.pull and args.offline:
+                    raise BuildError("--pull and --offline cannot be combined")
+                if args.pull and (args.base_tar is not None or args.base_map is not None):
+                    raise BuildError("--pull cannot refresh an explicitly supplied local base tar/map")
+                if args.hermetic:
+                    if (args.run or args.wsl or args.secret or args.cache_dir is not None or
+                            args.attest or args.sign_key is not None or args.allow_emulated_run or
+                            args.run_network != "none" or args.workspace is not None or args.pull or
+                            args.username is not None or args.password_env is not None or
+                            args.ca_file is not None or args.insecure_http or args.auth_host is not None):
+                        raise BuildError("--hermetic rejects RUN, WSL, secrets, cache, attestation, "
+                                         "emulation, network, and custom workspace options")
+                    from hermetic import build_locked
+                    result, report = build_locked(
+                        args.input_lock, args.dockerfile, args.context, args.base_tar, args.base_map,
+                        args.tag, args.output, target_platform=args.platform, target_stage=args.target,
+                        image_format=args.format, oci_output=args.oci_output,
+                        source_date_epoch=args.source_date_epoch, build_args=parsed_args)
+                    published.extend(_build_products(args))
+                    published.append(report)
+                    digest, size = _archive_digest(result, reporter)
+                    reporter.success(image=args.tag, platform=args.platform, output=str(result),
+                                     digest=digest, size=size, hermetic_report=str(report))
+                    return 0
+                managed_base = args.base_tar is None and args.base_map is None
+                if managed_base:
+                    from image_store import pull_base_map
+                    temporary_map = cleanup.enter_context(
+                        tempfile.TemporaryDirectory(prefix="pyimagebuilder-base-map-"))
+                    map_path = Path(temporary_map) / "base-map.json"
+                    reporter.phase_start("Resolving base images")
+                    args.base_map = pull_base_map(
+                        args.dockerfile, target_platform=args.platform, target_stage=args.target,
+                        build_args=parsed_args, source=args.pull_source, store=args.image_store,
+                        refresh=args.pull, offline=args.offline,
+                        username=args.username, password_env=args.password_env,
+                        ca_file=args.ca_file, insecure_http=args.insecure_http,
+                        auth_host=args.auth_host, workers=args.pull_workers,
+                        destination=map_path, settings=settings, reporter=reporter)
+                    reporter.phase_success("Resolving base images")
+                if args.wsl:
+                    status = _run_wsl(args, managed_base)
+                    if status == 0:
+                        published.extend(_build_products(args))
+                    return status
+                chosen_cache = None if args.no_cache else (args.cache_dir or
+                    Path(tempfile.gettempdir()) / "pyimagebuilder-layer-cache")
+                stats = {}
+                build_info = {}
+                result = build(args.dockerfile, args.context, args.base_tar, args.base_map,
+                               args.tag, args.output, args.run, args.run_network, args.workspace,
+                               chosen_cache, stats, args.target, args.format, args.oci_output,
+                               args.source_date_epoch, args.attest, args.sign_key, args.run_sandbox,
+                               args.platform, args.allow_emulated_run, parsed_args, parsed_secrets,
+                               reporter=reporter, build_info=build_info,
+                               allow_remote_add=not args.offline,
+                               trusted_base_cache=managed_base or args.trusted_base_cache,
+                               verify_cache=args.verify_cache)
+                published.extend(_build_products(args))
             digest, size = _archive_digest(result, reporter)
-            reporter.success(image=args.tag, platform=args.platform, output=str(result),
-                             digest=digest, size=size, hermetic_report=str(report))
-            return 0
-        managed_base = args.base_tar is None and args.base_map is None
-        if managed_base:
-            from image_store import pull_base_map
-            temporary_map = tempfile.TemporaryDirectory(prefix="pyimagebuilder-base-map-")
-            map_path = Path(temporary_map.name) / "base-map.json"
-            reporter.phase_start("Resolving base images")
-            args.base_map = pull_base_map(
-                args.dockerfile, target_platform=args.platform, target_stage=args.target,
-                build_args=parsed_args, source=args.pull_source, store=args.image_store,
-                refresh=args.pull, offline=args.offline,
-                username=args.username, password_env=args.password_env,
-                ca_file=args.ca_file, insecure_http=args.insecure_http,
-                auth_host=args.auth_host, workers=args.pull_workers,
-                destination=map_path, settings=settings, reporter=reporter)
-            reporter.phase_success("Resolving base images")
-        if args.wsl:
-            return _run_wsl(args, managed_base)
-        chosen_cache = None if args.no_cache else (args.cache_dir or
-            Path(tempfile.gettempdir()) / "pyimagebuilder-layer-cache")
-        stats = {}
-        build_info = {}
-        result = build(args.dockerfile, args.context, args.base_tar, args.base_map,
-                       args.tag, args.output, args.run, args.run_network, args.workspace,
-                       chosen_cache, stats, args.target, args.format, args.oci_output,
-                       args.source_date_epoch, args.attest, args.sign_key, args.run_sandbox,
-                       args.platform, args.allow_emulated_run, parsed_args, parsed_secrets,
-                       reporter=reporter, build_info=build_info,
-                       allow_remote_add=not args.offline,
-                       trusted_base_cache=managed_base or args.trusted_base_cache,
-                       verify_cache=args.verify_cache)
+            reporter.success(image=args.tag, platform=build_info.get("platform", args.platform), output=str(result),
+                             digest=digest, size=size, layers=build_info.get("layers"),
+                             cache=("disabled" if args.no_cache else
+                                    "{} hit(s), {} miss(es), {} stored".format(
+                                        stats["hits"], stats["misses"], stats["stored"])),
+                             oci_output=build_info.get("oci_output"),
+                             sbom=str(result) + ".spdx.json" if args.attest else None,
+                             provenance=str(result) + ".provenance.json" if args.attest else None,
+                             signature=str(result) + ".dsse.json" if args.sign_key else None)
     except (BuildError, OSError, RuntimeError, ValueError) as exc:
-        reporter.fail(exc)
-        if args.debug:
-            import traceback
-            traceback.print_exc(file=sys.stderr)
-        return 1
-    finally:
-        if temporary_map is not None:
-            temporary_map.cleanup()
-    try:
-        digest, size = _archive_digest(result, reporter)
-        reporter.success(image=args.tag, platform=build_info.get("platform", args.platform), output=str(result),
-                         digest=digest, size=size, layers=build_info.get("layers"),
-                         cache=("disabled" if args.no_cache else
-                                "{} hit(s), {} miss(es), {} stored".format(
-                                    stats["hits"], stats["misses"], stats["stored"])),
-                         oci_output=build_info.get("oci_output"),
-                         sbom=str(result) + ".spdx.json" if args.attest else None,
-                         provenance=str(result) + ".provenance.json" if args.attest else None,
-                         signature=str(result) + ".dsse.json" if args.sign_key else None)
-    except OSError as exc:
         reporter.fail(exc)
         if args.debug:
             import traceback

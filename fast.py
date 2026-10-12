@@ -20,6 +20,7 @@ from errors import BuildError
 from reproducible import parse_epoch
 from settings import cache_directory, config_path, load_settings, repository_settings
 from compat import unlink_missing
+from file_publish import publication_transaction
 from path_policy import (archive_path as safe_archive_path, container_path, host_components,
                          host_path_aliases, output_path)
 
@@ -278,7 +279,7 @@ def quick_build(artifact, project, version, config_path=None, *,
                                                         dir=artifact.parent)
     except OSError:
         temporary_context = tempfile.TemporaryDirectory(prefix="pyimagebuilder-fast-")
-    with temporary_context as temporary, ExitStack() as cleanup:
+    with publication_transaction() as published, temporary_context as temporary, ExitStack() as cleanup:
         prepare_started = time.monotonic()
         if reporter is not None:
             reporter.phase_start("Preparing application package")
@@ -335,12 +336,16 @@ def quick_build(artifact, project, version, config_path=None, *,
             reporter.phase_success("Resolving base image")
         if output == base_tar:
             raise BuildError("Output must differ from the cached base tar")
+        info = build_info if build_info is not None else {}
         result = build(dockerfile, context, base_tar, None, tag, output,
                        enable_run=False, cache_dir=cache_dir, cache_stats=cache_stats,
                        image_format=image_format, source_date_epoch=epoch,
-                       target_platform=platform, reporter=reporter, build_info=build_info,
+                       target_platform=platform, reporter=reporter, build_info=info,
                        trusted_base_cache=profile.get("baseTar") is None,
                        verify_cache=verify_cache)
+        published.append(result)
+        if info.get("oci_output") is not None:
+            published.append(Path(info["oci_output"]))
     return result, tag
 
 

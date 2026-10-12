@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import base64
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
-from contextlib import nullcontext
 import gzip
 import hashlib
 import html.parser
@@ -39,7 +38,7 @@ from urllib.request import (Request, build_opener, HTTPBasicAuthHandler,
                             HTTPPasswordMgrWithDefaultRealm, HTTPRedirectHandler, HTTPSHandler)
 
 from compat import unlink_missing, is_linked_directory
-from file_publish import publish_new_file
+from file_publish import publication_transaction, publish_new_file
 from path_policy import archive_path, host_components, output_path
 from errors import ArchiveError, BuildError
 from image_reader import read_image_json_file, verify_layer_tar
@@ -628,27 +627,29 @@ def pack_files(root: Path, output: Path, display: ProgressDisplay) -> float:
     reporter = threading.Thread(target=report, name="tar-progress")
     reporter.daemon = True
     reporter.start()
-    try:
-        # 固定 output.part 可能属于另一任务，不能先删除或覆盖它。
-        descriptor, pending = tempfile.mkstemp(prefix="artifact-pack-", suffix=".part", dir=output.parent)
-        part_output = Path(pending)
-        with os.fdopen(descriptor, "wb") as sink, tarfile.open(fileobj=sink, mode="w", bufsize=1024 * 1024) as archive:
-            for path in files:
-                arcname = path.relative_to(root).as_posix()
-                tarinfo = archive.gettarinfo(str(path), arcname=arcname)
-                with path.open("rb") as source:
-                    archive.addfile(tarinfo, CountingReader(source, stats))
-        publish_new_file(part_output, output)
-    finally:
-        stop.set()
-        reporter.join()
-        if part_output is not None:
-            unlink_missing(part_output)
+    with publication_transaction() as published:
+        try:
+            # 固定 output.part 可能属于另一任务，不能先删除或覆盖它。
+            descriptor, pending = tempfile.mkstemp(prefix="artifact-pack-", suffix=".part", dir=output.parent)
+            part_output = Path(pending)
+            with os.fdopen(descriptor, "wb") as sink, tarfile.open(fileobj=sink, mode="w", bufsize=1024 * 1024) as archive:
+                for path in files:
+                    arcname = path.relative_to(root).as_posix()
+                    tarinfo = archive.gettarinfo(str(path), arcname=arcname)
+                    with path.open("rb") as source:
+                        archive.addfile(tarinfo, CountingReader(source, stats))
+            publish_new_file(part_output, output)
+            published.append(output)
+        finally:
+            stop.set()
+            reporter.join()
+            if part_output is not None:
+                unlink_missing(part_output)
 
-    elapsed = time.monotonic() - started
-    display.status("打包 100.0% | {} | 耗时 {}".format(format_size(total_size), format_duration(elapsed)))
-    display.finish_line()
-    return elapsed
+        elapsed = time.monotonic() - started
+        display.status("打包 100.0% | {} | 耗时 {}".format(format_size(total_size), format_duration(elapsed)))
+        display.finish_line()
+        return elapsed
 
 
 def download_one(opener, directory_url: str, name: str, root: Path,
@@ -807,7 +808,8 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
             len(files), len(sizes)
         ))
 
-    with tempfile.TemporaryDirectory(prefix="artifactory_download_") as temp:
+    with publication_transaction(cas_store, image_reference, target_platform, "artifactory") as published, \
+            tempfile.TemporaryDirectory(prefix="artifactory_download_") as temp:
         workspace = Path(temp)
         raw_root = workspace / "registry-v2"
         archive_root = workspace / "docker-archive"
@@ -927,74 +929,65 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
         display.log("下载完成：{}，耗时 {}；开始{}…".format(
             format_size(stats.snapshot()), format_duration(download_elapsed),
             "校验并写入 CAS" if cas_only else "转换 Registry V2 格式"))
-        lock = (cas_store.ref_lock(image_reference, target_platform, "artifactory")
-                if cas_store is not None else nullcontext())
-        with lock:
-            previous_ref = (cas_store.snapshot_ref(image_reference, target_platform, "artifactory")
-                            if cas_store is not None else None)
-            try:
-                conversion_started = time.monotonic()
-                if cas_only:
-                    manifest, manifest_raw = read_image_json_file(raw_root / "manifest.json",
-                                                                  "Artifactory manifest")
-                    config_entry, descriptors = manifest.get("config"), manifest.get("layers")
-                    if not isinstance(config_entry, dict) or not isinstance(descriptors, list):
-                        raise RuntimeError("Registry manifest 的 config/layers 格式无效")
-                    config_path = find_blob(raw_root, config_entry.get("digest"), "config.digest")
-                    config = load_json_object(config_path, "镜像 config blob")
-                    rootfs = config.get("rootfs")
-                    diff_ids = rootfs.get("diff_ids") if isinstance(rootfs, dict) else None
-                    if not isinstance(diff_ids, list) or len(diff_ids) != len(descriptors):
-                        raise RuntimeError("config.rootfs.diff_ids 数量与 manifest.layers 不一致")
-                    layer_paths = []
-                    for index, (descriptor, diff_id) in enumerate(zip(descriptors, diff_ids), 1):
-                        if not isinstance(descriptor, dict):
-                            raise RuntimeError("Registry manifest 的 layer descriptor 格式无效")
-                        blob = find_blob(raw_root, descriptor.get("digest"), "layer.digest")
-                        _check_cas_layer_encoding(descriptor, blob, diff_id)
-                        decoded = workspace / "decoded.tar"
-                        # 相同 DiffID 的旧解码层只能证明旧数据有效，不能代替本次 blob 的校验。
-                        # 逐层验证、入库并删除临时层，限制 CAS-only 的临时磁盘占用。
-                        materialize_layer(blob, decoded, str(descriptor.get("mediaType", "")),
-                                          diff_id, index, len(descriptors), display,
-                                          descriptor.get("digest"))
-                        cas_store.store_decoded_layer(decoded, diff_id)
-                        decoded.unlink()
-                        layer_paths.append(blob)
-                else:
-                    decoded_layers = convert_registry_to_docker_archive(
-                        raw_root, archive_root, image_reference, display)
-                    if cas_store is not None:
-                        manifest, manifest_raw = read_image_json_file(raw_root / "manifest.json",
-                                                                      "Artifactory manifest")
-                        config_path = find_blob(raw_root, manifest["config"]["digest"], "config.digest")
-                        layer_paths = [find_blob(raw_root, item["digest"], "layer.digest")
-                                       for item in manifest["layers"]]
-                        config = load_json_object(config_path, "镜像 config blob")
-                        for descriptor, blob, layer, diff_id in zip(
-                                manifest["layers"], layer_paths, decoded_layers, config["rootfs"]["diff_ids"]):
-                            _check_cas_layer_encoding(descriptor, blob, diff_id)
-                            cas_store.store_decoded_layer(layer, diff_id)
-                conversion_elapsed = time.monotonic() - conversion_started
-                if reporter is not None:
-                    reporter.record_timing("Convert Artifactory layers", conversion_elapsed)
-                if cas_store is not None:
-                    cas_store.import_registry(manifest_raw, config_path, layer_paths,
-                                              image_reference, target_platform, replace=True,
-                                              verified_diff_ids=True)
-                if cas_only:
-                    # 保留基础镜像入口对 media type 与配置的检查；层内容已在发布前验证。
-                    cas_store.open_base(image_reference, target_platform, "artifactory")
-                    return
-                display.log("格式转换完成，耗时 {}；开始生成 Docker tar…".format(
-                    format_duration(conversion_elapsed)))
-                pack_elapsed = pack_files(archive_root, output, display)
-                if reporter is not None:
-                    reporter.record_timing("Pack Artifactory base archive", pack_elapsed)
-            except BaseException:
-                if cas_store is not None:
-                    cas_store.restore_ref(image_reference, target_platform, "artifactory", previous_ref)
-                raise
+        conversion_started = time.monotonic()
+        if cas_only:
+            manifest, manifest_raw = read_image_json_file(raw_root / "manifest.json",
+                                                          "Artifactory manifest")
+            config_entry, descriptors = manifest.get("config"), manifest.get("layers")
+            if not isinstance(config_entry, dict) or not isinstance(descriptors, list):
+                raise RuntimeError("Registry manifest 的 config/layers 格式无效")
+            config_path = find_blob(raw_root, config_entry.get("digest"), "config.digest")
+            config = load_json_object(config_path, "镜像 config blob")
+            rootfs = config.get("rootfs")
+            diff_ids = rootfs.get("diff_ids") if isinstance(rootfs, dict) else None
+            if not isinstance(diff_ids, list) or len(diff_ids) != len(descriptors):
+                raise RuntimeError("config.rootfs.diff_ids 数量与 manifest.layers 不一致")
+            layer_paths = []
+            for index, (descriptor, diff_id) in enumerate(zip(descriptors, diff_ids), 1):
+                if not isinstance(descriptor, dict):
+                    raise RuntimeError("Registry manifest 的 layer descriptor 格式无效")
+                blob = find_blob(raw_root, descriptor.get("digest"), "layer.digest")
+                _check_cas_layer_encoding(descriptor, blob, diff_id)
+                decoded = workspace / "decoded.tar"
+                # 相同 DiffID 的旧解码层只能证明旧数据有效，不能代替本次 blob 的校验。
+                # 逐层验证、入库并删除临时层，限制 CAS-only 的临时磁盘占用。
+                materialize_layer(blob, decoded, str(descriptor.get("mediaType", "")),
+                                  diff_id, index, len(descriptors), display,
+                                  descriptor.get("digest"))
+                cas_store.store_decoded_layer(decoded, diff_id)
+                decoded.unlink()
+                layer_paths.append(blob)
+        else:
+            decoded_layers = convert_registry_to_docker_archive(
+                raw_root, archive_root, image_reference, display)
+            if cas_store is not None:
+                manifest, manifest_raw = read_image_json_file(raw_root / "manifest.json",
+                                                              "Artifactory manifest")
+                config_path = find_blob(raw_root, manifest["config"]["digest"], "config.digest")
+                layer_paths = [find_blob(raw_root, item["digest"], "layer.digest")
+                               for item in manifest["layers"]]
+                config = load_json_object(config_path, "镜像 config blob")
+                for descriptor, blob, layer, diff_id in zip(
+                        manifest["layers"], layer_paths, decoded_layers, config["rootfs"]["diff_ids"]):
+                    _check_cas_layer_encoding(descriptor, blob, diff_id)
+                    cas_store.store_decoded_layer(layer, diff_id)
+        conversion_elapsed = time.monotonic() - conversion_started
+        if reporter is not None:
+            reporter.record_timing("Convert Artifactory layers", conversion_elapsed)
+        if cas_store is not None:
+            cas_store.import_registry(manifest_raw, config_path, layer_paths,
+                                      image_reference, target_platform, replace=True,
+                                      verified_diff_ids=True)
+        if cas_only:
+            # 保留基础镜像入口对 media type 与配置的检查；层内容已在发布前验证。
+            cas_store.open_base(image_reference, target_platform, "artifactory")
+            return
+        display.log("格式转换完成，耗时 {}；开始生成 Docker tar…".format(
+            format_duration(conversion_elapsed)))
+        pack_elapsed = pack_files(archive_root, output, display)
+        published.append(output)
+        if reporter is not None:
+            reporter.record_timing("Pack Artifactory base archive", pack_elapsed)
 
 
 def main(argv=None) -> int:

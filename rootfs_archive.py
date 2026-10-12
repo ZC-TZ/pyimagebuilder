@@ -19,7 +19,7 @@ from cas_store import CASStore, docker_archive_tag
 from compat import remove_suffix
 from path_policy import output_path
 from errors import ArchiveError, BuildError
-from file_publish import publish_new_file
+from file_publish import publication_transaction, publish_new_file
 from image_changes import apply_changes, parse_changes
 from image_reader import ImageArchiveReader, archive_members, sha256_file
 from image_store import _archive_path, default_store
@@ -272,7 +272,8 @@ def export_rootfs(source, output, tag=None, platform="linux/amd64", store=None,
     """导出文件系统，不携带 config/manifest/history；'-' 仅写二进制标准输出。"""
     binary = str(output) == "-"
     destination = None if binary else _output_path(output)
-    with tempfile.TemporaryDirectory(prefix="pyimagebuilder-rootfs-",
+    with publication_transaction() as published, \
+            tempfile.TemporaryDirectory(prefix="pyimagebuilder-rootfs-",
                                      dir=destination.parent if destination else None) as temporary:
         workspace = Path(temporary)
         with open_image(source, workspace, tag, platform, store, kind) as (image, selected):
@@ -288,6 +289,7 @@ def export_rootfs(source, output, tag=None, platform="linux/amd64", store=None,
                 stream.flush()
             else:
                 publish_new_file(merged, destination)
+                published.append(destination)
             if reporter is not None:
                 reporter.phase_success()
             return {"operation": "export", "tag": selected, "output": "-" if binary else str(destination),
@@ -333,7 +335,8 @@ def import_rootfs(source, reference, output, changes=None, platform="linux/amd64
     platform, epoch = normalize_platform(platform), parse_epoch(source_date_epoch)
     instructions = parse_changes(changes)
     destination = _output_path(output)
-    with tempfile.TemporaryDirectory(prefix="pyimagebuilder-import-", dir=destination.parent) as temporary:
+    with publication_transaction() as published, \
+            tempfile.TemporaryDirectory(prefix="pyimagebuilder-import-", dir=destination.parent) as temporary:
         workspace = Path(temporary)
         if str(source) == "-":
             source = workspace / "stdin.tar"
@@ -355,6 +358,7 @@ def import_rootfs(source, reference, output, changes=None, platform="linux/amd64
                   "files": files, "layers": 1, "image_id": _config_digest(partial, format),
                   "sha256": digest}
         publish_new_file(partial, destination)
+        published.append(destination)
         return result
 
 
@@ -376,7 +380,8 @@ def flatten_image(source, output, reference=None, tag=None, platform="linux/amd6
     platform, epoch = normalize_platform(platform), parse_epoch(source_date_epoch)
     instructions = parse_changes(changes)
     destination = _output_path(output)
-    with tempfile.TemporaryDirectory(prefix="pyimagebuilder-flatten-", dir=destination.parent) as temporary:
+    with publication_transaction() as published, \
+            tempfile.TemporaryDirectory(prefix="pyimagebuilder-flatten-", dir=destination.parent) as temporary:
         workspace = Path(temporary)
         with open_image(source, workspace, tag, platform, store, kind) as (image, selected):
             output_tag = image_tag(reference or selected)
@@ -395,6 +400,7 @@ def flatten_image(source, output, reference=None, tag=None, platform="linux/amd6
                       "source_image_id": image.config_digest, "image_id": _config_digest(partial, format),
                       "sha256": digest}
             publish_new_file(partial, destination)
+            published.append(destination)
             return result
 
 

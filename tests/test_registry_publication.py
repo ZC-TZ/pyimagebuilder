@@ -17,6 +17,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import registry
+import file_publish
 from cas_store import CASStore
 from errors import BuildError
 from image_reader import ImageArchiveReader
@@ -114,7 +115,7 @@ class RegistryPublicationTests(unittest.TestCase):
             store.import_docker(make_image(root, "old"), REFERENCE, PLATFORM, SOURCE)
             previous = store.snapshot_ref(REFERENCE, PLATFORM, SOURCE)
             output, second = root / "image.tar", root / "image.oci.tar"
-            publish, unlink = registry.publish_new_file, registry.unlink_missing
+            publish, unlink = registry.publish_new_file, file_publish.unlink_missing
 
             def fail_second(source, destination):
                 if Path(destination) == second:
@@ -127,7 +128,7 @@ class RegistryPublicationTests(unittest.TestCase):
                 return unlink(path)
 
             with local_registry(), patch.object(registry, "publish_new_file", side_effect=fail_second), \
-                    patch.object(registry, "unlink_missing", side_effect=fail_cleanup):
+                    patch.object(file_publish, "unlink_missing", side_effect=fail_cleanup):
                 with self.assertRaisesRegex(OSError, "cleanup interrupted"):
                     registry.pull(REFERENCE, output, image_format="both", cas_store=store)
             self.assertEqual(store.snapshot_ref(REFERENCE, PLATFORM, SOURCE), previous)
