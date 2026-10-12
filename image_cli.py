@@ -118,6 +118,9 @@ def list_images(store=None):
     if not root.exists():
         return {"image_store": str(root), "images": result}
     for path in sorted(root.glob("*.tar")):
+        if path.is_symlink():
+            result.append({"archive": str(path), "error": "Stored archive must not be a symlink"})
+            continue
         try:
             for entry in _manifest(path):
                 with tarfile.open(path, "r:*") as source:
@@ -143,7 +146,7 @@ def list_images(store=None):
                                "archive": str(path) if path.is_file() else None,
                                "bytes": 0 if path.is_file() else
                                         sum(item["size"] for item in ref["layers"])})
-        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        except (BuildError, KeyError, TypeError, ValueError, AttributeError) as exc:
             result.append({"storage": "cas", "error": "Invalid CAS ref: " + str(exc)})
     return {"image_store": str(root), "images": result}
 

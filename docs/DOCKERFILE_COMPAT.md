@@ -43,7 +43,7 @@ COPY --from 使用源 inode 的最终属主与权限；COPY --from 和 ADD 解�
 
 本地目录及跨阶段目录 COPY 保留**同一源目录树内部**的硬链接关系，按实际源 inode 分组；相同内容不等于硬链接。被排除或已删除的源名字不作为新层链接目标，仍可从存活别名复制固定内容。多个源参数或通配符展开后的独立源分别复制，不会仅因源 inode 相同而在目标中共享写入。这一复制边界参考 [BuildKit 文件操作](https://github.com/moby/buildkit/blob/master/solver/llbsolver/file/backend.go)及其使用的 [fsutil 复制逻辑](https://github.com/tonistiigi/fsutil/blob/master/copy/copy.go)；目标 Docker/BuildKit 版本仍需运行对照验收。
 
-指令缓存版本为 20，路径规则已统一（见 [路径处理规则](PATH_POLICY.md)）；旧版本根目录属性、根 opaque、RUN 保留名、whiteout 删除、账户路径解析、层文件属主、硬链接、扩展属性、目录元数据或 RUN 身份可能有误，首次使用会自动重新构建相应层。
+指令缓存版本为 21，路径规则已统一（见 [路径处理规则](PATH_POLICY.md)）；旧版本根目录属性、根 opaque、RUN 保留名、whiteout 删除、账户路径解析、层文件属主、硬链接、扩展属性、目录元数据或 RUN 身份可能有误，首次使用会自动重新构建相应层。
 
 目录及根目录更新保留未覆盖的 xattr；物化和 OverlayFS 按 chown/xattr/chmod 顺序恢复属性。RUN 默认 umask=0022，新挂载目录、设备节点及 cache 来源目录显式设置权限。具体规则与验证边界见 [镜像权限规则](PERMISSION_POLICY.md)。
 

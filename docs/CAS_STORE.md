@@ -51,7 +51,7 @@ CAS 的 manifest/config/ref 文件同样限量读取，每份最多 16 MiB，并
 
 普通 `build` 和 Fast 现在直接从 CAS 读取基础 config 与 layer；首次从 Registry/Artifactory 下载供构建使用时，也可直接校验入库，跳过 Docker tar 的转换与打包。两种下载器都在发布引用前核对本次传输 blob、解压后 DiffID 和 tar 结构，并保存原始 blob 与已验证的未压缩 tar，随后构建直接复用。Artifactory 的 CAS-only 路径逐层解码、入库并删除临时解码文件，不组装中间 Docker save tar。两种层表示的磁盘占用会叠加，实际存储量由压缩率决定；保留它们是为了兼顾原始传输摘要和构建速度。显式 `--base-tar`、`--base-map` 的旧式路径仍由 Docker archive reader 读取。独立 `pull`、`save` 和 `cas export` 仍会生成 Docker tar，供 `docker load` 使用；因此仓库中同时存在 CAS 和归档时，磁盘用量还会增加。当前层解码路径支持 gzip 和未压缩 tar，不支持 zstd；遇到 zstd 会明确报错，不能假定安装第三方模块后就会自动接入。
 
-仅识别开头是否像 tar 不足以证明完整性。下载和读取路径共用层结构检查，核对成员负载、padding 及结束位置；CAS 新解码层在入库前检查，已有解码层在使用时再次检查。当前指令缓存版本为 20，路径规则见 [路径处理规则](PATH_POLICY.md)，权限规则见 [镜像权限规则](PERMISSION_POLICY.md)；缓存覆盖根目录元数据、whiteout、硬链接、RUN 层校验和指令应用后的发布规则。显式 tar 的基础层缓存版本为 3，旧条目自动重新构建或验证。CAS schema 仍为 1，无需清库或重新下载正常镜像。`import_registry` 的低层接口仍允许保存压缩传输 blob，不独立保证 DiffID 和解压成功；标准 Registry 与 Artifactory 下载路径负责在发布前完成这两项验证。
+仅识别开头是否像 tar 不足以证明完整性。下载和读取路径共用层结构检查，核对成员负载、padding 及结束位置；CAS 新解码层在入库前检查，已有解码层在使用时再次检查。当前指令缓存版本为 21，路径规则见 [路径处理规则](PATH_POLICY.md)，权限规则见 [镜像权限规则](PERMISSION_POLICY.md)；缓存覆盖根目录元数据、whiteout、硬链接、RUN 层校验和指令应用后的发布规则。显式 tar 的基础层缓存版本为 3，旧条目自动重新构建或验证。CAS schema 仍为 1，无需清库或重新下载正常镜像。`import_registry` 的低层接口仍允许保存压缩传输 blob，不独立保证 DiffID 和解压成功；标准 Registry 与 Artifactory 下载路径负责在发布前完成这两项验证。
 
 已有某个 DiffID 的解码缓存，只能证明该缓存文件的内容，不能证明新下载的压缩 blob 对应同一个 DiffID。远端刷新时仍解码并验证本次下载内容，不以旧缓存命中跳过这一绑定校验。Artifactory 下载接口在引用锁内保存旧 ref，完成验证后发布新 ref；后续打包失败则恢复旧 ref。失败前已经保存的独立 blob 可由 GC 回收，不算成功下载的镜像。
 

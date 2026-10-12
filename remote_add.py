@@ -2,11 +2,12 @@
 
 import hashlib
 import http.client
-from pathlib import Path
+import posixpath
 from urllib.parse import unquote, urlsplit
 from urllib.request import urlopen
 
-from errors import BuildError, UnsupportedInstruction
+from errors import ArchiveError, BuildError, UnsupportedInstruction
+from path_policy import archive_path
 
 
 MAX_BYTES = 4 * 1024 * 1024 * 1024
@@ -22,9 +23,13 @@ def fetch(url, destination, checksum=None, reporter=None):
     parsed = urlsplit(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
         raise UnsupportedInstruction("Remote ADD requires an HTTP(S) URL without embedded credentials")
-    filename = Path(unquote(parsed.path)).name
-    if not filename or filename in (".", ".."):
-        raise BuildError("Remote ADD URL needs a filename in its path")
+    # URL 总是 POSIX 路径；先选末尾组件再解码，不能把编码后的分隔符改成目录跳转。
+    try:
+        filename = unquote(posixpath.basename(parsed.path), errors="strict")
+        if "/" in filename or archive_path(filename, allow_root=False) != filename:
+            raise BuildError("Remote ADD URL needs one safe filename in its path")
+    except (UnicodeError, BuildError, ArchiveError) as exc:
+        raise BuildError("Invalid Remote ADD URL filename") from exc
     digest = hashlib.sha256()
     count = 0
     try:

@@ -33,7 +33,8 @@ def default_store():
 
 def _archive_path(store, reference, platform, source):
     key = hashlib.sha256((source + "\0" + reference + "\0" + platform).encode("utf-8")).hexdigest()
-    return Path(store).resolve() / (key + ".tar")
+    # 数据根可由用户显式指定；内部 tar 节点不能借链接变成库外输入或输出。
+    return output_path(Path(store).resolve() / (key + ".tar"))
 
 
 def _cas_source(store, reference, platform, source):

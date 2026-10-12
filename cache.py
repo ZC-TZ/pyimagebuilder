@@ -28,7 +28,8 @@ from image_reader import digest_hex, sha256_file, verify_layer_tar
 # 版本 17 及更早在层应用前发布缓存，失败指令也可能留下无效链接或权限层。
 # 版本 18 及更早会丢失跨阶段目录的硬链接，并将独立本地源错误地合成硬链接。
 # 版本 20 排除源输入在生成 COPY/ADD 层期间变化后，仍按旧指纹发布的条目。
-CACHE_VERSION = 20
+# 版本 21 排除旧 URL 文件名解析与 RUN rootfs 链接跳转语义生成的结果。
+CACHE_VERSION = 21
 
 
 def cache_key(*values):

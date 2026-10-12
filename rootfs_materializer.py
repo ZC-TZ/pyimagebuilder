@@ -40,6 +40,8 @@ class RootFSMaterializer:
         """在镜像 root 内解析符号链接，包括镜像中的绝对路径链接。"""
         name = clean_path(image_path)
         parts = [] if not name else name.split("/")
+        if image_path.endswith("/") and parts:
+            parts.append("")
         resolved = []
         hops = 0
         while parts:
@@ -65,6 +67,10 @@ class RootFSMaterializer:
                     resolved = []
                 parts = target.split("/") + parts
             else:
+                # 内核先解析当前组件；普通文件或缺失目录不能被后续 ./.. 抵消。
+                # 只有最终缺失叶子可交给调用方创建，尾部斜杠仍要求目录。
+                if parts and not candidate.is_dir():
+                    raise ArchiveError("Rootfs path traverses a missing or non-directory component: " + image_path)
                 resolved.append(part)
         return self.root.joinpath(*resolved)
 
