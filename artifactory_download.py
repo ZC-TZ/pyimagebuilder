@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import base64
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from contextlib import nullcontext
 import gzip
 import hashlib
 import html.parser
@@ -517,8 +518,8 @@ def chain_id(parent_chain_id: Optional[str], diff_id: str) -> str:
 
 def convert_registry_to_docker_archive(raw_root: Path, archive_root: Path,
                                        image_reference: str,
-                                       display: ProgressDisplay) -> None:
-    """把 Registry V2 文件布局重构为 docker save 兼容目录。"""
+                                       display: ProgressDisplay) -> List[Path]:
+    """重构 docker save 兼容目录，返回按 manifest 顺序排列的已验证解码层。"""
     manifest_path = raw_root / "manifest.json"
     if not manifest_path.is_file():
         raise RuntimeError("制品目录缺少 Registry manifest.json")
@@ -590,6 +591,7 @@ def convert_registry_to_docker_archive(raw_root: Path, archive_root: Path,
     top_layer_hex = parse_sha256_digest(parent_chain, "top chain ID") if parent_chain else config_hex
     write_json(archive_root / "repositories", {repository: {tag: top_layer_hex}})
     display.finish_line()
+    return [archive_root / name for name in layer_paths]
 
 
 def pack_files(root: Path, output: Path, display: ProgressDisplay) -> float:
@@ -744,13 +746,32 @@ def download_one(opener, directory_url: str, name: str, root: Path,
         limiter.release()
 
 
+def _check_cas_layer_encoding(descriptor, blob, diff_id):
+    """在发布前确认声明的编码可被 CAS 使用，不能靠 magic 探测掩盖错误声明。"""
+    media_type = descriptor.get("mediaType")
+    if not media_type:
+        return  # 缺省编码沿用 import_registry 的 magic 推断规则。
+    if not isinstance(media_type, str):
+        raise BuildError("Invalid Registry layer media type")
+    if media_type.endswith(".tar"):
+        if descriptor.get("digest") != diff_id:
+            raise BuildError("Uncompressed Artifactory layer digest must equal DiffID")
+    elif media_type.endswith(("+gzip", ".gzip")):
+        with blob.open("rb") as stream:
+            if stream.read(2) != b"\x1f\x8b":
+                raise BuildError("Artifactory gzip layer has invalid compression header")
+    else:
+        raise BuildError("Unsupported CAS layer compression: " + media_type)
+
+
 def download_and_pack(opener, directory_url: str, files: List[str], output: Path,
                       workers: int, image_reference: str, reporter=None,
                       cas_store=None, target_platform="linux/amd64", cas_only=False) -> None:
     """并发下载 Artifactory 制品，并按所选模式导出归档或导入 CAS。
 
-    cas_only=True 时仅校验并保存传输 blob，不生成 tar，也不在此处解压核对 DiffID；
-    首次构建由 CAS open_base 完成解压校验。普通归档路径先转换并验证各层再打包。
+    两种路径都先验证本次下载的传输 blob、解压后 DiffID 和 tar 结构，再发布 CAS ref。
+    cas_only=True 时保存原始 blob 和已验证解码层，不生成 Docker save tar。
+    引用发布及归档打包受同一引用锁保护；失败时恢复旧 ref，孤立 blob 留给 GC 回收。
     """
     if cas_only and cas_store is None:
         raise RuntimeError("CAS-only download requires a CAS store")
@@ -906,27 +927,73 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
         display.log("下载完成：{}，耗时 {}；开始{}…".format(
             format_size(stats.snapshot()), format_duration(download_elapsed),
             "校验并写入 CAS" if cas_only else "转换 Registry V2 格式"))
-        if cas_store is not None:
-            manifest, manifest_raw = read_image_json_file(raw_root / "manifest.json", "Artifactory manifest")
-            config_path = find_blob(raw_root, manifest["config"]["digest"], "config.digest")
-            layer_paths = [find_blob(raw_root, item["digest"], "layer.digest")
-                           for item in manifest["layers"]]
-            cas_store.import_registry(manifest_raw, config_path, layer_paths,
-                                      image_reference, target_platform, replace=True)
-        if cas_only:
-            cas_store.open_base(image_reference, target_platform, "artifactory")
-            return
-        conversion_started = time.monotonic()
-        convert_registry_to_docker_archive(raw_root, archive_root, image_reference, display)
-        conversion_elapsed = time.monotonic() - conversion_started
-        if reporter is not None:
-            reporter.record_timing("Convert Artifactory layers", conversion_elapsed)
-        display.log("格式转换完成，耗时 {}；开始生成 Docker tar…".format(
-            format_duration(conversion_elapsed)
-        ))
-        pack_elapsed = pack_files(archive_root, output, display)
-        if reporter is not None:
-            reporter.record_timing("Pack Artifactory base archive", pack_elapsed)
+        lock = (cas_store.ref_lock(image_reference, target_platform, "artifactory")
+                if cas_store is not None else nullcontext())
+        with lock:
+            previous_ref = (cas_store.snapshot_ref(image_reference, target_platform, "artifactory")
+                            if cas_store is not None else None)
+            try:
+                conversion_started = time.monotonic()
+                if cas_only:
+                    manifest, manifest_raw = read_image_json_file(raw_root / "manifest.json",
+                                                                  "Artifactory manifest")
+                    config_entry, descriptors = manifest.get("config"), manifest.get("layers")
+                    if not isinstance(config_entry, dict) or not isinstance(descriptors, list):
+                        raise RuntimeError("Registry manifest 的 config/layers 格式无效")
+                    config_path = find_blob(raw_root, config_entry.get("digest"), "config.digest")
+                    config = load_json_object(config_path, "镜像 config blob")
+                    rootfs = config.get("rootfs")
+                    diff_ids = rootfs.get("diff_ids") if isinstance(rootfs, dict) else None
+                    if not isinstance(diff_ids, list) or len(diff_ids) != len(descriptors):
+                        raise RuntimeError("config.rootfs.diff_ids 数量与 manifest.layers 不一致")
+                    layer_paths = []
+                    for index, (descriptor, diff_id) in enumerate(zip(descriptors, diff_ids), 1):
+                        if not isinstance(descriptor, dict):
+                            raise RuntimeError("Registry manifest 的 layer descriptor 格式无效")
+                        blob = find_blob(raw_root, descriptor.get("digest"), "layer.digest")
+                        _check_cas_layer_encoding(descriptor, blob, diff_id)
+                        decoded = workspace / "decoded.tar"
+                        # 相同 DiffID 的旧解码层只能证明旧数据有效，不能代替本次 blob 的校验。
+                        # 逐层验证、入库并删除临时层，限制 CAS-only 的临时磁盘占用。
+                        materialize_layer(blob, decoded, str(descriptor.get("mediaType", "")),
+                                          diff_id, index, len(descriptors), display,
+                                          descriptor.get("digest"))
+                        cas_store.store_decoded_layer(decoded, diff_id)
+                        decoded.unlink()
+                        layer_paths.append(blob)
+                else:
+                    decoded_layers = convert_registry_to_docker_archive(
+                        raw_root, archive_root, image_reference, display)
+                    if cas_store is not None:
+                        manifest, manifest_raw = read_image_json_file(raw_root / "manifest.json",
+                                                                      "Artifactory manifest")
+                        config_path = find_blob(raw_root, manifest["config"]["digest"], "config.digest")
+                        layer_paths = [find_blob(raw_root, item["digest"], "layer.digest")
+                                       for item in manifest["layers"]]
+                        config = load_json_object(config_path, "镜像 config blob")
+                        for descriptor, blob, layer, diff_id in zip(
+                                manifest["layers"], layer_paths, decoded_layers, config["rootfs"]["diff_ids"]):
+                            _check_cas_layer_encoding(descriptor, blob, diff_id)
+                            cas_store.store_decoded_layer(layer, diff_id)
+                conversion_elapsed = time.monotonic() - conversion_started
+                if reporter is not None:
+                    reporter.record_timing("Convert Artifactory layers", conversion_elapsed)
+                if cas_store is not None:
+                    cas_store.import_registry(manifest_raw, config_path, layer_paths,
+                                              image_reference, target_platform, replace=True)
+                if cas_only:
+                    # 保留基础镜像入口对 media type 与配置的检查；层内容已在发布前验证。
+                    cas_store.open_base(image_reference, target_platform, "artifactory")
+                    return
+                display.log("格式转换完成，耗时 {}；开始生成 Docker tar…".format(
+                    format_duration(conversion_elapsed)))
+                pack_elapsed = pack_files(archive_root, output, display)
+                if reporter is not None:
+                    reporter.record_timing("Pack Artifactory base archive", pack_elapsed)
+            except Exception:
+                if cas_store is not None:
+                    cas_store.restore_ref(image_reference, target_platform, "artifactory", previous_ref)
+                raise
 
 
 def main(argv=None) -> int:
