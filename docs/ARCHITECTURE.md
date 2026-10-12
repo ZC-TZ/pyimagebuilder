@@ -173,6 +173,8 @@ Docker 归档入口共用 docker_manifest 校验 Config、Layers 与 RepoTags �
 
 cache mount 的宿主目录以目标平台和 mount id 的 SHA-256 命名，位于指定 cache 根目录；Linux `flock` 将同一目录的写入串行化。secret mount 从 CLI 指定的文件只读 bind 到命名空间内指定路径。两者都在 OverlayFS merged rootfs 之后、chroot 之前安装；对应 mount 目标从 upperdir 转 layer 时排除。mount 本身不会写入 image config；secret `RUN` 不查找或写入指令层缓存。父目录可能作为空目录出现在新层，符合路径存在的效果。若 RUN 主动将 secret 内容写到非挂载路径，仍会进入产物；本工具不提供数据防泄漏沙箱。
 
+挂载目标先归一化为单前导斜杠的绝对路径，再检查根目录、`/proc`、`/sys`、`/dev` 及相互重叠；例如 `/cache/..` 与 `//` 都是禁止的根目录目标。未提供的可选 secret 也校验其目标声明。全部声明通过后才创建 cache mount 目录，并拒绝符号链接或 Windows junction；执行器直接调用时也会在创建管道、fork 之前重新校验挂载目标。此预检不能抵御另一个宿主进程在检查后并发替换目录。
+
 ## 离线分析与保守删层
 
 `optimizer.py` 复用 Docker save 读取器和 OCI writer 的校验路径，把每个未压缩层暂存到独立工作区，再用 `RootFSIndex` 计算最终可见路径。逐层报告 tar 字节、普通文件有效负载、在最终 rootfs 中已被覆盖或删除的文件字节；相同 SHA-256 的文件内容分组用于定位重复拷贝。隐藏字节及重复字节可能交叉，不能相加当成节省空间估计。

@@ -11,6 +11,7 @@ from errors import BuildError, UnsupportedInstruction
 from image_identity import checked_identity_id
 from overlay import mount
 from sandbox import install_filter
+from run_mounts import normalize_mount_target
 
 
 CLONE_NEWNS = 0x00020000
@@ -204,6 +205,14 @@ class RunExecutor:
             argv = list(command.value)
         if not argv:
             raise BuildError("Empty RUN command")
+        # execute 也可被直接调用，不能仅依赖 builder 的 Dockerfile 挂载预检。
+        targets = set()
+        validated_mounts = []
+        for kind, source, target in mounts:
+            if kind not in ("cache", "secret"):
+                raise BuildError("Unsupported RUN mount type")
+            validated_mounts.append((kind, source, normalize_mount_target(target, targets)))
+        mounts = validated_mounts
         read_fd, write_fd = os.pipe()
         log_callback = getattr(self, "log", None)
         log_read, log_write = os.pipe() if log_callback is not None else (None, None)

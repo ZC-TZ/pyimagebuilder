@@ -56,6 +56,7 @@ COPY --from 使用源 inode 的最终属主与权限；COPY --from 和 ADD 解�
 | `ADD --unpack=true/false` | 本地 tar 默认展开；远程 tar 默认保留文件。显式标志覆盖默认值。当前 zstd tar 展开会明确报错。 |
 | `ADD --checksum=sha256:...` | 对 HTTP(S) 下载按原始字节验证；有 checksum 时可安全命中层缓存，无 checksum 时每次下载并绕过层缓存。`--offline` 和严格 hermetic 构建拒绝远程 ADD。 |
 | `RUN --network=default/none/host` | 每条 RUN 可覆盖网络；`host` 还要求 CLI `--network=host`。`default` 采用本工具 CLI 的默认网络策略。 |
+| `RUN --mount=type=cache/secret` | cache 仅支持 `sharing=locked`；secret 通过 CLI 提供文件并只读挂载，含 secret 的 RUN 不复用指令层缓存。目标先统一为单前导斜杠绝对路径，拒绝归一化后的根目录、`/proc`、`/sys`、`/dev` 及重叠路径；未提供的可选 secret 仍校验目标声明。所有声明通过后才创建 cache mount 目录；拒绝符号链接与 Windows junction。 |
 | `RUN --security=sandbox/insecure` | `sandbox` 使用 CLI 选择的隔离级别；`insecure` 只在显式 `--run-sandbox=legacy` 时允许。legacy 不等同于 Docker BuildKit 的完整 privileged entitlement。 |
 | `FROM --platform`、平台 ARG | 提供 `TARGETPLATFORM/TARGETOS/TARGETARCH/TARGETVARIANT` 和 `BUILDPLATFORM/BUILDOS/BUILDARCH/BUILDVARIANT`；按 Docker 的作用域规则，stage 内需再次 `ARG` 声明。仅输出 linux/amd64、linux/arm64。 |
 | `ONBUILD` | 写入基础镜像触发器；作为后续构建的 `FROM` 时在该构建的 context 中执行，执行后从子镜像配置中移除。基础配置的 `OnBuild` 缺省、null 或空数组均表示没有触发器，也允许随后新增 ONBUILD。外部触发器必须恰好包含一条指令，允许该指令含 heredoc；拒绝空内容或多条指令。触发器作为 `ONBUILD` 阶段显示，不占用子 Dockerfile 的 `[n/N]` 指令号。禁止嵌套 ONBUILD、FROM、MAINTAINER。 |
