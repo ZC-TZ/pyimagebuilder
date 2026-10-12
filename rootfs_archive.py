@@ -108,7 +108,6 @@ def merge_rootfs(layers, output, reporter=None):
     的内容；选一个可见名字先写成普通文件，其余名字链接到它。
     """
     index = RootFSIndex()
-    root_member = None
     for number, layer in enumerate(layers, 1):
         index.apply_layer(layer)
         if reporter is not None:
@@ -125,7 +124,6 @@ def merge_rootfs(layers, output, reporter=None):
                 if not name:
                     if not member.isdir():
                         raise ArchiveError("Root tar member must be a directory")
-                    root_member = member
                 if member.islnk():
                     _member_name(member.linkname.lstrip("/"), allow_root=False)
                 key = (str(layer), member.name)
@@ -135,8 +133,8 @@ def merge_rootfs(layers, output, reporter=None):
     inodes = {}
     try:
         with tarfile.open(output, "w", format=tarfile.PAX_FORMAT) as target:
-            if root_member is not None:
-                target.addfile(_header(root_member, "."))
+            if index.root_metadata is not None:
+                target.addfile(_header(index.root_metadata, "."))
             for number, name in enumerate(sorted(index.entries), 1):
                 entry = index.entries[name]
                 if entry.layer:

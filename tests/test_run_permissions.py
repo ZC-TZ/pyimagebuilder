@@ -53,6 +53,7 @@ class RunPermissionsTests(unittest.TestCase):
                 stack.enter_context(patch.object(executor, name))
             stack.enter_context(patch.object(executor.os, "geteuid", return_value=1001, create=True))
             stack.enter_context(patch.object(executor.os, "getegid", return_value=1002, create=True))
+            self.command_umask = stack.enter_context(patch.object(executor.os, "umask", return_value=0o077))
             with self.assertRaises(ChildExited):
                 runner.execute(overlay, command, {}, "/", user, ["/bin/sh", "-c"])
         return events
@@ -118,7 +119,14 @@ class RunPermissionsTests(unittest.TestCase):
             (root / "tmp").mkdir()
             with patch.object(Path, "chmod", autospec=True) as chmod:
                 self._execute_child(root)
-            chmod.assert_not_called()
+            self.assertNotIn(unittest.mock.call(root / "tmp", 0o1777), chmod.call_args_list)
+
+    def test_run_uses_runtime_default_umask_in_all_sandbox_modes(self):
+        for sandbox in ("legacy", "hardened", "rootless"):
+            with self.subTest(sandbox=sandbox), tempfile.TemporaryDirectory() as temporary, \
+                    self._accounts(None, None):
+                self._execute_child(Path(temporary), sandbox=sandbox)
+            self.command_umask.assert_called_once_with(0o022)
 
     def test_rootless_mapping_does_not_call_forbidden_setgroups(self):
         with tempfile.TemporaryDirectory() as temporary, self._accounts(None, None):

@@ -8,7 +8,7 @@ import tarfile
 from pathlib import Path
 
 from errors import ArchiveError, BuildError
-from image_identity import checked_layer_id
+from permissions import validate_metadata
 from compat import is_linked_directory
 from rootfs import clean_path, validate_layer_paths
 from path_policy import host_components, host_path_aliases
@@ -106,8 +106,7 @@ class RootFSMaterializer:
 
     def _validate_ownership(self, member):
         """在修改文件前拒绝无效属主，防止 -1 被系统调用当成保持宿主值。"""
-        checked_layer_id(member.uid, "UID")
-        checked_layer_id(member.gid, "GID")
+        validate_metadata(member, materialize=True)
         if self.rootless and (member.uid != 0 or member.gid != 0):
             raise BuildError("Rootless RUN supports only uid/gid 0 in image layers: " + member.name)
 
@@ -121,21 +120,23 @@ class RootFSMaterializer:
                     os.chown(path, os.geteuid(), os.getegid(), follow_symlinks=False)
             else:
                 os.chown(path, member.uid, member.gid, follow_symlinks=False)
-            if not symlink:
-                os.chmod(path, member.mode, follow_symlinks=False)
-            os.utime(path, (member.mtime, member.mtime), follow_symlinks=False)
         except (OSError, NotImplementedError, OverflowError, ValueError) as exc:
-            raise BuildError("Cannot preserve layer metadata for {}: {}".format(path, exc)) from exc
+            raise BuildError("Cannot preserve layer ownership for {}: {}".format(path, exc)) from exc
         for key, value in member.pax_headers.items():
             if key.startswith("SCHILY.xattr."):
                 try:
                     os.setxattr(path, key[len("SCHILY.xattr."):], value.encode("utf-8"),
                                 follow_symlinks=False)
                 except (OSError, UnicodeError, AttributeError) as exc:
-                    # tarfile 可用 surrogate 表示非 UTF-8 的 PAX 值；当前 RUN 路径
-                    # 不支持该编码，必须明确失败，不能漏掉权限属性或泄漏原始 traceback。
                     raise BuildError("Cannot preserve xattr {} for {}: {}".format(
                         key[len("SCHILY.xattr."):], path, exc)) from exc
+        try:
+            # ACL xattr 会修改 mode；chown/xattr 完成后再恢复头中的 setuid/setgid/sticky。
+            if not symlink:
+                os.chmod(path, member.mode, follow_symlinks=False)
+            os.utime(path, (member.mtime, member.mtime), follow_symlinks=False)
+        except (OSError, NotImplementedError, OverflowError, ValueError) as exc:
+            raise BuildError("Cannot preserve layer mode/time for {}: {}".format(path, exc)) from exc
 
     def apply(self, layer_path):
         """应用镜像层并保留元数据，始终检查 rootfs 路径边界。"""

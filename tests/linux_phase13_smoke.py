@@ -2,6 +2,7 @@
 """使用带 shell 的基础镜像测试真实 Linux cache/secret 挂载。"""
 
 import argparse
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -28,7 +29,7 @@ def main():
         context.mkdir()
         dockerfile = context / "Dockerfile"
         dockerfile.write_text(
-            "FROM {}\nARG MODE=ok\n"
+            "FROM {}\nUSER 0:0\nARG MODE=ok\n"
             "RUN --mount=type=cache,target=/build-cache,id=phase13 "
             "--mount=type=secret,id=token "
             "test -s /run/secrets/token && printf '%s' \"$MODE\" > /build-cache/mark\n"
@@ -38,10 +39,14 @@ def main():
         secret = root / "token.txt"
         secret.write_text("phase13-private-marker-123", encoding="utf-8")
         output = root / "out.tar"
-        build(dockerfile, context, args.base_tar, None, "pyimagebuilder/phase13:smoke",
-              output, enable_run=True, workspace_dir=args.workspace,
-              cache_dir=root / "cache", run_sandbox=args.sandbox,
-              secret_sources={"token": secret})
+        old_umask = os.umask(0o077)
+        try:
+            build(dockerfile, context, args.base_tar, None, "pyimagebuilder/phase13:smoke",
+                  output, enable_run=True, workspace_dir=args.workspace,
+                  cache_dir=root / "cache", run_sandbox=args.sandbox,
+                  secret_sources={"token": secret})
+        finally:
+            os.umask(old_umask)
         with tempfile.TemporaryDirectory() as extracted:
             image = ImageArchiveReader(output, Path(extracted)).read(
                 "pyimagebuilder/phase13:smoke")
@@ -50,6 +55,14 @@ def main():
                 index.apply_layer(layer)
             if index.kind("phase13-result") != "file" or index.kind("build-cache/mark"):
                 raise BuildError("Cache mount result leaked into image or RUN failed")
+            if index.entries["phase13-result"].metadata.mode != 0o644:
+                raise BuildError("RUN file permissions inherited host umask instead of 0022")
+        sources = [path for path in (root / "cache/run-mounts").iterdir() if path.is_dir()]
+        if len(sources) != 1:
+            raise BuildError("Expected one cache mount directory")
+        info = sources[0].stat()
+        if (info.st_mode & 0o7777, info.st_uid, info.st_gid) != (0o755, os.geteuid(), os.getegid()):
+            raise BuildError("Cache source permissions inherited host umask or setgid group")
         if secret.read_bytes() in output.read_bytes():
             raise BuildError("Secret bytes leaked into Docker archive")
     print("Phase 13 Linux mount smoke test passed")

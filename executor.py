@@ -83,13 +83,29 @@ def _unshare(flags):
 
 def _device(path, mode, major, minor):
     os.mknod(path, stat.S_IFCHR | mode, os.makedev(major, minor))
+    os.chown(path, 0, 0)
+    os.chmod(path, mode)
+
+
+def _runtime_directory(path, mode=0o755):
+    """只为新挂载目录设置确定的权限，避免宿主 umask 和父目录 setgid 泄漏。"""
+    if path.is_symlink():
+        raise BuildError("RUN setup directory must not be a symlink: " + str(path))
+    if path.exists():
+        if not path.is_dir():
+            raise BuildError("RUN setup path must be a directory: " + str(path))
+        return
+    path.mkdir(mode=mode)
+    # rootless 调用发生在 user namespace 内，此处的 0:0 即映射的宿主身份。
+    os.chown(path, 0, 0)
+    path.chmod(mode)
 
 
 def _prepare_devices(merged, rootless=False):
     devices = merged / "dev"
     if devices.is_symlink():
         raise BuildError("Image /dev must not be a symlink during RUN setup")
-    devices.mkdir(exist_ok=True)
+    _runtime_directory(devices)
     if not devices.is_dir():
         raise BuildError("Image /dev must be a directory")
     mount("tmpfs", devices, "tmpfs", MS_NOSUID, "mode=755")
@@ -105,7 +121,7 @@ def _prepare_devices(merged, rootless=False):
         else:
             _device(devices / name, mode, major, minor)
     pts = devices / "pts"
-    pts.mkdir()
+    _runtime_directory(pts)
     mount("devpts", pts, "devpts", MS_NOSUID | MS_NOEXEC, "newinstance,ptmxmode=0666,mode=0620")
     os.symlink("pts/ptmx", devices / "ptmx")
     os.symlink("/proc/self/fd", devices / "fd")
@@ -247,12 +263,12 @@ class RunExecutor:
                         destination = destination / part
                         if destination.is_symlink():
                             raise BuildError("RUN mount traverses an image symlink")
-                        destination.mkdir(exist_ok=True)
+                        _runtime_directory(destination)
                     destination = destination / parts[-1]
                     if destination.is_symlink():
                         raise BuildError("RUN mount target is an image symlink")
                     if kind == "cache":
-                        destination.mkdir(exist_ok=True)
+                        _runtime_directory(destination)
                     else:
                         if destination.exists() and not destination.is_file():
                             raise BuildError("Secret mount target is not a file")
@@ -263,19 +279,11 @@ class RunExecutor:
                 proc = merged / "proc"
                 if proc.is_symlink():
                     raise BuildError("Image /proc must not be a symlink during RUN setup")
-                proc.mkdir(exist_ok=True)
+                _runtime_directory(proc)
                 temporary = merged / "tmp"
                 if temporary.is_symlink():
                     raise BuildError("Image /tmp must not be a symlink during RUN setup")
-                if not temporary.exists():
-                    temporary.mkdir(mode=0o1777)
-                    # mkdir 的 mode 会被宿主 umask 削减，必须恢复 world-write 和 sticky 位。
-                    # 有特定权限的已有 /tmp 保持镜像配置，不擅自放宽权限。
-                    if self.sandbox != "rootless":
-                        os.chown(temporary, 0, 0)
-                    temporary.chmod(0o1777)
-                elif not temporary.is_dir():
-                    raise BuildError("Image /tmp must be a directory during RUN setup")
+                _runtime_directory(temporary, mode=0o1777)
                 _prepare_devices(merged, self.sandbox == "rootless")
                 runner = os.fork()
                 if runner == 0:
@@ -299,6 +307,8 @@ class RunExecutor:
                             install_filter()
                         env = dict(environment)
                         env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+                        # 仅修改执行命令的子进程；RUN 自己仍可通过 umask 显式覆盖。
+                        os.umask(0o022)
                         os.execvpe(argv[0], argv, env)
                     except BaseException:
                         os.write(write_fd, traceback.format_exc().encode("utf-8", "replace"))

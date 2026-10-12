@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from errors import ArchiveError
 from path_policy import archive_path, container_path
+from permissions import merge_metadata, validate_metadata
 
 
 @dataclass
@@ -16,15 +17,7 @@ class Inode:
 
     def apply_link(self, member):
         """应用链接头的 inode 属性，保留未覆盖的普通扩展属性。"""
-        updated = copy.copy(member)
-        # 链接不重新创建文件，未覆盖的普通 xattr 仍在 inode 上。
-        # 物化时 lchown 会清除旧 capability，因此不能把该属性从旧头恢复回来。
-        attrs = {key: value for key, value in self.metadata.pax_headers.items()
-                 if key.startswith("SCHILY.xattr.") and key != "SCHILY.xattr.security.capability"}
-        updated.pax_headers = dict(member.pax_headers)
-        attrs.update(updated.pax_headers)
-        updated.pax_headers = attrs
-        self.metadata = updated
+        self.metadata = merge_metadata(self.metadata, member, clear_capability=True)
 
 
 @dataclass
@@ -38,7 +31,7 @@ class Entry:
 
     @property
     def metadata(self):
-        """返回文件 inode 的最终元数据，不能用内容成员头替代。"""
+        """返回节点有效元数据；目录更新及硬链接不能只看最后的内容成员头。"""
         return self.inode.metadata if self.inode is not None else None
 
 
@@ -57,6 +50,7 @@ def validate_layer_paths(members):
     declared = {path: member for path, member in members
                 if not posixpath.basename(path).startswith(".wh.")}
     for path, member in members:
+        validate_metadata(member)
         # 链接声明也属于整层预检；无效目标不能在 whiteout 已改变索引后才失败。
         if member.islnk():
             archive_path(member.linkname.lstrip("/"), allow_root=False)
@@ -190,7 +184,8 @@ class RootFSIndex:
                     self._remove(target)
             for path, member in members:
                 if not path:
-                    self.root_metadata = copy.copy(member)
+                    self.root_metadata = (merge_metadata(self.root_metadata, member)
+                                          if self.root_metadata is not None else copy.copy(member))
                     continue
                 if posixpath.basename(path).startswith(".wh."):
                     continue
@@ -199,7 +194,9 @@ class RootFSIndex:
                     old = self.entries.get(path)
                     if old and old.kind != "dir":
                         self._remove(path)
-                    entry = Entry("dir", layer=str(layer_path), member=member.name)
+                    metadata = (merge_metadata(old.metadata, member) if old and old.kind == "dir"
+                                and old.metadata is not None else copy.copy(member))
+                    entry = Entry("dir", layer=str(layer_path), member=member.name, inode=Inode(metadata))
                 else:
                     self._remove(path)
                     if member.isfile():

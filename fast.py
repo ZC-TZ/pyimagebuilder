@@ -12,6 +12,7 @@ import tempfile
 import tarfile
 import time
 import zipfile
+from contextlib import ExitStack
 from pathlib import Path
 
 from builder import build
@@ -277,7 +278,7 @@ def quick_build(artifact, project, version, config_path=None, *,
                                                         dir=artifact.parent)
     except OSError:
         temporary_context = tempfile.TemporaryDirectory(prefix="pyimagebuilder-fast-")
-    with temporary_context as temporary:
+    with temporary_context as temporary, ExitStack() as cleanup:
         prepare_started = time.monotonic()
         if reporter is not None:
             reporter.phase_start("Preparing application package")
@@ -289,11 +290,19 @@ def quick_build(artifact, project, version, config_path=None, *,
             destination = profile["deployDir"] + "/" + project + "f"
         else:
             target_war = context / "app.war"
-            try:
-                os.link(artifact, target_war)
+            linked = False
+            # Windows 删除只读硬链接需要改共享文件属性；改成独立复制以保护原 WAR。
+            readonly_windows = os.name == "nt" and not artifact.stat().st_mode & stat.S_IWRITE
+            if not readonly_windows:
+                try:
+                    os.link(artifact, target_war)
+                    linked = True
+                except OSError:
+                    pass
+            if linked:
                 if reporter is not None:
                     reporter.log("WAR staged with a hard link")
-            except OSError:
+            else:
                 if reporter is None:
                     shutil.copyfile(artifact, target_war)
                 else:
@@ -302,6 +311,11 @@ def quick_build(artifact, project, version, config_path=None, *,
                     with open(artifact, "rb") as source_stream, open(target_war, "xb") as sink:
                         shutil.copyfileobj(CountingReader(source_stream, reporter.progress,
                                                           total, "Copying WAR"), sink, 4 * 1024 * 1024)
+                if os.name == "nt":
+                    # 构建结束或失败时恢复独立副本的删除权限，兼容 Python 3.7 清理。
+                    cleanup.callback(target_war.chmod, stat.S_IREAD | stat.S_IWRITE)
+                # 与硬链接路径保持同一 COPY 输入权限，不能因跨盘回退而改变镜像。
+                shutil.copymode(artifact, target_war)
             source = "app.war"
             destination = profile["deployDir"] + "/" + project + ".war"
         lines = ["FROM " + profile["baseImage"],

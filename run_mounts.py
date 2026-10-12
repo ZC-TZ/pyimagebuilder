@@ -1,6 +1,7 @@
 """在进入 namespace 前验证 RUN 的临时 cache/secret 挂载。"""
 
 import hashlib
+import os
 import re
 from contextlib import contextmanager, ExitStack
 from pathlib import Path
@@ -99,7 +100,16 @@ def prepare(options, secret_sources, cache_root, workspace, stage_platform):
             source = mount_root / source
             if is_linked_directory(source):
                 raise BuildError("Unsafe cache mount directory")
-            source.mkdir(parents=True, exist_ok=True)
+            try:
+                source.mkdir()
+            except FileExistsError:
+                pass
+            else:
+                # bind mount 显示的是来源目录权限；只修正镜像内挂载点并不够。
+                # 单 UID/GID rootless 映射对应宿主当前身份，root 模式则对应 0:0。
+                if hasattr(os, "geteuid"):
+                    os.chown(source, os.geteuid(), os.getegid())
+                source.chmod(0o755)
             if not source.is_dir():
                 raise BuildError("Unsafe cache mount directory")
         prepared.append((kind, source, target))

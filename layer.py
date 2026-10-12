@@ -17,6 +17,7 @@ from image_reader import sha256_file
 from image_identity import checked_identity_id
 from rootfs import clean_path
 from path_policy import container_path, host_components
+from permissions import validate_metadata
 
 
 def _safe_name(name):
@@ -291,6 +292,8 @@ class LayerBuilder:
         info.uid, info.gid = ownership if ownership is not None else (uid, gid)
         info.mode = mode if chmod is None else chmod
         info.mtime = self.source_date_epoch
+        # tarfile 写头会截掉 mode 的高位；必须在编码前验证，不能悄悄修正非法输入。
+        validate_metadata(info)
         return info
 
     def _source_node(self, archive, source, name, added, ownership, chmod, hardlinks):

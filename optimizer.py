@@ -139,6 +139,7 @@ def _signature(index, memo):
         # 只有根权限变化的层也不能删；原先仅比较 entries 会漏掉 chmod/chown /。
         result.append(("", "root-directory", (member.mode, member.uid, member.gid,
                        member.mtime, json.dumps(member.pax_headers, sort_keys=True))))
+    inode_names = {}
     for path, entry in sorted(index.entries.items()):
         if entry.kind == "other":
             raise BuildError("Cannot safely optimize an image with special rootfs entries")
@@ -160,7 +161,15 @@ def _signature(index, memo):
                                   member.gid, member.mtime, member.linkname,
                                   member.devmajor, member.devminor,
                                   json.dumps(member.pax_headers, sort_keys=True), content)
-        result.append((path, entry.kind, memo[identity]))
+        effective = list(memo[identity])
+        if entry.metadata is not None:
+            metadata = entry.metadata
+            effective[2:6] = [metadata.mode, metadata.uid, metadata.gid, metadata.mtime]
+            effective[9] = json.dumps(metadata.pax_headers, sort_keys=True)
+        # 相同内容和权限不等于共享 inode；更换硬链接目标同样会改变后续 chmod/chown 效果。
+        alias = (inode_names.setdefault(id(entry.inode), path)
+                 if entry.kind in ("file", "hardlink") else None)
+        result.append((path, entry.kind, tuple(effective), alias))
     return tuple(result)
 
 

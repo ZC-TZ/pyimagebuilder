@@ -22,7 +22,8 @@ from image_reader import digest_hex, sha256_file, verify_layer_tar
 # 版本 12 及更早的 RUN 可能通过下层符号链接误应用 whiteout 删除。
 # 版本 13 及更早遗漏根目录属性与根 opaque，并可将 RUN 的 .wh.* 实体误作删除。
 # 版本 14 及更早的路径规则允许双前导斜杠或改写反斜杠，不能复用旧结果。
-CACHE_VERSION = 15
+# 版本 15 及更早会丢失目录扩展属性，且 RUN 默认 umask/cache 挂载权限受宿主影响。
+CACHE_VERSION = 16
 
 
 def cache_key(*values):

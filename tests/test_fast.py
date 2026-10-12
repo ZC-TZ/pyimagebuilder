@@ -20,6 +20,7 @@ import main as builder_main
 from errors import BuildError
 from image_reader import ImageArchiveReader
 from rootfs import RootFSIndex
+from progress import make_reporter
 from test_phase1 import make_base
 
 
@@ -71,11 +72,52 @@ class FastBuildTests(unittest.TestCase):
         war.write_bytes(b"WAR fallback")
         linked, _ = fast.quick_build(war, "sfcx", "1.3.4", self.profile,
                                      output=self.root / "linked.tar")
-        with patch.object(fast.os, "link", side_effect=OSError(errno.EXDEV, "different filesystem")):
+        with patch.object(fast.os, "link", side_effect=OSError(errno.EXDEV, "different filesystem")), \
+                patch.object(fast.shutil, "copymode", wraps=fast.shutil.copymode) as copymode:
             output, tag = fast.quick_build(war, "sfcx", "1.3.4", self.profile,
                                            output=self.root / "copied.tar")
+        copymode.assert_called_once()
+        self.assertEqual(copymode.call_args[0][0], war)
         self.inspect(output, tag, "soft/tomcat/webapps/sfcx.war", b"WAR fallback")
         self.assertEqual(linked.read_bytes(), output.read_bytes())
+
+    @unittest.skipUnless(os.name == "nt", "Windows read-only file cleanup")
+    def test_readonly_war_preserves_source_and_cleans_independent_copy(self):
+        self.init()
+        war = self.root / "readonly.war"
+        war.write_bytes(b"readonly WAR")
+        war.chmod(0o444)
+        try:
+            for number, reporter in enumerate((None, make_reporter("plain", quiet=True, stream=io.StringIO()))):
+                with self.subTest(progress=bool(reporter)), \
+                        patch.object(fast.os, "link", wraps=fast.os.link) as link:
+                    output, tag = fast.quick_build(war, "sfcx", "1", self.profile,
+                        output=self.root / ("readonly-{}.tar".format(number)),
+                        cache_dir=self.root / "cache", reporter=reporter)
+                # 输出发布也会 link，只确认原 WAR 未被链接，避免把 source 变为可写。
+                self.assertFalse(any(call[0] and call[0][0] == war for call in link.call_args_list))
+                self.assertEqual(war.stat().st_mode & 0o222, 0)
+                self.assertEqual(war.read_bytes(), b"readonly WAR")
+                self.assertFalse(list(self.root.glob("pyimagebuilder-fast-*")))
+                self.inspect(output, tag, "soft/tomcat/webapps/sfcx.war", b"readonly WAR")
+        finally:
+            war.chmod(0o666)
+
+    @unittest.skipUnless(os.name == "nt", "Windows read-only file cleanup")
+    def test_failed_readonly_war_build_keeps_source_and_cleans_context(self):
+        self.init()
+        war = self.root / "readonly.war"
+        war.write_bytes(b"readonly WAR")
+        war.chmod(0o444)
+        try:
+            with patch.object(fast, "build", side_effect=BuildError("fixture failure")):
+                with self.assertRaisesRegex(BuildError, "fixture failure"):
+                    fast.quick_build(war, "sfcx", "1", self.profile,
+                                     output=self.root / "failure.tar")
+            self.assertEqual(war.stat().st_mode & 0o222, 0)
+            self.assertFalse(list(self.root.glob("pyimagebuilder-fast-*")))
+        finally:
+            war.chmod(0o666)
 
     def test_main_fast_and_standalone_fast_share_the_same_workflow(self):
         init_args = ["init", "--base-tar", str(self.base),

@@ -33,6 +33,7 @@
 | --- | --- |
 | [架构说明](ARCHITECTURE.md) | 模块分工、数据流、执行模型及实现边界 |
 | [路径处理规则](PATH_POLICY.md) | 镜像路径、归档、Windows 文件名、链接与输出边界 |
+| [镜像权限规则](PERMISSION_POLICY.md) | UID/GID、mode、xattr、硬链接、RUN 与缓存的权限契约 |
 | [镜像身份契约](IMAGE_IDENTITY.md) | ImageID、manifest digest、原始 JSON 字节与转存规则 |
 | [开发与维护](../CONTRIBUTING.md) | 测试、目标环境验收与公开仓库提交范围 |
 

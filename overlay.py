@@ -104,7 +104,6 @@ class OverlayManager:
             if hasattr(os, "chown"):
                 os.chown(self.upper, root_metadata.st_uid, root_metadata.st_gid,
                          follow_symlinks=False)
-            self.upper.chmod(stat.S_IMODE(root_metadata.st_mode))
         except (OSError, NotImplementedError) as exc:
             raise BuildError("Cannot preserve overlay root metadata: " + str(exc)) from exc
         if self.upper.stat().st_dev != self.work.stat().st_dev:
@@ -115,6 +114,11 @@ class OverlayManager:
                 os.setxattr(self.upper, key, value, follow_symlinks=False)
         except (OSError, AttributeError) as exc:
             raise BuildError("Cannot preserve overlay root xattrs: " + str(exc)) from exc
+        try:
+            # 与层解包保持同一顺序：ACL 写入可能改变 mode，必须最后恢复权限位。
+            self.upper.chmod(stat.S_IMODE(root_metadata.st_mode))
+        except (OSError, NotImplementedError) as exc:
+            raise BuildError("Cannot preserve overlay root mode: " + str(exc)) from exc
         self._initial_root = _metadata_signature(self.upper.stat(), attrs)
 
     def mount_in_child(self):

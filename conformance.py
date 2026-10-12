@@ -274,6 +274,12 @@ def _layer_tree(layers):
                 xattrs = {key[len("SCHILY.xattr."):]: value
                           for key, value in member.pax_headers.items()
                           if key.startswith("SCHILY.xattr.")}
+                if kind == "dir":
+                    previous = tree.get(name)
+                    if previous and previous.get("type") == "dir":
+                        retained = dict(previous.get("xattrs", {}))
+                        retained.update(xattrs)
+                        xattrs = retained
                 if xattrs:
                     data["xattrs"] = xattrs
                 if kind == "file":
