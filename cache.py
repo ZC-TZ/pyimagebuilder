@@ -24,7 +24,8 @@ from image_reader import digest_hex, sha256_file, verify_layer_tar
 # 版本 14 及更早的路径规则允许双前导斜杠或改写反斜杠，不能复用旧结果。
 # 版本 15 及更早会丢失目录扩展属性，且 RUN 默认 umask/cache 挂载权限受宿主影响。
 # 版本 16 及更早可把另一 xattr namespace 的普通属性误当删除，并遗漏目录 xattr 删除。
-CACHE_VERSION = 17
+# 版本 17 及更早在层应用前发布缓存，失败指令也可能留下无效链接或权限层。
+CACHE_VERSION = 18
 
 
 def cache_key(*values):

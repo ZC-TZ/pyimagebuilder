@@ -41,7 +41,7 @@ COPY/ADD 自动创建的目标目录和中间父目录同样采用 `--chown`、`
 
 COPY --from 使用源 inode 的最终属主与权限；COPY --from 和 ADD 解包保留源 PAX 的 SCHILY.xattr 记录。它们不会让源 PAX 的路径、uid/gid、大小或时间覆盖传输参数及固定 epoch。RUN 物化仅支持可用 UTF-8 表示的 xattr 值，非 UTF-8 或宿主不能设置的属性明确失败，不能静默丢弃。
 
-指令缓存版本为 17，路径规则已统一（见 [路径处理规则](PATH_POLICY.md)）；旧版本根目录属性、根 opaque、RUN 保留名、whiteout 删除、账户路径解析、层文件属主、硬链接、扩展属性、目录元数据或 RUN 身份可能有误，首次使用会自动重新构建相应层。
+指令缓存版本为 18，路径规则已统一（见 [路径处理规则](PATH_POLICY.md)）；旧版本根目录属性、根 opaque、RUN 保留名、whiteout 删除、账户路径解析、层文件属主、硬链接、扩展属性、目录元数据或 RUN 身份可能有误，首次使用会自动重新构建相应层。
 
 目录及根目录更新保留未覆盖的 xattr；物化和 OverlayFS 按 chown/xattr/chmod 顺序恢复属性。RUN 默认 umask=0022，新挂载目录、设备节点及 cache 来源目录显式设置权限。具体规则与验证边界见 [镜像权限规则](PERMISSION_POLICY.md)。
 

@@ -237,10 +237,11 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
             state_key = cache_key("state", state_key, instruction.raw, diff_id)
 
         def resolve_layer(instruction, target, produce, extra=None, independent=False):
-            """按输入和父状态查找指令缓存；未命中时生成层并在校验后发布缓存。
+            """查找或生成层，应用成功后才发布新缓存，返回已接受的层。
 
             返回 (layer_path, diff_id)；未产生文件变化时二者均为 None。
             independent=True 用于 --link：不依赖基础 rootfs，但仍依赖展开后的 COPY/ADD 输入。
+            摘要和 tar 格式正确不代表路径、链接和宿主元数据可用；调用方不能再次应用。
             """
             parent_state = ("linked-layer", target_platform) if independent else state_key
             key = cache_key("instruction", CACHE_VERSION, parent_state, instruction.raw, extra)
@@ -248,6 +249,7 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                 with reporter.timed("Layer cache lookup") if reporter is not None else nullcontext():
                     hit = cache.lookup(key)
                 if hit is not None:
+                    accept_layer(hit.path, hit.diff_id)
                     if reporter is not None:
                         reporter.cache_hit(hit.diff_id or "metadata")
                         if reporter.verbose:
@@ -265,6 +267,9 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                                 else "RUN layer creation" if instruction.op == "RUN"
                                 else "Other layer creation") if reporter is not None else nullcontext():
                 diff_id = produce(target)
+            # 先让实际消费者检查链接、whiteout、权限及 RUN 写盘条件。
+            # 否则失败的指令也会留下可命中的条目，后续构建无法重新执行和恢复。
+            accept_layer(target if diff_id is not None else None, diff_id)
             if reporter is not None and reporter.verbose and diff_id is not None:
                 reporter.log("Layer DiffID: " + diff_id)
             if cache is not None:
@@ -475,7 +480,6 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                 layer_path, diff_id = resolve_layer(
                     instruction, layer_path,
                     lambda target: layer_builder.volume_layer(volume_paths, target))
-                accept_layer(layer_path, diff_id)
                 config.set_volumes(volume_paths)
                 record(instruction, diff_id)
             elif op == "CMD":
@@ -505,7 +509,6 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                 layer_path, diff_id = resolve_layer(
                     instruction, layer_path,
                     lambda target: layer_builder.workdir_layer(workdir, target, user))
-                accept_layer(layer_path, diff_id)
                 config.set_workdir(workdir)
                 record(instruction, diff_id)
             elif op in ("COPY", "ADD"):
@@ -576,6 +579,7 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                         if cache_stats is not None:
                             cache_stats["misses"] += 1
                         diff_id = produce_remote(layer_path)
+                        accept_layer(layer_path, diff_id)
                     else:
                         layer_path, diff_id = resolve_layer(instruction, layer_path, produce_remote,
                                                            fingerprint, independent=transfer.link)
@@ -590,7 +594,6 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                         (lambda target: transfer_builder.transfer_layer(transfer, workdir, target,
                                                                      add=(op == "ADD"))),
                         fingerprint, independent=transfer.link)
-                accept_layer(layer_path, diff_id)
                 record(instruction, diff_id)
             elif op == "RUN":
                 run_command = instruction.value.command
@@ -657,6 +660,7 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                 layer_path = workspace / ("instruction-{}.tar".format(number))
                 if any(item["type"] == "secret" for item in instruction.value.mounts):
                     diff_id = execute_run(layer_path)
+                    accept_layer(layer_path, diff_id)
                     if reporter is not None:
                         reporter.cache_miss()
                     if cache_stats is not None:
@@ -667,7 +671,6 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                         ["network", effective_network, "sandbox", effective_sandbox,
                          "architecture", current_architecture, "emulation", allow_emulated_run,
                          "arguments", stage_args])
-                accept_layer(layer_path, diff_id)
                 record(instruction, diff_id)
             else:
                 # 正常路径已由解析器拒绝未知指令；此处用于检测内部指令分派错误。
