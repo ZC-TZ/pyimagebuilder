@@ -87,8 +87,9 @@ class FailurePathTests(unittest.TestCase):
                     return original_open(path, mode, *args, **kwargs)
 
                 if command == "save":
+                    # save 的排他复制已集中到 image_store；竞争注入仍须命中实际 open。
                     with patch.object(image_cli, "locate_archive", return_value=("local", base)), \
-                            patch.object(image_cli, "open", side_effect=racing_open, create=True):
+                            patch.object(image_store, "open", side_effect=racing_open, create=True):
                         with self.assertRaises(FileExistsError):
                             image_cli.save_archive("example/base:1", output)
                 else:

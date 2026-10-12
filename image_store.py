@@ -17,6 +17,7 @@ from compat import unlink_missing
 from build_args import expand
 from dockerfile_parser import parse
 from path_policy import output_path
+from file_publish import publication_transaction
 from errors import BuildError
 from fast import _require_base_tag
 from image_reader import (MAX_JSON, digest_hex, docker_manifest, outer_name, parse_image_json,
@@ -101,6 +102,29 @@ def _check_archive_platform(path, reference, platform, verify_layers=False, with
     except (OSError, tarfile.TarError, ValueError, KeyError, TypeError, AttributeError) as exc:
         raise BuildError("Cannot inspect pulled image platform: " + str(exc)) from exc
     raise BuildError("Pulled image needs exactly one {} variant for {}".format(platform, reference))
+
+
+def copy_image_archive(archive, output, reference, platform):
+    """复制交付归档，校验成品层及配置身份；失败只清理本次排他创建的副本。
+
+    源配置原始摘要锚定本次复制，不能把字段相同但重编码后的 JSON 当作同一镜像。
+    成品采用流式层校验，无需将大层再次解包到磁盘；旧 tar-only 镜像库也必须通过。
+    """
+    archive, output = Path(archive).resolve(), output_path(output)
+    if output.exists() or output == archive:
+        raise BuildError("Archive copy output must be a new, distinct file")
+    _, expected_config = _check_archive_platform(
+        archive, reference, platform, with_config_digest=True)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with publication_transaction() as published:
+        with open(archive, "rb") as source, open(output, "xb") as target:
+            published.append(output)
+            shutil.copyfileobj(source, target, 4 * 1024 * 1024)
+        _, actual_config = _check_archive_platform(
+            output, reference, platform, verify_layers=True, with_config_digest=True)
+        if actual_config != expected_config:
+            raise BuildError("Archive config bytes changed during copy")
+    return output
 
 
 def _check_cached_archive(cas, path, reference, platform, source):
@@ -441,25 +465,17 @@ def pull_main(argv=None):
             output = output_path(args.output)
             if output == archive:
                 raise BuildError("--output must be a distinct .tar path")
-            output.parent.mkdir(parents=True, exist_ok=True)
-            created = False
-            try:
-                with open(archive, "rb") as source, open(output, "xb") as sink:
-                    created = True
-                    shutil.copyfileobj(source, sink, 4 * 1024 * 1024)
-            except OSError:
-                if created:
-                    unlink_missing(output)
-                raise
+            copy_image_archive(archive, output, args.reference, args.platform)
             reporter.log("Created " + str(output))
         import hashlib
         digest = hashlib.sha256()
-        with open(archive, "rb") as stream:
+        delivered = args.output if args.output is not None else archive
+        with open(delivered, "rb") as stream:
             for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
                 digest.update(block)
         reporter.success(image=args.reference, platform=args.platform,
-                         output=str(args.output.resolve() if args.output is not None else archive),
-                         digest="sha256:" + digest.hexdigest(), size=archive.stat().st_size)
+                         output=str(delivered.resolve()),
+                         digest="sha256:" + digest.hexdigest(), size=delivered.stat().st_size)
         return 0
     except (BuildError, OSError, RuntimeError, ValueError) as exc:
         reporter.fail(exc)

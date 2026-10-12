@@ -19,7 +19,8 @@ from cas_store import CASStore, docker_archive_tag
 from compat import is_linked_directory, remove_suffix, unlink_missing
 from image_reader import (MAX_JSON, ImageArchiveReader, archive_members, docker_manifest,
                           image_history, outer_name, sha256_file)
-from image_store import _archive_path, _check_archive_platform, default_store, locate_archive
+from image_store import (_archive_path, _check_archive_platform, copy_image_archive,
+                         default_store, locate_archive)
 from optimizer import audit_cache, cache_files, prune_cache
 from registry import RegistryClient, push
 from settings import cache_directory, load_settings, repository_settings
@@ -213,21 +214,7 @@ def _load_archive_locked(archive, root, cas, selected, platform, digest, replace
 def save_archive(reference, output, store=None, platform="linux/amd64", source=None):
     """将指定存储镜像导出到新路径；需要时由 CAS 生成 Docker tar。"""
     kind, archive = locate_archive(store, reference, platform, source)
-    output = output_path(output)
-    if output.exists() or output == archive:
-        raise BuildError("Save output must be a new, distinct file")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    created = False
-    try:
-        with open(archive, "rb") as source_stream, open(output, "xb") as target:
-            created = True
-            shutil.copyfileobj(source_stream, target, 4 * 1024 * 1024)
-    except BaseException:
-        # 退出 with 后句柄才关闭，Windows 此时才能删除残片。
-        # 排他创建失败时不能删除别的进程已创建的同名输出。
-        if created:
-            unlink_missing(output)
-        raise
+    output = copy_image_archive(archive, output, reference, platform)
     return {"tag": reference, "platform": platform, "source": kind, "output": str(output)}
 
 
