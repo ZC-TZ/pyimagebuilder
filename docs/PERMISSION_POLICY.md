@@ -60,7 +60,7 @@ Fast 的 dist.zip 当前不按 ZIP 的 Unix 外部权限字段恢复 mode，解�
 
 - 有效层 UID/GID 范围为 0..4294967294；拒绝 chown 哨兵值。mode 只接受 0000..7777 的 Unix 权限位，包含 setuid/setgid/sticky。
 - 在应用 whiteout、改变索引或物化整层前检查权限声明；生产层也在 tar 编码前检查，避免 tarfile 静默截掉非法 mode 高位。
-- 指令缓存版本为 **21**，旧版本的构建结果失效；CAS schema 仍为 1，基础层缓存版本为 3，不要求重下载合法基础镜像 blob。
+- 指令缓存版本为 **22**，旧版本的构建结果失效；CAS schema 仍为 1，基础层缓存版本为 3，不要求重下载合法基础镜像 blob。
 - `tests/test_permission_contract.py` 覆盖目录继承、opaque、重建、COPY、CAS/cache、双格式 flatten、优化与系统调用顺序；其他权限测试覆盖 inode、root、USER、链接和自动目录。
 - `tests/test_overlay_xattrs.py` 覆盖实际挂载 namespace 的标记识别、非活动 namespace 属性保留、非法 whiteout、目录 xattr 删除拒绝，以及构建失败不发布或缓存。
 - `tests/test_layer_acceptance_cache.py` 覆盖无效链接/属主、RUN 写盘失败不发布该指令缓存，以及修复执行条件后重试、有效命中和先前成功指令缓存保留。

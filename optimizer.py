@@ -309,8 +309,8 @@ def optimize_image(path, output, tag=None, source_date_epoch=0):
                 "saved_bytes": original_size - optimized_size}
 
 
-def audit_cache(directory, excluding=()):
-    """验证缓存条目，找出缺失、损坏或无引用的层；excluding 用于模拟条目删除。"""
+def cache_files(directory):
+    """清理前预检全部缓存节点，空条目和排除项也不能通过链接读取库外文件。"""
     root = Path(directory).resolve()
     entries_dir = root / "entries"
     layers_dir = root / "layers"
@@ -318,11 +318,24 @@ def audit_cache(directory, excluding=()):
         raise BuildError("Cache entries/layers directories must not be symlinks")
     if not entries_dir.is_dir() or not layers_dir.is_dir():
         raise BuildError("Expected a pyimagebuilder cache with entries/ and layers/")
+    entries = sorted(entries_dir.glob("*.json"))
+    layers = sorted(layers_dir.glob("*.tar"))
+    for path in entries + layers:
+        if path.is_symlink() or not path.is_file():
+            raise BuildError("Cache entry/layer must be a regular file, not a symlink: " + str(path))
+    return entries, layers
+
+
+def audit_cache(directory, excluding=()):
+    """验证缓存条目，找出缺失、损坏或无引用的层；excluding 用于模拟条目删除。"""
+    root = Path(directory).resolve()
+    entries_dir, layers_dir = root / "entries", root / "layers"
+    entries, layers = cache_files(root)
     referenced = set()
     invalid = []
     valid = 0
     excluded = {Path(path).resolve() for path in excluding}
-    for path in sorted(entries_dir.glob("*.json")):
+    for path in entries:
         if path.resolve() in excluded:
             continue
         reason = None
@@ -351,7 +364,7 @@ def audit_cache(directory, excluding=()):
         if reason:
             invalid.append({"path": str(path), "reason": reason, "bytes": path.stat().st_size})
     orphan = [{"path": str(path), "bytes": path.stat().st_size}
-              for path in sorted(layers_dir.glob("*.tar")) if path.name not in referenced]
+              for path in layers if path.name not in referenced]
     return {"cache_dir": str(root), "valid_entries": valid, "invalid_entries": invalid,
             "orphan_layers": orphan,
             "reclaimable_bytes": sum(item["bytes"] for item in invalid + orphan)}

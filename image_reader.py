@@ -15,6 +15,7 @@ from pathlib import Path
 from errors import ArchiveError, BaseImageNotFound
 from path_policy import archive_path
 from compat import is_linked_directory
+from cache_identity import file_identity, stat_identity
 from platforms import architecture, normalize_platform
 
 
@@ -269,12 +270,11 @@ class ImageArchiveReader:
 
     @staticmethod
     def _identity(path):
-        data = path.stat()
-        return ImageArchiveReader._stat_identity(data)
+        return file_identity(path)
 
     @staticmethod
     def _stat_identity(data):
-        return [data.st_dev, data.st_ino, data.st_size, data.st_mtime_ns, data.st_ctime_ns]
+        return stat_identity(data)
 
     def _check_source_unchanged(self):
         """归档身份取自已打开的文件，后续路径变化不能授权复用旧层。"""
@@ -313,7 +313,7 @@ class ImageArchiveReader:
         try:
             entry = json.loads(metadata.read_text(encoding="utf-8"))
             if (entry.get("version") == BASE_CACHE_VERSION and
-                    entry.get("source") == getattr(self, "_source_identity", self._identity(self.path)) and
+                    entry.get("source") == (getattr(self, "_source_identity", None) or self._identity(self.path)) and
                     entry.get("layer") == self._identity(layer) and
                     entry.get("diff_id") == expected):
                 return layer, (layer, metadata)
@@ -358,7 +358,8 @@ class ImageArchiveReader:
                         os.unlink(pending)
         self._check_source_unchanged()
         entry = {"version": BASE_CACHE_VERSION,
-                 "source": getattr(self, "_source_identity", self._identity(self.path)), "layer": self._identity(layer),
+                 "source": getattr(self, "_source_identity", None) or self._identity(self.path),
+                 "layer": self._identity(layer),
                  "diff_id": expected}
         descriptor, pending = tempfile.mkstemp(prefix="base-entry-", suffix=".part", dir=metadata.parent)
         try:

@@ -20,7 +20,7 @@ from compat import is_linked_directory, remove_suffix, unlink_missing
 from image_reader import (MAX_JSON, ImageArchiveReader, archive_members, docker_manifest,
                           image_history, outer_name, sha256_file)
 from image_store import _archive_path, _check_archive_platform, default_store, locate_archive
-from optimizer import audit_cache, prune_cache
+from optimizer import audit_cache, cache_files, prune_cache
 from registry import RegistryClient, push
 from settings import cache_directory, load_settings, repository_settings
 
@@ -352,13 +352,9 @@ def prune_old_cache(directory, older_than_days, dry_run=False):
     if older_than_days < 0:
         raise BuildError("--older-than must be nonnegative")
     root = Path(directory).resolve()
-    if is_linked_directory(root / "entries") or is_linked_directory(root / "layers"):
-        raise BuildError("Cache entries/layers directories must not be symlinks")
-    if not (root / "entries").is_dir() or not (root / "layers").is_dir():
-        raise BuildError("Expected a pyimagebuilder cache with entries/ and layers/")
+    all_entries, _ = cache_files(root)
     threshold = time.time() - older_than_days * 86400
-    entries = [path for path in sorted((root / "entries").glob("*.json"))
-               if not path.is_symlink() and path.stat().st_mtime < threshold]
+    entries = [path for path in all_entries if path.stat().st_mtime < threshold]
     expired_bytes = sum(path.stat().st_size for path in entries)
     if not dry_run:
         for path in entries:

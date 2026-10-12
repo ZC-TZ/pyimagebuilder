@@ -11,6 +11,7 @@ from pathlib import Path
 
 from errors import ArchiveError, BuildError
 from compat import is_linked_directory
+from cache_identity import file_identity
 from store_lock import file_lock
 from path_policy import cache_entry_key
 from image_reader import digest_hex, sha256_file, verify_layer_tar
@@ -29,7 +30,8 @@ from image_reader import digest_hex, sha256_file, verify_layer_tar
 # 版本 18 及更早会丢失跨阶段目录的硬链接，并将独立本地源错误地合成硬链接。
 # 版本 20 排除源输入在生成 COPY/ADD 层期间变化后，仍按旧指纹发布的条目。
 # 版本 21 排除旧 URL 文件名解析与 RUN rootfs 链接跳转语义生成的结果。
-CACHE_VERSION = 21
+# 版本 22 排除 Windows 旧文件身份误命中后，依据错误基础 rootfs 生成的后续层。
+CACHE_VERSION = 22
 
 
 def cache_key(*values):
@@ -68,7 +70,7 @@ class LayerCache:
     def lookup(self, key):
         """返回有效缓存结果；元数据过期、缺失或内容损坏时返回 None。
 
-        默认模式下，设备号、inode、大小、mtime 和 ctime 全部匹配时可跳过完整哈希。
+        默认模式下，文件身份全部匹配时可跳过完整哈希；Windows 额外检查 ChangeTime。
         文件身份变化或 verify=True 时重新核对 DiffID 与 tar 格式。
         这只适用于可信本地缓存，不能抵御同时修改内容和缓存元数据的攻击者。
         """
@@ -168,5 +170,4 @@ class LayerCache:
     @staticmethod
     def _identity(path):
         """记录文件身份与时间信息，供可信缓存快速检查；这些字段本身不是内容证明。"""
-        data = path.stat()
-        return [data.st_dev, data.st_ino, data.st_size, data.st_mtime_ns, data.st_ctime_ns]
+        return file_identity(path)

@@ -231,6 +231,7 @@ def _pull_image_locked(cas, reference, platform, source, store, refresh, offline
     previous_ref = cas.snapshot_ref(reference, platform, source)
     raw_imported = False
     native_cas_only = False
+    staged = None
     try:
         with tempfile.TemporaryDirectory(prefix="pull-", dir=store) as temporary:
             pending = Path(temporary) / "base.tar"
@@ -281,12 +282,21 @@ def _pull_image_locked(cas, reference, platform, source, store, refresh, offline
             if not raw_imported:
                 cas.import_docker(pending, reference, platform, source, replace=True)
             if materialize_tar:
-                os.replace(pending, archive)
-            else:
-                unlink_missing(archive)
+                # 临时目录清理也可能失败；先保留待发布文件，退出目录后才提交最终 tar。
+                descriptor, staged = tempfile.mkstemp(prefix="pull-publish-", suffix=".part", dir=store)
+                os.close(descriptor)
+                os.replace(pending, staged)
+        if materialize_tar:
+            os.replace(staged, archive)
+            staged = None
+        else:
+            unlink_missing(archive)
     except BaseException:
         cas.restore_ref(reference, platform, source, previous_ref)
         raise
+    finally:
+        if staged is not None:
+            unlink_missing(staged)
     return (archive if materialize_tar else _cas_source(store, reference, platform, source)), True
 
 
