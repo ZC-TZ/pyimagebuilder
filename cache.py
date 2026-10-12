@@ -23,7 +23,8 @@ from image_reader import digest_hex, sha256_file, verify_layer_tar
 # 版本 13 及更早遗漏根目录属性与根 opaque，并可将 RUN 的 .wh.* 实体误作删除。
 # 版本 14 及更早的路径规则允许双前导斜杠或改写反斜杠，不能复用旧结果。
 # 版本 15 及更早会丢失目录扩展属性，且 RUN 默认 umask/cache 挂载权限受宿主影响。
-CACHE_VERSION = 16
+# 版本 16 及更早可把另一 xattr namespace 的普通属性误当删除，并遗漏目录 xattr 删除。
+CACHE_VERSION = 17
 
 
 def cache_key(*values):

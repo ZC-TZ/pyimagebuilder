@@ -77,7 +77,7 @@ class PhaseTenTests(unittest.TestCase):
                 raise PermissionError(errno.EPERM, "denied")
             return b"y"
         with patch.object(overlay.os, "getxattr", side_effect=getxattr, create=True):
-            self.assertEqual(overlay._overlay_value("unused", "opaque"), b"y")
+            self.assertEqual(overlay._overlay_value("unused", "opaque", rootless=True), b"y")
 
     def test_rootless_wsl_uses_default_user(self):
         args = SimpleNamespace(run=True, base_map=None, base_tar=Path("C:/base.tar"),

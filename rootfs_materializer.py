@@ -105,8 +105,12 @@ class RootFSMaterializer:
         return directory
 
     def _validate_ownership(self, member):
-        """在修改文件前拒绝无效属主，防止 -1 被系统调用当成保持宿主值。"""
+        """写盘前检查属主、xattr 编码及 RUN 保留属性，拒绝 chown 哨兵值。"""
         validate_metadata(member, materialize=True)
+        prefix = "SCHILY.xattr." + ("user.overlay." if self.rootless else "trusted.overlay.")
+        if any(key.startswith(prefix) for key in member.pax_headers):
+            # 来自归档的普通属性不能在下次挂载中变成内核 whiteout/opaque/metacopy。
+            raise BuildError("Image layer contains reserved OverlayFS xattr for RUN: " + member.name)
         if self.rootless and (member.uid != 0 or member.gid != 0):
             raise BuildError("Rootless RUN supports only uid/gid 0 in image layers: " + member.name)
 

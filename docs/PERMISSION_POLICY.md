@@ -27,6 +27,8 @@ opaque 只遮蔽下层子内容，不清除目录自身的权限和 xattr。普�
 
 这与 [Moby 层解包实现](https://raw.githubusercontent.com/moby/go-archive/main/archive.go)复用已有目录并设置声明 xattr 的行为相对应。归档转存能保留 tarfile 可无损表示的二进制 xattr；当前 RUN 物化仅支持 UTF-8 xattr，非 UTF-8 值在整层预检时明确失败。ACL、capability 和其他属性是否能落盘，还取决于宿主文件系统及执行权限，不能静默忽略设置错误。
 
+**当前 RUN 不支持删除已有目录或根目录的 xattr。** 目录头中缺少某个属性，不会让 Docker 解包器删除它；空值也不等于删除。仅输出 opaque 会改变子内容可见性，却不能解决属性删除，因此这类 RUN 结果明确失败，不发布镜像或写入指令缓存。普通文件替换后的属性删除，以及目录属性新增或更新仍可处理。
+
 ## 3. RUN 权限准备
 
 物化器与 OverlayFS 根目录恢复均按 **chown → xattr → chmod** 处理，避免 chown 清除 setuid/setgid、或 ACL 写入改变最终 mode。mtime 在物化器最后恢复；符号链接只设置适用的属性。
@@ -42,6 +44,12 @@ RUN 的执行子进程默认 umask 为 **0022**，与 [runc 初始化规则](htt
 
 rootless 仍使用单 UID/GID 映射，只支持镜像 0:0 及受支持的节点类型，不保证任意镜像均可物化。secret 只读 bind mount 保留显式来源文件的权限；工具不会为了让任意 USER 可读而放宽宿主秘密文件。
 
+### OverlayFS 内部属性
+
+按照 [Linux OverlayFS 规则](https://docs.kernel.org/filesystems/overlayfs.html#user-xattr)，root 模式只识别 `trusted.overlay.*`，带 `userxattr` 的 rootless 模式只识别 `user.overlay.*`。另一 namespace 的属性按普通 xattr 保留，不能回退查找并误作 whiteout/opaque，也不能无条件丢弃。
+
+xattr whiteout 必须是零长度普通文件；非空文件或目录带此标记时明确拒绝导出，不能丢弃其内容并生成删除层。基础镜像中若声明本次 RUN 挂载使用的保留 xattr namespace，物化整层前报错，避免普通 PAX 属性被内核当作删除、opaque 或 metacopy 控制信息。纯归档转存仍保留原始 blob；该限制属于 RUN 执行路径。
+
 ## 4. Fast 的 WAR 准备
 
 硬链接与复制回退应提供相同的 WAR 文件 mode。跨盘或不支持硬链接时，复制完成后恢复源 mode。Windows 只读 WAR 使用独立副本，构建成功或失败后仅恢复副本的删除权限，兼容 Python 3.7；不通过 chmod 硬链接改变原 WAR。
@@ -52,8 +60,9 @@ Fast 的 dist.zip 当前不按 ZIP 的 Unix 外部权限字段恢复 mode，解�
 
 - 有效层 UID/GID 范围为 0..4294967294；拒绝 chown 哨兵值。mode 只接受 0000..7777 的 Unix 权限位，包含 setuid/setgid/sticky。
 - 在应用 whiteout、改变索引或物化整层前检查权限声明；生产层也在 tar 编码前检查，避免 tarfile 静默截掉非法 mode 高位。
-- 指令缓存版本为 **16**，旧版本的构建结果失效；CAS schema 仍为 1，基础层缓存版本仍为 2，不要求重下载合法基础镜像 blob。
+- 指令缓存版本为 **17**，旧版本的构建结果失效；CAS schema 仍为 1，基础层缓存版本仍为 2，不要求重下载合法基础镜像 blob。
 - `tests/test_permission_contract.py` 覆盖目录继承、opaque、重建、COPY、CAS/cache、双格式 flatten、优化与系统调用顺序；其他权限测试覆盖 inode、root、USER、链接和自动目录。
+- `tests/test_overlay_xattrs.py` 覆盖实际挂载 namespace 的标记识别、非活动 namespace 属性保留、非法 whiteout、目录 xattr 删除拒绝，以及构建失败不发布或缓存。
 - `tests/linux_phase13_smoke.py` 在真实 Linux 上以宿主 umask=077 验证 RUN 新文件与 cache 来源目录的权限，可通过 `conformance.py linux` 执行。
 
 Windows 上的系统调用模拟不能证明 Linux ACL、capability、user namespace、OverlayFS 或设备节点已通过内核验收。Windows chmod 也不等同于 Unix mode 或 Windows ACL 管理。真实 Linux/WSL 及 Docker 对照须在目标环境运行；输入、缓存和私有工作目录应由构建用户控制并保持稳定。

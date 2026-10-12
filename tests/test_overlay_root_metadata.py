@@ -159,7 +159,7 @@ class OverlayRootMetadataTests(unittest.TestCase):
             root = Path(temporary)
             manager = self._manager(root)
             target = root / "run.tar"
-            with patch("overlay._overlay_value", side_effect=lambda path, key:
+            with patch("overlay._overlay_value", side_effect=lambda path, key, rootless=False:
                        b"y" if path == manager.upper and key == "opaque" else None), \
                  patch.object(overlay.os, "listxattr", return_value=[], create=True):
                 manager.to_layer(target)

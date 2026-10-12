@@ -42,11 +42,13 @@ def _xattr(path, name):
         raise
 
 
-def _overlay_value(path, suffix):
-    first = _xattr(path, "trusted.overlay." + suffix)
-    if first is not None:
-        return first
-    return _xattr(path, "user.overlay." + suffix)
+def _overlay_prefix(rootless):
+    return "user.overlay." if rootless else "trusted.overlay."
+
+
+def _overlay_value(path, suffix, rootless=False):
+    """只读取当前挂载使用的内部命名空间，不能跨 namespace 猜测删除标记。"""
+    return _xattr(path, _overlay_prefix(rootless) + suffix)
 
 
 def _tarinfo(name, data, epoch=0):
@@ -57,15 +59,15 @@ def _tarinfo(name, data, epoch=0):
     return info
 
 
-def _file_xattrs(path):
-    """读取可导出的真实扩展属性，排除 OverlayFS 的内部状态。"""
+def _file_xattrs(path, rootless=False):
+    """排除当前挂载的内部属性，另一 namespace 的普通属性仍应导出。"""
     if not hasattr(os, "listxattr"):
         # Windows 文件树测试没有该 API；真实 RUN 由 Linux 入口限定。
         return {}
     try:
         return {key: os.getxattr(path, key, follow_symlinks=False)
                 for key in os.listxattr(path, follow_symlinks=False)
-                if not key.startswith(("trusted.overlay.", "user.overlay."))}
+                if not key.startswith(_overlay_prefix(rootless))}
     except OSError as exc:
         raise BuildError("Cannot read RUN xattrs for {}: {}".format(path, exc)) from exc
 
@@ -108,7 +110,7 @@ class OverlayManager:
             raise BuildError("Cannot preserve overlay root metadata: " + str(exc)) from exc
         if self.upper.stat().st_dev != self.work.stat().st_dev:
             raise BuildError("Overlay upperdir and workdir must share a filesystem")
-        attrs = _file_xattrs(self.rootfs)
+        attrs = _file_xattrs(self.rootfs, self.rootless)
         try:
             for key, value in attrs.items():
                 os.setxattr(self.upper, key, value, follow_symlinks=False)
@@ -133,6 +135,26 @@ class OverlayManager:
 
     def to_layer(self, target):
         """把内核 whiteout 和 opaque 目录转换为 OCI 层；拒绝无法保留的元数据。"""
+        def check_directory_attrs(name, before, after):
+            removed = sorted(set(before) - set(after))
+            if removed:
+                # Docker 解包会保留目录头未声明的 xattr；缺失字段不能表达属性删除。
+                # 不能用空值冒充删除，也不能只加 opaque 而丢掉下层子文件。
+                raise UnsupportedInstruction("RUN directory xattr removal cannot be preserved at /{}: {}".format(
+                    name, ", ".join(removed)))
+
+        def lower_directory(name):
+            """只定位同名下层目录；符号链接的属性不能当作另一目录的旧属性。"""
+            path = self.rootfs
+            for part in name.split("/"):
+                path = path / part
+                if path.is_symlink() or not path.is_dir():
+                    return None
+            return path
+
+        root_data = self.upper.stat()
+        root_attrs = _file_xattrs(self.upper, self.rootless)
+        check_directory_attrs("", self._initial_root[3], root_attrs)
         hardlinks = {}
         with tarfile.open(target, "w", format=tarfile.PAX_FORMAT) as archive:
             def info_with_attributes(name, data, attrs):
@@ -149,15 +171,14 @@ class OverlayManager:
                 return info
 
             # 遍历子项不会看到 upper 根自身；其权限变化和 opaque 标记必须单独输出。
-            root_data = self.upper.stat()
-            root_attrs = _file_xattrs(self.upper)
-            if _overlay_value(self.upper, "metacopy") or _overlay_value(self.upper, "redirect"):
+            if _overlay_value(self.upper, "metacopy", self.rootless) or _overlay_value(
+                    self.upper, "redirect", self.rootless):
                 raise UnsupportedInstruction("Overlay root metacopy/redirect cannot be serialized safely")
             if _metadata_signature(root_data, root_attrs) != self._initial_root:
                 info = info_with_attributes(".", root_data, root_attrs)
                 info.type = tarfile.DIRTYPE
                 archive.addfile(info)
-            if _overlay_value(self.upper, "opaque") == b"y":
+            if _overlay_value(self.upper, "opaque", self.rootless) == b"y":
                 _add_whiteout(archive, ".wh..wh..opq", self.source_date_epoch)
 
             def visit(directory, prefix=""):
@@ -171,25 +192,34 @@ class OverlayManager:
                     if entry.name.startswith(".wh."):
                         raise UnsupportedInstruction("Reserved OCI whiteout path produced by RUN: " + name)
                     data = path.lstat()
-                    if _overlay_value(path, "metacopy") or _overlay_value(path, "redirect"):
+                    if _overlay_value(path, "metacopy", self.rootless) or _overlay_value(
+                            path, "redirect", self.rootless):
                         raise UnsupportedInstruction("Overlay metacopy/redirect cannot be serialized safely: " + name)
                     is_whiteout = (stat.S_ISCHR(data.st_mode) and
                                    os.major(data.st_rdev) == 0 and os.minor(data.st_rdev) == 0)
-                    is_whiteout = is_whiteout or _overlay_value(path, "whiteout") is not None
+                    marker = _overlay_value(path, "whiteout", self.rootless)
+                    if marker is not None and not is_whiteout:
+                        if not stat.S_ISREG(data.st_mode) or data.st_size != 0:
+                            raise UnsupportedInstruction("Invalid OverlayFS xattr whiteout: " + name)
+                        is_whiteout = True
                     # OverlayFS 用设备节点或扩展属性表示删除，
                     # OCI 层则用空的 .wh.<name> 文件表达同一语义。
                     if is_whiteout:
                         _add_whiteout(archive, prefix + ".wh." + entry.name,
                                       self.source_date_epoch)
                         continue
-                    info = info_with_attributes(name, data, _file_xattrs(path))
+                    attrs = _file_xattrs(path, self.rootless)
+                    info = info_with_attributes(name, data, attrs)
                     if stat.S_ISDIR(data.st_mode):
+                        lower = lower_directory(name)
+                        if lower is not None:
+                            check_directory_attrs(name, _file_xattrs(lower, self.rootless), attrs)
                         info.name += "/"
                         info.type = tarfile.DIRTYPE
                         archive.addfile(info)
                         # opaque 目录遮蔽所有下层子项，
                         # 包括本次 upperdir 遍历中没有出现的名字。
-                        if _overlay_value(path, "opaque") == b"y":
+                        if _overlay_value(path, "opaque", self.rootless) == b"y":
                             _add_whiteout(archive, name + "/.wh..wh..opq",
                                           self.source_date_epoch)
                         visit(path, name + "/")

@@ -49,7 +49,7 @@ RUN echo hello
             directory.mkdir()
             (directory / "new.txt").write_bytes(b"new")
 
-            def fake_xattr(path, suffix):
+            def fake_xattr(path, suffix, rootless=False):
                 if Path(path).name == "deleted" and suffix == "whiteout":
                     return b""
                 if Path(path).name == "opaque" and suffix == "opaque":
