@@ -133,6 +133,11 @@ def _hash_stream(stream):
 
 def _signature(index, memo):
     result = []
+    if index.root_metadata is not None:
+        member = index.root_metadata
+        # 只有根权限变化的层也不能删；原先仅比较 entries 会漏掉 chmod/chown /。
+        result.append(("", "root-directory", (member.mode, member.uid, member.gid,
+                       member.mtime, json.dumps(member.pax_headers, sort_keys=True))))
     for path, entry in sorted(index.entries.items()):
         if entry.kind == "other":
             raise BuildError("Cannot safely optimize an image with special rootfs entries")

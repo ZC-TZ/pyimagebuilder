@@ -19,7 +19,8 @@ from image_reader import digest_hex, sha256_file, verify_layer_tar
 # 版本 10 及更早的跨阶段 COPY 忽略硬链接共享权限，并遗漏源 PAX xattr。
 # 版本 11 及更早可能根据无效 passwd 链接或带哨兵 UID/GID 的基础层生成错误结果。
 # 版本 12 及更早的 RUN 可能通过下层符号链接误应用 whiteout 删除。
-CACHE_VERSION = 13
+# 版本 13 及更早遗漏根目录属性与根 opaque，并可将 RUN 的 .wh.* 实体误作删除。
+CACHE_VERSION = 14
 
 
 def cache_key(*values):

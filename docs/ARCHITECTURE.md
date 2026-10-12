@@ -60,7 +60,7 @@ CAS blobs/ref ────────────► CASStore.open_base ──�
 
 CAS resolve 与 GC 共用引用内容校验。GC 会核对保留 ref 的身份和 manifest/config 摘要，以及层列表、大小、media type、平台和 DiffID 的一致性，避免 ref 遗漏层时把有效内容误判为孤儿；所有保留引用通过检查后才删除 blob。GC 只检查层存在性和大小，完整传输层 SHA-256 仍由 resolve 默认执行，避免清理时重复扫描全部大层。
 
-`RootFSIndex` 在内存中还原**逻辑可见文件树**，不把不可信的 tar 成员直接释放到宿主文件系统。应用前检查整层声明的祖先类型，拒绝普通成员的同层非目录父路径与子路径冲突；同时预检所有 whiteout 的空普通文件形态、目标和保留名称，避免先删除再报错。删除只针对下层，不用本层替换后的父路径类型判断删除标记；允许删掉下层目录内容后把目录替换成文件。物化时删除路径不穿过下层符号链接，避免虚拟索引保留、实际文件却被误删。物化器复用预检，独立 conformance 读取器另行实现同等检查。它用于判断目标路径是否已经是目录，按层验证 whiteout，并从可见的 `/etc/passwd`、`/etc/group` 解析 `--chown` 名称。已有 base layer 的原始 tar 字节不变；每条 `COPY`、`ADD` 或创建目录的 `WORKDIR` 新增一个 layer。
+`RootFSIndex` 在内存中还原**逻辑可见文件树**，不把不可信的 tar 成员直接释放到宿主文件系统。应用前检查整层声明的祖先类型，拒绝普通成员的同层非目录父路径与子路径冲突；同时预检所有 whiteout 的空普通文件形态、目标和保留名称，避免先删除再报错。删除只针对下层，不用本层替换后的父路径类型判断删除标记；允许删掉下层目录内容后把目录替换成文件。物化时删除路径不穿过下层符号链接，避免虚拟索引保留、实际文件却被误删。物化器复用预检，独立 conformance 读取器另行实现同等检查。它用于判断目标路径是否已经是目录，按层验证 whiteout，并从可见的 `/etc/passwd`、`/etc/group` 解析 `--chown` 名称。根目录 `.`/`./` 的目录头单独保存在 `root_metadata`，不混入子路径索引；同层重复根头或非目录根头在写入前拒绝。物化时最后应用根元数据，rootless 同样预检其 UID/GID；保守优化的文件树签名包含根属性，不能删掉只改变根权限的层。已有 base layer 的原始 tar 字节不变；每条 `COPY`、`ADD` 或创建目录的 `WORKDIR` 新增一个 layer。
 
 WORKDIR 按当前 USER 创建缺失目录，保留已有父目录的属主。具名用户省略组时使用镜像 passwd 的主组，数字 UID 省略组时使用同值 GID；同一解析规则用于 --chown，不读取宿主账户。执行 RUN 前，RootFSMaterializer 按依赖顺序创建硬链接链，目标为本层尚未创建的链接时不能复用下层同名文件；循环依赖明确失败。硬链接目标的前导 `/` 解释为镜像根，相对路径仍拒绝 `..`，不会映射到宿主根目录。
 
@@ -87,7 +87,7 @@ WORKDIR 按当前 USER 创建缺失目录，保留已有父目录的属主。具
 
 `cache.py` 为 `COPY/ADD/WORKDIR/VOLUME/RUN` 保存指令级缓存。基础状态由 `FROM` 引用、基础 image config、base diff IDs 得出。每条指令将自身原文及结果 diff ID 加入连续状态键，因此前面的配置变化、文件内容变化或层结果变化会使后续缓存失效。`COPY/ADD` 额外遍历展开后的来源，哈希文件内容及路径、类型、权限、所有权、修改时间、链接关系；`RUN` 额外计入网络模式。源文件被同时修改时，构建目录应由调用方保持稳定。
 
-条目放在 `entries/<key>.json`，实际未压缩层放在 `layers/<diffid>.tar`。当前指令缓存版本为 13，旧条目不能复用：版本 12 及更早的 RUN 物化可能通过下层符号链接误应用 whiteout 删除；版本 11 及更早可能根据无效账户文件链接或带 chown 哨兵值的层属主生成错误权限；版本 10 及更早的跨阶段 COPY 未读取硬链接 inode 的最终权限，COPY/ADD 还会遗漏源 PAX 扩展属性；版本 9 及更早的 RUN 可能使用宿主组、错误附加组或受 umask 影响的目录权限；版本 8 及更早的 COPY/ADD 可能遗漏新目录的属主与权限；版本 7 及更早的校验只识别首个 tar 头，可能信任负载截断的层。默认命中检查版本、键、大小与文件身份；身份变化或指定 --verify-cache 时重新核对 SHA-256、成员负载及结束位置。新层先核对结构，新副本关闭、刷新后在发布前重新校验摘要，再原子替换层与条目；失败不能把错误副本记为可信，既有条目保留。条目大小来自实际目标层。空层也能命中。`RUN` 命中后跳过 rootfs 物化、OverlayFS 与命令执行；未命中才进入 Phase 2 执行路径。基础镜像每次仍需读取与校验，最终归档每次仍要重新生成，因此缓存不保证固定倍数的加速。若外部网络资源改变，`RUN` 缓存无法自动感知，需 `--no-cache` 或修改相应构建输入。
+条目放在 `entries/<key>.json`，实际未压缩层放在 `layers/<diffid>.tar`。当前指令缓存版本为 14，旧条目不能复用：版本 13 及更早遗漏根目录元数据和根 opaque，且可能把 RUN 创建的 .wh.* 实体当成删除标记；版本 12 及更早的 RUN 物化可能通过下层符号链接误应用 whiteout 删除；版本 11 及更早可能根据无效账户文件链接或带 chown 哨兵值的层属主生成错误权限；版本 10 及更早的跨阶段 COPY 未读取硬链接 inode 的最终权限，COPY/ADD 还会遗漏源 PAX 扩展属性；版本 9 及更早的 RUN 可能使用宿主组、错误附加组或受 umask 影响的目录权限；版本 8 及更早的 COPY/ADD 可能遗漏新目录的属主与权限；版本 7 及更早的校验只识别首个 tar 头，可能信任负载截断的层。默认命中检查版本、键、大小与文件身份；身份变化或指定 --verify-cache 时重新核对 SHA-256、成员负载及结束位置。新层先核对结构，新副本关闭、刷新后在发布前重新校验摘要，再原子替换层与条目；失败不能把错误副本记为可信，既有条目保留。条目大小来自实际目标层。空层也能命中。`RUN` 命中后跳过 rootfs 物化、OverlayFS 与命令执行；未命中才进入 Phase 2 执行路径。基础镜像每次仍需读取与校验，最终归档每次仍要重新生成，因此缓存不保证固定倍数的加速。若外部网络资源改变，`RUN` 缓存无法自动感知，需 `--no-cache` 或修改相应构建输入。
 
 显式 tar 的可信基础层缓存由 ImageArchiveReader 单独管理。跨文件系统发布时，临时副本必须核对预期 DiffID 才能移动到共享层路径；失败清理副本，保留 workspace 文件。基础层条目现在包含 version=2，旧无版本及 version=1 条目首次使用会重新提取、验证结构并写入新记录。旧条目可能对应首个 tar 头可读、实际负载已截断的层，不能继续信任。正常新版本命中的快速检查保留；无需手动清理缓存。CAS ref schema 仍为 1，读取层时另外执行结构检查。
 
@@ -213,7 +213,7 @@ repositories
 1. 在 Linux 上，从已校验的 base layers 和 Phase 1 新层安全还原真实 rootfs，依次应用 OCI whiteout，保留 uid/gid、mode、mtime、链接和可表示的 xattr。拒绝越界路径。Windows 原生模式不物化 Linux rootfs。
 2. 为每条 `RUN` fork 子进程，在子进程中 unshare mount/PID namespace，默认也 unshare network namespace；把 mount 传播设为 private 后，挂载只读 lower rootfs、同文件系统上的 `upperdir/workdir` 与 `merged`。OverlayFS 不可用时失败。父构建进程不进入这些 namespace。
 3. 在命名空间内挂载最小 `/proc`、tmpfs `/dev`、`/dev/pts`，chroot 到 merged，然后按 Dockerfile 当前 `ENV`、`WORKDIR`、`USER`、`SHELL` 执行命令。PID namespace 在 unshare 后 fork；等待并传播退出码，非零即失败。子进程退出时命名空间内的挂载消失。`/sys`、DNS 注入和 cgroup 资源限制尚未实现；seccomp 收紧由前述 hardened/rootless 沙箱负责。
-4. 把 upperdir 的内容**转换**为 OCI/Docker layer：OverlayFS 的 0/0 字符设备或 `overlay.whiteout` xattr → 空 `.wh.<name>` 文件；`overlay.opaque=y` → `.wh..wh..opq`。保留基本元数据、符号链接和硬链接；遇到无法可靠表示的 metacopy、redirect 或非 UTF-8 xattr 会失败，不能直接 tar upperdir。完成后更新可见 rootfs 和 config；下一个 `RUN` 在上一个结果上执行。
+4. 把 upperdir 的内容**转换**为 OCI/Docker layer：OverlayFS 的 0/0 字符设备或 `overlay.whiteout` xattr → 空 `.wh.<name>` 文件；`overlay.opaque=y` → `.wh..wh..opq`。upper 根初始化时复制 lower 根的权限、属主和普通 xattr；RUN 修改根的权限、属主或 xattr 时输出 `.` 目录头，根 opaque 单独输出顶层 `.wh..wh..opq`。mtime 仍按固定 epoch 规范化。保留基本元数据、符号链接和硬链接；RUN 产生的 `.wh.*` 实体及无法可靠表示的 metacopy、redirect 或非 UTF-8 xattr 会失败，不能直接 tar upperdir。完成后更新可见 rootfs 和 config；下一个 `RUN` 在上一个结果上执行。
 5. `USER` 和 `SHELL` 已先于执行器加入状态模型。`hardened` 模式需要 Linux root；`rootless` 模式需满足前述单 UID/GID 和内核约束。仍需 Linux/WSL 真机集成验证及更多 OverlayFS 组合测试。
 
 Windows 上的可选 WSL 入口只负责**切换执行地点**：使用 `wsl.exe` 执行本项目 `main.py`，把 Windows 驱动器路径映射到 WSL，工作区放在 Linux `/tmp`。WSL 发行版、Python 3、文件可见性、架构与必要内核权限仍需要在目标机验证。没有可用 WSL 时，含 `RUN` 的构建明确失败；无 `RUN` 的构建不需要 WSL。

@@ -56,6 +56,24 @@ def _tarinfo(name, data, epoch=0):
     return info
 
 
+def _file_xattrs(path):
+    """读取可导出的真实扩展属性，排除 OverlayFS 的内部状态。"""
+    if not hasattr(os, "listxattr"):
+        # Windows 文件树测试没有该 API；真实 RUN 由 Linux 入口限定。
+        return {}
+    try:
+        return {key: os.getxattr(path, key, follow_symlinks=False)
+                for key in os.listxattr(path, follow_symlinks=False)
+                if not key.startswith(("trusted.overlay.", "user.overlay."))}
+    except OSError as exc:
+        raise BuildError("Cannot read RUN xattrs for {}: {}".format(path, exc)) from exc
+
+
+def _metadata_signature(data, attrs):
+    # mtime 统一采用 source_date_epoch，不作为额外生成根目录头的原因。
+    return stat.S_IMODE(data.st_mode), data.st_uid, data.st_gid, attrs
+
+
 def _add_whiteout(archive, name, epoch=0):
     info = tarfile.TarInfo(name)
     info.mode = 0o000
@@ -90,6 +108,13 @@ class OverlayManager:
             raise BuildError("Cannot preserve overlay root metadata: " + str(exc)) from exc
         if self.upper.stat().st_dev != self.work.stat().st_dev:
             raise BuildError("Overlay upperdir and workdir must share a filesystem")
+        attrs = _file_xattrs(self.rootfs)
+        try:
+            for key, value in attrs.items():
+                os.setxattr(self.upper, key, value, follow_symlinks=False)
+        except (OSError, AttributeError) as exc:
+            raise BuildError("Cannot preserve overlay root xattrs: " + str(exc)) from exc
+        self._initial_root = _metadata_signature(self.upper.stat(), attrs)
 
     def mount_in_child(self):
         """在子进程私有 mount namespace 中挂载 merged rootfs。"""
@@ -103,12 +128,41 @@ class OverlayManager:
         """把内核 whiteout 和 opaque 目录转换为 OCI 层；拒绝无法保留的元数据。"""
         hardlinks = {}
         with tarfile.open(target, "w", format=tarfile.PAX_FORMAT) as archive:
+            def info_with_attributes(name, data, attrs):
+                info = _tarinfo(name, data, self.source_date_epoch)
+                if self.rootless:
+                    if data.st_uid != os.geteuid() or data.st_gid != os.getegid():
+                        raise BuildError("Rootless RUN produced an unmapped file owner: " + (name or "."))
+                    info.uid = info.gid = 0
+                for key, value in attrs.items():
+                    try:
+                        info.pax_headers["SCHILY.xattr." + key] = value.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise UnsupportedInstruction("Non-UTF8 xattr cannot be serialized: " + name) from exc
+                return info
+
+            # 遍历子项不会看到 upper 根自身；其权限变化和 opaque 标记必须单独输出。
+            root_data = self.upper.stat()
+            root_attrs = _file_xattrs(self.upper)
+            if _overlay_value(self.upper, "metacopy") or _overlay_value(self.upper, "redirect"):
+                raise UnsupportedInstruction("Overlay root metacopy/redirect cannot be serialized safely")
+            if _metadata_signature(root_data, root_attrs) != self._initial_root:
+                info = info_with_attributes(".", root_data, root_attrs)
+                info.type = tarfile.DIRTYPE
+                archive.addfile(info)
+            if _overlay_value(self.upper, "opaque") == b"y":
+                _add_whiteout(archive, ".wh..wh..opq", self.source_date_epoch)
+
             def visit(directory, prefix=""):
                 for entry in sorted(os.scandir(directory), key=lambda item: item.name):
                     path = Path(entry.path)
                     name = prefix + entry.name
                     if name in self.excluded_paths:
                         continue
+                    # 实体 .wh.* 在 OCI 中无法表示：空文件会被误作删除，不是普通文件。
+                    # 真正的内核 whiteout 在下面按设备号/xattr 转成专用标记。
+                    if entry.name.startswith(".wh."):
+                        raise UnsupportedInstruction("Reserved OCI whiteout path produced by RUN: " + name)
                     data = path.lstat()
                     if _overlay_value(path, "metacopy") or _overlay_value(path, "redirect"):
                         raise UnsupportedInstruction("Overlay metacopy/redirect cannot be serialized safely: " + name)
@@ -121,19 +175,7 @@ class OverlayManager:
                         _add_whiteout(archive, prefix + ".wh." + entry.name,
                                       self.source_date_epoch)
                         continue
-                    info = _tarinfo(name, data, self.source_date_epoch)
-                    if self.rootless:
-                        if data.st_uid != os.geteuid() or data.st_gid != os.getegid():
-                            raise BuildError("Rootless RUN produced an unmapped file owner: " + name)
-                        info.uid = info.gid = 0
-                    for key in os.listxattr(path, follow_symlinks=False):
-                        if key.startswith(("trusted.overlay.", "user.overlay.")):
-                            continue
-                        value = os.getxattr(path, key, follow_symlinks=False)
-                        try:
-                            info.pax_headers["SCHILY.xattr." + key] = value.decode("utf-8")
-                        except UnicodeDecodeError as exc:
-                            raise UnsupportedInstruction("Non-UTF8 xattr cannot be serialized: " + name) from exc
+                    info = info_with_attributes(name, data, _file_xattrs(path))
                     if stat.S_ISDIR(data.st_mode):
                         info.name += "/"
                         info.type = tarfile.DIRTYPE

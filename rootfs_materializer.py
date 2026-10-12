@@ -135,7 +135,6 @@ class RootFSMaterializer:
         """应用镜像层并保留元数据，始终检查 rootfs 路径边界。"""
         with tarfile.open(layer_path, "r:") as archive:
             members = [(clean_path(member.name), member) for member in archive]
-            members = [(name, member) for name, member in members if name]
             seen = set()
             for name, _ in members:
                 if name in seen:

@@ -213,8 +213,8 @@ def _layer_tree(layers):
             seen = set()
             for member in archive:
                 name = _path(member.name)
-                if not name:
-                    continue
+                if not name and not member.isdir():
+                    raise ArchiveError("Root tar member must be a directory")
                 if name in seen:
                     raise ArchiveError("Duplicate path within layer: " + name)
                 seen.add(name)
@@ -244,7 +244,7 @@ def _layer_tree(layers):
                     continue
                 if base == ".wh..wh..opq":
                     for key in list(tree):
-                        if not parent or key.startswith(parent + "/"):
+                        if (not parent and key) or (parent and key.startswith(parent + "/")):
                             del tree[key]
                 else:
                     _drop(tree, posixpath.join(parent, base[4:]))
@@ -379,12 +379,16 @@ def _normalize_tree(tree):
             normalized[path] = {"type": "dir", "mode": 0o755, "uid": 0, "gid": 0}
         elif data.get("type") == "dir":
             normalized[path] = {key: data[key] for key in ("type", "mode", "uid", "gid")}
+            if "xattrs" in data:
+                normalized[path]["xattrs"] = data["xattrs"]
         elif data.get("type") == "symlink":
             normalized[path] = {key: data[key] for key in ("type", "target", "uid", "gid")}
             if "xattrs" in data:
                 normalized[path]["xattrs"] = data["xattrs"]
         else:
             normalized[path] = data
+    # 未显式声明根目录时使用镜像默认值，使有/无默认根头的归档可做语义对照。
+    normalized.setdefault("", {"type": "dir", "mode": 0o755, "uid": 0, "gid": 0})
     return normalized
 
 

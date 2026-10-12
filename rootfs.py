@@ -63,6 +63,8 @@ def validate_layer_paths(members):
     declared = {path: member for path, member in members
                 if not posixpath.basename(path).startswith(".wh.")}
     for path, member in members:
+        if not path and not member.isdir():
+            raise ArchiveError("Root tar member must be a directory")
         base = posixpath.basename(path)
         if base.startswith(".wh."):
             if not member.isfile() or member.size != 0:
@@ -83,6 +85,8 @@ class RootFSIndex:
     """按层顺序维护最终可见文件树，应用 OCI whiteout 而不实际解包。"""
     def __init__(self):
         self.entries = {}
+        # 根目录不参与子路径索引，但其权限/xattr 同样是镜像文件系统的一部分。
+        self.root_metadata = None
 
     def kind(self, path):
         """返回镜像路径当前可见的文件类型；路径不存在时返回 None。"""
@@ -167,11 +171,10 @@ class RootFSIndex:
             seen = set()
             for member in archive:
                 path = clean_path(member.name)
-                if path:
-                    if path in seen:
-                        raise ArchiveError("Duplicate path in layer: " + path)
-                    seen.add(path)
-                    members.append((path, member))
+                if path in seen:
+                    raise ArchiveError("Duplicate path in layer: " + (path or "."))
+                seen.add(path)
+                members.append((path, member))
             # 子条目可能先于父条目出现；不能等父文件覆盖索引后才解析硬链接。
             validate_layer_paths(members)
             # OCI whiteout 只遮蔽下层条目，不能删除同层新增内容。
@@ -187,6 +190,9 @@ class RootFSIndex:
                     target = posixpath.join(parent, base[4:])
                     self._remove(target)
             for path, member in members:
+                if not path:
+                    self.root_metadata = copy.copy(member)
+                    continue
                 if posixpath.basename(path).startswith(".wh."):
                     continue
                 self._parents(path)
