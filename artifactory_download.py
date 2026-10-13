@@ -39,6 +39,7 @@ from urllib.request import (Request, build_opener, HTTPBasicAuthHandler,
 
 from compat import unlink_missing, is_linked_directory
 from file_resources import fdopen_owned
+from task_resources import cancel_pending_on_error
 from file_publish import publication_transaction, publish_new_file
 from path_policy import archive_path, host_components, output_path
 from errors import ArchiveError, BuildError
@@ -327,11 +328,11 @@ def probe_file_sizes(opener, directory_url: str, files: List[str]) -> dict:
     """并发探测大小，为最大文件优先调度和精确进度提供数据。"""
     sizes = {}
     workers = min(12, len(files))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_names = {
-            executor.submit(probe_file_size, opener, directory_url, name): name
-            for name in files
-        }
+    with ThreadPoolExecutor(max_workers=workers) as executor, \
+            cancel_pending_on_error(executor) as submit:
+        future_names = {}
+        for name in files:
+            future_names[submit(probe_file_size, opener, directory_url, name)] = name
         for future in as_completed(future_names):
             size = future.result()
             if size is not None:
@@ -844,10 +845,11 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
 
         try:
             # 线程池按最大值创建，真正的网络并发由可动态调整的 limiter 控制。
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor, \
+                    cancel_pending_on_error(executor) as submit:
                 pending = set()
                 for name in ordered_files:
-                    pending.add(executor.submit(
+                    pending.add(submit(
                         download_one, opener, directory_url, name, raw_root, sizes.get(name),
                         limiter, stats, display
                     ))

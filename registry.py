@@ -32,6 +32,7 @@ from image_reader import (BaseImage, ImageArchiveReader, archive_members, digest
                           same_json_value, sha256_file, verify_layer_tar)
 from image_writer import ImageArchiveWriter
 from file_publish import publication_transaction, publish_new_file
+from task_resources import cancel_pending_on_error
 from oci_writer import (CONFIG_TYPE, INDEX_TYPE, LAYER_TYPE, MANIFEST_TYPE,
                         OCIImageWriter)
 from platforms import architecture, normalize_platform
@@ -478,8 +479,9 @@ def pull(reference, output, username=None, password=None, ca_file=None,
             return index
 
         with reporter.timed("Download Registry layers") if reporter is not None else nullcontext():
-            with ThreadPoolExecutor(max_workers=count) as executor:
-                futures = [executor.submit(download_layer, index, descriptor)
+            with ThreadPoolExecutor(max_workers=count) as executor, \
+                    cancel_pending_on_error(executor) as submit:
+                futures = [submit(download_layer, index, descriptor)
                            for index, descriptor in enumerate(descriptors)]
                 for future in as_completed(futures):
                     index = future.result()
@@ -508,8 +510,9 @@ def pull(reference, output, username=None, password=None, ca_file=None,
         # 保持 rootfs 应用顺序与 config.diff_ids 一致。
         layers = [None] * len(descriptors)
         with reporter.timed("Decompress and verify Registry layers") if reporter is not None else nullcontext():
-            with ThreadPoolExecutor(max_workers=count) as executor:
-                futures = [executor.submit(materialize_layer, index, descriptor, diff_id)
+            with ThreadPoolExecutor(max_workers=count) as executor, \
+                    cancel_pending_on_error(executor) as submit:
+                futures = [submit(materialize_layer, index, descriptor, diff_id)
                            for index, (descriptor, diff_id) in enumerate(zip(descriptors, diff_ids))]
                 for future in as_completed(futures):
                     index, layer = future.result()
