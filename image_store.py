@@ -16,7 +16,7 @@ from cas_store import CASStore, docker_archive_tag
 from compat import unlink_missing
 from build_args import expand
 from dockerfile_parser import parse
-from path_policy import output_path
+from path_policy import output_path, stored_file_path
 from file_publish import publication_transaction
 from errors import BuildError
 from fast import _require_base_tag
@@ -35,7 +35,8 @@ def default_store():
 def _archive_path(store, reference, platform, source):
     key = hashlib.sha256((source + "\0" + reference + "\0" + platform).encode("utf-8")).hexdigest()
     # 数据根可由用户显式指定；内部 tar 节点不能借链接变成库外输入或输出。
-    return output_path(Path(store).resolve() / (key + ".tar"))
+    path = stored_file_path(Path(store).resolve() / (key + ".tar"), "Stored archive path")
+    return output_path(path)
 
 
 def _cas_source(store, reference, platform, source):

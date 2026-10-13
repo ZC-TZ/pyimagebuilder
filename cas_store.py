@@ -5,7 +5,7 @@ config、manifest 和层 blob 先校验落盘，ref 最后原子发布。
 读取引用时核对关联 blob 的摘要；构建通过 open_base 取得有序的未压缩层。
 """
 
-from path_policy import output_path
+from path_policy import output_path, stored_file_path
 
 import hashlib
 import argparse
@@ -68,9 +68,7 @@ class CASStore:
     def _ref(self, reference, platform, source):
         key = hashlib.sha256((source + "\0" + reference + "\0" + platform).encode("utf-8")).hexdigest()
         path = self.refs / (key + ".json")
-        if path.is_symlink():
-            raise ArchiveError("CAS ref path must not be a symlink")
-        return path
+        return stored_file_path(path, "CAS ref path", ArchiveError)
 
     def ref_lock(self, reference, platform, source):
         """按引用、平台及来源互斥更新；调用方应覆盖快照、发布和失败恢复全过程。"""

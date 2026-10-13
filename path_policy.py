@@ -3,6 +3,7 @@
 import os
 import posixpath
 import re
+import stat
 from pathlib import Path
 
 from errors import ArchiveError, BuildError
@@ -73,6 +74,24 @@ def output_path(value):
         raise BuildError("Output path must not contain NUL or be a symlink")
     host_components([part for part in raw.parts if part not in (raw.anchor, ".", "..")])
     return raw.resolve()
+
+
+def stored_file_path(value, label, error_type=BuildError):
+    """检查存储文件节点，允许真正缺失，拒绝目录、链接和其他非普通节点。
+
+    用 lstat 保留节点本身的类型；不能先 resolve 掉 Windows junction。
+    权限或其他读取错误继续上抛，只有 FileNotFoundError 表示可创建的新路径。
+    """
+    path = Path(value)
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return path
+    if stat.S_ISLNK(mode):
+        raise error_type(label + " must not be a symlink")
+    if not stat.S_ISREG(mode):
+        raise error_type(label + " must be a regular file")
+    return path
 
 
 def cache_entry_key(key):

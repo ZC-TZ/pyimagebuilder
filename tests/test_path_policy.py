@@ -4,6 +4,7 @@ import io
 import hashlib
 import json
 import os
+import stat
 import sys
 import tarfile
 import tempfile
@@ -325,8 +326,18 @@ class PathPolicyTests(unittest.TestCase):
             ref = store._ref("test/path:1", "linux/amd64", "local")
             ref.parent.mkdir(parents=True)
             ref.write_text("{}")
-            original = Path.is_symlink
-            with patch.object(Path, "is_symlink", lambda path: path == ref or original(path)):
+            original = Path.lstat
+
+            def linked_node(path):
+                data = original(path)
+                if path == ref:
+                    fields = list(data)
+                    fields[0] = stat.S_IFLNK | 0o777
+                    return os.stat_result(fields)
+                return data
+
+            # 无 Windows 文件链接权限时模拟 lstat 类型，覆盖共用节点检查与列表入口。
+            with patch.object(Path, "lstat", linked_node):
                 with patch.object(cas_store, "read_image_json_file") as reader:
                     with self.assertRaises(ArchiveError):
                         store.resolve("test/path:1", source="local")
