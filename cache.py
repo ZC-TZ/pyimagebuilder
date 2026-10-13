@@ -31,7 +31,8 @@ from image_reader import digest_hex, sha256_file, verify_layer_tar
 # 版本 20 排除源输入在生成 COPY/ADD 层期间变化后，仍按旧指纹发布的条目。
 # 版本 21 排除旧 URL 文件名解析与 RUN rootfs 链接跳转语义生成的结果。
 # 版本 22 排除 Windows 旧文件身份误命中后，依据错误基础 rootfs 生成的后续层。
-CACHE_VERSION = 22
+# 版本 23 排除多阶段 RUN 共用物化目录后，读取前一阶段残留内容生成的层及后续结果。
+CACHE_VERSION = 23
 
 
 def cache_key(*values):

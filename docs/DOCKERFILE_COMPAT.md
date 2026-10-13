@@ -43,7 +43,7 @@ COPY --from 使用源 inode 的最终属主与权限；COPY --from 和 ADD 解�
 
 本地目录及跨阶段目录 COPY 保留**同一源目录树内部**的硬链接关系，按实际源 inode 分组；相同内容不等于硬链接。被排除或已删除的源名字不作为新层链接目标，仍可从存活别名复制固定内容。多个源参数或通配符展开后的独立源分别复制，不会仅因源 inode 相同而在目标中共享写入。这一复制边界参考 [BuildKit 文件操作](https://github.com/moby/buildkit/blob/master/solver/llbsolver/file/backend.go)及其使用的 [fsutil 复制逻辑](https://github.com/tonistiigi/fsutil/blob/master/copy/copy.go)；目标 Docker/BuildKit 版本仍需运行对照验收。
 
-指令缓存版本为 22，路径规则已统一（见 [路径处理规则](PATH_POLICY.md)）；旧版本根目录属性、根 opaque、RUN 保留名、whiteout 删除、账户路径解析、层文件属主、硬链接、扩展属性、目录元数据或 RUN 身份可能有误，首次使用会自动重新构建相应层。
+指令缓存版本为 23，路径规则已统一（见 [路径处理规则](PATH_POLICY.md)）；旧版本根目录属性、根 opaque、RUN 保留名、whiteout 删除、账户路径解析、层文件属主、硬链接、扩展属性、目录元数据或 RUN 身份可能有误，首次使用会自动重新构建相应层。
 
 目录及根目录更新保留未覆盖的 xattr；物化和 OverlayFS 按 chown/xattr/chmod 顺序恢复属性。RUN 默认 umask=0022，新挂载目录、设备节点及 cache 来源目录显式设置权限。具体规则与验证边界见 [镜像权限规则](PERMISSION_POLICY.md)。
 
@@ -52,6 +52,10 @@ RUN 当前无法可靠表达已有目录/根目录的 xattr 删除，因此检�
 权限参数及账户查询得到的 UID/GID 需在 0 至 2147483647 之间，采用 Docker 执行用户的兼容范围；非法或超范围值明确失败。RUN 的用户解析与 COPY/WORKDIR 的目录属主规则有区别：数字 USER 未显式指定组时，采用镜像 passwd 中首个匹配账户的主组，无匹配时为 GID 0。具名 USER 使用该账户自身的附加组，不反查其他同 UID 的用户名；重复用户名、UID 或组名取首个匹配记录。显式指定组时不加载附加组。未写 USER 的 root 执行也会按镜像 UID 0 重置身份，避免保留宿主组。
 
 ## 现代语法与 flag 细节
+
+多阶段构建的 RUN 使用本阶段独立的物化 rootfs，只读取其 FROM 的层及本阶段的后续变化。
+同一阶段连续 RUN、FROM 已完成阶段的显式继承和 COPY --from 复制保持可见内容一致。
+编译阶段独有的文件不会因宿主目录复用而出现在无关阶段中。
 
 | 语法 | 当前行为 |
 | --- | --- |

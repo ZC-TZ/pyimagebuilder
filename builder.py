@@ -641,9 +641,11 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                     if reporter is not None:
                         runner.log = reporter.log
                     if materialized is None:
-                        materialized = (RootFSMaterializer(workspace / "rootfs", rootless=True)
+                        # 新阶段从自身层建立独立 rootfs；重用目录会残留前一阶段的文件和属性。
+                        stage_root = workspace / ("rootfs-{}".format(stage_index))
+                        materialized = (RootFSMaterializer(stage_root, rootless=True)
                                         if effective_sandbox == "rootless" else
-                                        RootFSMaterializer(workspace / "rootfs"))
+                                        RootFSMaterializer(stage_root))
                         for layer_index, existing_layer in enumerate(layers, 1):
                             materialized.apply(existing_layer)
                             if reporter is not None:
