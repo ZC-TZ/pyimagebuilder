@@ -251,8 +251,8 @@ def remove_image(reference, store=None, platform="linux/amd64", source=None):
         if cas.has_ref(reference, platform, kind):
             cas.resolve(reference, platform, kind)
         previous_ref = cas.snapshot_ref(reference, platform, kind)
-        cas.remove_ref(reference, platform, kind)
         try:
+            cas.remove_ref(reference, platform, kind)
             if has_archive:
                 archive.unlink()
         except BaseException:
@@ -271,8 +271,12 @@ def prune_images(store=None, older_than_days=None, dry_run=False):
     for path in sorted(root.glob("*.tar")) if root.is_dir() else []:
         if path.is_symlink():
             continue
-        if path.stat().st_mtime < threshold:
-            candidates.append({"path": str(path), "bytes": path.stat().st_size})
+        # 年龄筛选前预检全部节点，避免先删有效镜像，再在伪装 tar 的目录上失败。
+        if not path.is_file():
+            raise ArchiveError("Unexpected image archive entry: " + str(path))
+        identity = path.stat()
+        if identity.st_mtime < threshold:
+            candidates.append({"path": str(path), "bytes": identity.st_size})
     cas = CASStore(root)
     refs = cas.list_refs()
     for ref in refs:

@@ -82,8 +82,9 @@ class CASStore:
         return self._ref(reference, normalize_platform(platform), source).is_file()
 
     def remove_ref(self, reference, platform, source):
-        """删除指定 ref，不直接删除共享 blob；无引用内容由 prune_orphans 清理。"""
-        with self.ref_lock(reference, platform, source):
+        """删除指定 ref；异常或中断时持锁恢复原字节，共享 blob 留给显式清理。"""
+        # unlink 已生效后仍可能抛异常；恢复范围必须包含删除调用本身。
+        with publication_transaction(self, reference, platform, source):
             unlink_missing(self._ref(reference, normalize_platform(platform), source))
 
     def list_refs(self):
@@ -478,11 +479,12 @@ class CASStore:
             raise BuildError("Excluding refs is only supported for CAS prune dry runs")
         reachable = set()
         for ref_path in sorted(self.refs.glob("*.json")) if self.refs.is_dir() else []:
-            if ref_path.resolve() in excluded:
-                continue
             try:
-                if ref_path.is_symlink():
-                    raise ArchiveError("CAS ref path is a symlink")
+                # 排除仅改变可达性计算，不能让目录或链接绕过节点预检。
+                if ref_path.is_symlink() or not ref_path.is_file():
+                    raise ArchiveError("CAS ref path must be a regular file")
+                if ref_path.resolve() in excluded:
+                    continue
                 value, _ = read_image_json_file(ref_path, "CAS ref for GC")
                 if (not isinstance(value, dict) or value.get("schemaVersion") != SCHEMA_VERSION or
                         not isinstance(value.get("layers"), list) or

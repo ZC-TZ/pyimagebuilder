@@ -111,6 +111,9 @@ python .\main.py cas prune --dry-run --image-store D:\image-store
 
 镜像引用冲突时 `cas import` 默认拒绝覆盖，显式 `--replace` 才更新。普通 `pull` 是刷新远端标签。`rmi` 在引用锁内删除对应来源的 tar 适配文件和 CAS 引用，归档删除失败时恢复引用；引用忙时不会先删除 tar。`rmi` 不再自动执行全库 GC，以免删除其他正在导入但尚未发布引用的 blob。因此删除后 CAS 占用可能暂时保留，其他镜像共享的层也继续保留。
 
+引用删除调用自身失败或中断时也恢复原始 ref；直接 CAS ref 删除遵循同一规则。如果兼容 tar 已删除才抛异常，会恢复 CAS 引用供继续使用与重试，不重建 tar。
+`image prune` 在年龄筛选前拒绝伪装成 .tar 的目录；CAS 预览排除的 ref 仍需通过普通文件和非链接检查。这些预检完成后才开始删除，仍要求停止镜像库上的并发写入。
+
 停止该镜像库上的构建、导入、拉取和其他存储操作后，使用 `main.py cas prune --dry-run` 预览，再用 `main.py cas prune` 回收孤立 blob；按同一配置或 `--image-store` 指向原镜像库。`cas prune` 不删除标签或 tar。清理前核对保留 ref 的身份、原始 manifest/config 摘要、层描述符和 DiffID 对应关系；损坏引用会使清理在删除 blob 前失败。GC 不重新读取全部大层计算摘要，完整层内容校验仍在镜像读取/导出时执行。`image prune` 的删除前预览也使用这一可达性校验。
 
 ## 固定 digest 引用
