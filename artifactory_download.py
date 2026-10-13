@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import argparse
 import base64
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 import gzip
 import hashlib
 import html.parser
@@ -68,13 +68,28 @@ class AdaptiveLimiter(object):
         self._condition = threading.Condition()
         self._limit = limit
         self._active = 0
+        self._cancelled = False
 
     def acquire(self) -> None:
         """等待并发名额，避免目录包含大量层时压垮内网服务。"""
         with self._condition:
-            while self._active >= self._limit:
+            while self._active >= self._limit and not self._cancelled:
                 self._condition.wait()
+            if self._cancelled:
+                raise CancelledError("Artifactory transfer cancelled")
             self._active += 1
+
+    def cancel(self) -> None:
+        """停止发放下载名额，并唤醒已在线程池中运行但仍等待闸门的线程。"""
+        with self._condition:
+            self._cancelled = True
+            self._condition.notify_all()
+
+    def check_cancelled(self) -> None:
+        """在重试前检查整体操作是否已经失败，避免收尾期间再次发起请求。"""
+        with self._condition:
+            if self._cancelled:
+                raise CancelledError("Artifactory transfer cancelled")
 
     def release(self) -> None:
         """释放下载名额并唤醒等待的线程。"""
@@ -184,15 +199,24 @@ class DigestReader(object):
         return False
 
 
+def _http_origin(url):
+    """提取制品服务来源，拒绝会进入引用记录或异常信息的 URL 内嵌凭据。"""
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Artifactory URL must use http:// or https:// with a host")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Do not embed credentials in Artifactory URLs; use username and password environment variable")
+    return parsed.scheme.lower(), parsed.netloc.lower()
+
+
 def artifact_directory_url(page_url: str) -> str:
     """把 UI 页面 URL 或已是 artifact URL 的地址规范为制品目录 URL。"""
     raw_input = page_url.strip()
     # Docker 镜像引用通常没有协议，例如 host/repository:tag；仓库截图使用 HTTP。
     if "://" not in raw_input:
         raw_input = "http://" + raw_input
+    _http_origin(raw_input)
     parsed = urlsplit(raw_input)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("URL 必须以 http:// 或 https:// 开头")
 
     path = unquote(parsed.path)
     fragment = unquote(parsed.fragment)
@@ -240,6 +264,7 @@ class SameOriginRedirect(HTTPRedirectHandler):
 def make_opener(base_url: str, username: Optional[str] = None,
                 password: Optional[str] = None, ca_file: Optional[Path] = None):
     """创建可选 Basic 鉴权的下载器，并限制凭据只发送到已配置的 Artifactory 源。"""
+    origin = _http_origin(base_url)
     if (username is None) != (password is None):
         raise ValueError("Username and password must be provided together")
     handlers = [SameOriginRedirect(),
@@ -249,7 +274,7 @@ def make_opener(base_url: str, username: Optional[str] = None,
         manager.add_password(None, base_url, username, password)
         handlers.append(HTTPBasicAuthHandler(manager))
     opener = build_opener(*handlers)
-    opener.artifactory_origin = (urlsplit(base_url).scheme.lower(), urlsplit(base_url).netloc.lower())
+    opener.artifactory_origin = origin
     opener.artifactory_authorization = ("Basic " + base64.b64encode(
         (username + ":" + password).encode("utf-8")).decode("ascii")) if username is not None else None
     return opener
@@ -257,7 +282,7 @@ def make_opener(base_url: str, username: Optional[str] = None,
 
 def request(opener, url: str, method: str = "GET", extra_headers=None, timeout: int = 60):
     """向同源 Artifactory 发起请求；保持原始编码以便按服务端摘要校验。"""
-    origin = (urlsplit(url).scheme.lower(), urlsplit(url).netloc.lower())
+    origin = _http_origin(url)
     if origin != opener.artifactory_origin:
         raise ValueError("Request target differs from configured Artifactory origin")
     headers = {
@@ -616,21 +641,27 @@ def pack_files(root: Path, output: Path, display: ProgressDisplay) -> float:
     stop = threading.Event()
     started = time.monotonic()
 
+    report_errors = []
+
     def report() -> None:
-        while not stop.wait(0.5 if display.is_tty else 5.0):
-            copied = stats.snapshot()
-            elapsed = max(time.monotonic() - started, 0.001)
-            percent = 100.0 * copied / total_size if total_size else 100.0
-            display.status("打包 {:5.1f}% | {} / {} | {:.1f} MiB/s".format(
-                min(percent, 100.0), format_size(copied), format_size(total_size),
-                copied / elapsed / (1024 * 1024)
-            ))
+        try:
+            while not stop.wait(0.5 if display.is_tty else 5.0):
+                copied = stats.snapshot()
+                elapsed = max(time.monotonic() - started, 0.001)
+                percent = 100.0 * copied / total_size if total_size else 100.0
+                display.status("打包 {:5.1f}% | {} / {} | {:.1f} MiB/s".format(
+                    min(percent, 100.0), format_size(copied), format_size(total_size),
+                    copied / elapsed / (1024 * 1024)
+                ))
+        except BaseException as exc:
+            report_errors.append(exc)
+            stop.set()
 
     reporter = threading.Thread(target=report, name="tar-progress")
     reporter.daemon = True
-    reporter.start()
     with publication_transaction() as published:
         try:
+            reporter.start()
             # 固定 output.part 可能属于另一任务，不能先删除或覆盖它。
             descriptor, pending = tempfile.mkstemp(prefix="artifact-pack-", suffix=".part", dir=output.parent)
             part_output = Path(pending)
@@ -640,11 +671,17 @@ def pack_files(root: Path, output: Path, display: ProgressDisplay) -> float:
                     tarinfo = archive.gettarinfo(str(path), arcname=arcname)
                     with path.open("rb") as source:
                         archive.addfile(tarinfo, CountingReader(source, stats))
+            # 后台输出失败必须在发布前反馈；不能只让进度线程带 traceback 退出。
+            stop.set()
+            reporter.join()
+            if report_errors:
+                raise BuildError("Artifactory pack progress failed") from report_errors[0]
             publish_new_file(part_output, output)
             published.append(output)
         finally:
             stop.set()
-            reporter.join()
+            if reporter.ident is not None:
+                reporter.join()
             if part_output is not None:
                 unlink_missing(part_output)
 
@@ -677,6 +714,7 @@ def download_one(opener, directory_url: str, name: str, root: Path,
     limiter.acquire()
     try:
         for attempt in range(1, 4):
+            limiter.check_cancelled()
             offset = destination.stat().st_size if destination.exists() else 0
             if destination.is_file() and expected_size is not None and offset == expected_size:
                 return offset
@@ -846,7 +884,7 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
         try:
             # 线程池按最大值创建，真正的网络并发由可动态调整的 limiter 控制。
             with ThreadPoolExecutor(max_workers=max_workers) as executor, \
-                    cancel_pending_on_error(executor) as submit:
+                    cancel_pending_on_error(executor, limiter.cancel) as submit:
                 pending = set()
                 for name in ordered_files:
                     pending.add(submit(

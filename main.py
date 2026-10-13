@@ -387,6 +387,8 @@ def main(argv=None):
             import traceback
             traceback.print_exc(file=sys.stderr)
         return 1
+    finally:
+        reporter.close()
     return 0
 
 

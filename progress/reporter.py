@@ -31,32 +31,111 @@ class BuildReporter:
         self.line = None
         self.last_progress = 0.0
         self.finished = False
+        self._closed = False
         self.timings = {}
         self.stop = threading.Event()
         self.thread = None
+        self._started = False
+        self._paused = 0
+        self._render_error = None
 
     def _emit(self, kind, message="", **fields):
         with self.lock:
             if self.finished:
                 return
+            if self._render_error is not None:
+                raise self._render_error
             event = BuildEvent(kind, round(time.monotonic() - self.started, 3),
                                message=message, phase=self.active,
                                step=self.step, total=self.total,
                                instruction=self.instruction, line=self.line, **fields)
-            self.renderer.render(event)
+            try:
+                self.renderer.render(event)
+            except BaseException as exc:
+                self._render_error = exc
+                self.stop.set()
+                raise
 
     def start(self, image, platform, mode="build"):
         """启动事件流和心跳线程，供长时间操作持续报告状态。"""
-        self._emit("build_start", details={"image": image, "platform": platform, "mode": mode})
-        self.thread = threading.Thread(target=self._heartbeat, daemon=True)
-        self.thread.start()
+        initialized = False
+        try:
+            with self.lock:
+                if self._started or self.finished:
+                    raise RuntimeError("Build reporter can only be started once")
+                self._started = initialized = True
+                self._emit("build_start", details={"image": image, "platform": platform, "mode": mode})
+                if self._paused:
+                    return
+                self.stop.clear()
+                self.thread = threading.Thread(target=self._heartbeat, daemon=True)
+                self.thread.start()
+        except BaseException:
+            if initialized:
+                self.close()
+            raise
 
     def _heartbeat(self):
-        while not self.stop.wait(self.heartbeat_interval):
+        try:
+            while not self.stop.wait(self.heartbeat_interval):
+                with self.lock:
+                    if self.active and self.active_since is not None and not self.finished:
+                        duration = time.monotonic() - self.active_since
+                        self._emit("heartbeat", self.active, duration=round(duration, 3))
+        except BaseException as exc:
+            # _emit 已登记渲染异常，下一次主线程输出会报告；后台不能静默成功。
             with self.lock:
-                if self.active and self.active_since is not None and not self.finished:
-                    duration = time.monotonic() - self.active_since
-                    self._emit("heartbeat", self.active, duration=round(duration, 3))
+                if self._render_error is None and not self.finished:
+                    self._render_error = exc
+                self.stop.set()
+
+    def close(self):
+        """幂等结束输出并回收心跳线程；不能持有事件锁等待工作线程。"""
+        try:
+            with self.lock:
+                self.stop.set()
+                self.finished = True
+                if not self._closed:
+                    self._closed = True
+                    self.renderer.close()
+        finally:
+            thread = self.thread
+            if (thread is not None and thread.ident is not None and
+                    thread is not threading.current_thread()):
+                thread.join()
+            # 关闭后不再持有异常 traceback；它可能间接保留整个失败构建的输入对象。
+            with self.lock:
+                self._render_error = None
+
+    @contextmanager
+    def pause_heartbeat(self):
+        """暂停并回收自己的心跳线程，使 RUN 能在单线程进程中 fork。
+
+        只控制本发布器的线程；执行器仍需检查调用方是否有其他活跃线程。
+        日志事件仍可正常输出，退出后恢复心跳；嵌套暂停只在最外层恢复。
+        """
+        with self.lock:
+            self._paused += 1
+            self.stop.set()
+            thread = self.thread
+        try:
+            if thread is not None and thread.ident is not None:
+                if thread is threading.current_thread():
+                    raise RuntimeError("Cannot pause heartbeat from its own thread")
+                thread.join()
+            yield
+        finally:
+            with self.lock:
+                self._paused -= 1
+                if not self._paused and not self.finished and self._render_error is None:
+                    self.stop.clear()
+                    if self._started:
+                        self.thread = threading.Thread(target=self._heartbeat, daemon=True)
+                        try:
+                            self.thread.start()
+                        except BaseException:
+                            self.stop.set()
+                            raise
 
     def phase_start(self, message):
         """标记 Dockerfile 指令以外的阶段，如下载或导出。"""
@@ -127,29 +206,44 @@ class BuildReporter:
 
     def success(self, **summary):
         """发布成功摘要，停止心跳并结束渲染输出。"""
-        with self.lock:
-            self.active = self.active_since = None
-            if self.timings:
-                summary["timings"] = {key: round(value, 3)
-                                      for key, value in self.timings.items()}
-            self._emit("build_success", duration=round(time.monotonic() - self.started, 3), details=summary)
-            self.finished = True
-            self.stop.set()
-            self.renderer.close()
+        try:
+            with self.lock:
+                if self.finished:
+                    return
+                try:
+                    self.active = self.active_since = None
+                    if self.timings:
+                        summary["timings"] = {key: round(value, 3)
+                                              for key, value in self.timings.items()}
+                    self._emit("build_success", duration=round(time.monotonic() - self.started, 3), details=summary)
+                finally:
+                    self.finished = True
+                    self.stop.set()
+        finally:
+            self.close()
 
     def fail(self, error):
         """发布包含当前步骤上下文的失败事件，停止心跳并结束输出。"""
-        with self.lock:
-            reason = str(error)
-            if not self.debug and "Traceback (most recent call last)" in reason:
-                reason = reason.strip().splitlines()[-1]
-            if self.active_since is not None and self.step is not None:
-                self._emit("step_failed", reason, duration=round(time.monotonic() - self.active_since, 3))
-            self._emit("build_failed", "{}: {}".format(type(error).__name__, reason),
-                       duration=round(time.monotonic() - self.started, 3))
-            self.finished = True
-            self.stop.set()
-            self.renderer.close()
+        try:
+            with self.lock:
+                if self.finished:
+                    return
+                try:
+                    # 已失效的输出端不能再报错一次，CLI 仍能正常返回失败状态。
+                    if self._render_error is not None:
+                        return
+                    reason = str(error)
+                    if not self.debug and "Traceback (most recent call last)" in reason:
+                        reason = reason.strip().splitlines()[-1]
+                    if self.active_since is not None and self.step is not None:
+                        self._emit("step_failed", reason, duration=round(time.monotonic() - self.active_since, 3))
+                    self._emit("build_failed", "{}: {}".format(type(error).__name__, reason),
+                               duration=round(time.monotonic() - self.started, 3))
+                finally:
+                    self.finished = True
+                    self.stop.set()
+        finally:
+            self.close()
 
 
 def make_reporter(progress="auto", quiet=False, verbose=False, debug=False,

@@ -663,12 +663,15 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                             env[key] = value
                     env.setdefault("SOURCE_DATE_EPOCH", str(source_date_epoch))
                     env.update({key: value for key, value in stage_args.items() if key not in env})
-                    if run_mounts:
-                        overlay.excluded_paths = {target.lstrip("/") for _, _, target in run_mounts}
-                        with locked_caches(run_mounts):
-                            runner.execute(overlay, run_command, env, workdir, user, shell, run_mounts)
-                    else:
-                        runner.execute(overlay, run_command, env, workdir, user, shell)
+                    # fork 前必须真正回收心跳线程；仅停止输出或设置 daemon 不够。
+                    pause = getattr(reporter, "pause_heartbeat", None)
+                    with pause() if pause is not None else nullcontext():
+                        if run_mounts:
+                            overlay.excluded_paths = {target.lstrip("/") for _, _, target in run_mounts}
+                            with locked_caches(run_mounts):
+                                runner.execute(overlay, run_command, env, workdir, user, shell, run_mounts)
+                        else:
+                            runner.execute(overlay, run_command, env, workdir, user, shell)
                     return overlay.to_layer(target)
 
                 layer_path = workspace / ("instruction-{}.tar".format(number))

@@ -48,6 +48,8 @@ class RunPermissionsTests(unittest.TestCase):
             stack.enter_context(patch.object(executor.os, "_exit", side_effect=ChildExited))
             for name in ("close", "write", "chroot", "chdir", "chown"):
                 stack.enter_context(patch.object(executor.os, name, create=True))
+            stack.enter_context(patch.object(executor, "_prepare_run_supervisor"))
+            stack.enter_context(patch.object(executor, "_fork_namespace_runner", return_value=0))
             for name in ("mount", "_unshare", "_map_rootless_identity", "_prepare_devices",
                          "_no_new_privileges", "_drop_bounding_capabilities", "_clear_capabilities", "install_filter"):
                 stack.enter_context(patch.object(executor, name))

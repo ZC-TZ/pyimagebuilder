@@ -4,7 +4,9 @@ import codecs
 import ctypes
 import os
 import platform
+import signal
 import stat
+import threading
 import traceback
 from pathlib import Path
 
@@ -101,6 +103,8 @@ def _fork_with_pipes(with_logs):
     """
     descriptors = []
     try:
+        if threading.active_count() != 1:
+            raise UnsupportedInstruction("RUN fork requires one active Python thread; pause background workers first")
         diagnostics = os.pipe()
         descriptors.extend(diagnostics)
         stdout = os.pipe() if with_logs else (None, None)
@@ -118,6 +122,93 @@ def _fork_with_pipes(with_logs):
                 pass
         raise
     return pid, diagnostics, stdout, stderr
+
+
+def _wait_child(pid, options=0):
+    """回收指定子进程；只重试系统 EINTR，不吞掉用户取消。"""
+    while True:
+        try:
+            return os.waitpid(pid, options)
+        except InterruptedError:
+            continue
+
+
+def _prepare_run_supervisor():
+    """隔离终端信号，并让父进程的取消请求在 namespace 准备阶段也可生效。"""
+    os.setpgid(0, 0)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+
+
+def _fork_namespace_runner():
+    """阻塞取消信号直到记录 runner PID，防止刚 fork 的 namespace init 成为孤儿。
+
+    supervisor 收到 SIGTERM 后直接杀死并回收 namespace init；内核随后终止该
+    PID namespace 内其他进程，包括另建 session 的后台程序。不能仅杀宿主进程组。
+    """
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    pid = None
+    try:
+        pid = os.fork()
+        if pid:
+            def terminate(_number, _frame):
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                try:
+                    # 正常 waitpid 可能刚回收 runner；旧 PID 此时不能再用于发信号。
+                    try:
+                        found, _ = _wait_child(pid, getattr(os, "WNOHANG", 1))
+                    except ChildProcessError:
+                        found = pid
+                    if found != pid:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        _wait_child(pid)
+                finally:
+                    os._exit(128 + signal.SIGTERM)
+            signal.signal(signal.SIGTERM, terminate)
+        else:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        return pid
+    except BaseException:
+        if pid:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _wait_child(pid)
+        raise
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, set(previous) - {signal.SIGTERM})
+
+
+def _abort_run(pid):
+    """请求 supervisor 清理 namespace init，再回收 supervisor，之后才清理 rootfs。"""
+    try:
+        found, _ = _wait_child(pid, getattr(os, "WNOHANG", 1))
+    except ChildProcessError:
+        return
+    if found == pid:
+        return  # 已退出的直接子进程由此次检查回收，不向旧 PID 发信号。
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        _wait_child(pid)
+    except ChildProcessError:
+        pass  # 已被回收时不能再向这个可能复用的 PID 发信号。
+
+
+def _exit_with_diagnostics(fd):
+    """诊断管道损坏也必须用 _exit 退出，不能回到继承的构建器调用栈。"""
+    try:
+        os.write(fd, traceback.format_exc().encode("utf-8", "replace"))
+    except OSError:
+        pass
+    finally:
+        os._exit(127)
 
 
 def _map_rootless_identity(host_uid, host_gid):
@@ -314,15 +405,16 @@ class RunExecutor:
         log_read, log_write = stdout_pipe
         err_read, err_write = stderr_pipe
         if pid == 0:
-            os.close(read_fd)
-            if log_callback is not None:
-                os.close(log_read)
-                os.close(err_read)
-                os.dup2(log_write, 1)
-                os.dup2(err_write, 2)
-                os.close(log_write)
-                os.close(err_write)
             try:
+                _prepare_run_supervisor()
+                os.close(read_fd)
+                if log_callback is not None:
+                    os.close(log_read)
+                    os.close(err_read)
+                    os.dup2(log_write, 1)
+                    os.dup2(err_write, 2)
+                    os.close(log_write)
+                    os.close(err_write)
                 if self.sandbox == "rootless":
                     host_uid, host_gid = os.geteuid(), os.getegid()
                     _unshare(CLONE_NEWUSER)
@@ -364,7 +456,7 @@ class RunExecutor:
                     raise BuildError("Image /tmp must not be a symlink during RUN setup")
                 _runtime_directory(temporary, mode=0o1777)
                 _prepare_devices(merged, self.sandbox == "rootless")
-                runner = os.fork()
+                runner = _fork_namespace_runner()
                 if runner == 0:
                     try:
                         mount("proc", merged / "proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC)
@@ -390,58 +482,86 @@ class RunExecutor:
                         os.umask(0o022)
                         os.execvpe(argv[0], argv, env)
                     except BaseException:
-                        os.write(write_fd, traceback.format_exc().encode("utf-8", "replace"))
-                        os._exit(127)
-                _, status = os.waitpid(runner, 0)
+                        _exit_with_diagnostics(write_fd)
+                _, status = _wait_child(runner)
                 os._exit(_wait_status(status))
             except BaseException:
-                os.write(write_fd, traceback.format_exc().encode("utf-8", "replace"))
-                os._exit(127)
-        os.close(write_fd)
-        if log_callback is not None:
-            os.close(log_write)
-            os.close(err_write)
-            import threading
-            log_errors = []
-            log_error_lock = threading.Lock()
-            log_failed = threading.Event()
+                _exit_with_diagnostics(write_fd)
+        owned_fds = {fd for pair in (diagnostic_pipe, stdout_pipe, stderr_pipe)
+                     for fd in pair if fd is not None}
+        log_threads = []
+        log_thread_fds = {}
+        log_errors = []
+        log_error_lock = threading.Lock()
+        log_failed = threading.Event()
+        reaped = False
 
-            def record_log_error(source, error):
-                with log_error_lock:
-                    if not log_errors:
-                        log_errors.append((source, error))
-                    log_failed.set()
+        def close_owned(fd):
+            owned_fds.discard(fd)
+            os.close(fd)
 
-            def forward_logs(fd, source):
-                try:
-                    output_stream = fdopen_owned(fd, "rb")
-                    with output_stream:
-                        for line in _iter_run_log_fragments(output_stream):
-                            if log_failed.is_set():
-                                continue
-                            try:
-                                log_callback(line, source)
-                            except BaseException as exc:
-                                # 回调失败后继续排空两个管道，避免改变 RUN 的输出与退出行为。
-                                # 线程中的异常交给等待结束后的主线程报告，不能静默判为成功。
-                                record_log_error(source, exc)
-                except BaseException as exc:
-                    record_log_error(source, exc)
-            log_threads = [threading.Thread(target=forward_logs, args=(fd, source), daemon=True)
-                           for fd, source in ((log_read, "stdout"), (err_read, "stderr"))]
-            for thread in log_threads:
-                thread.start()
-        with fdopen_owned(read_fd, "rb") as stream:
-            diagnostics = _read_run_diagnostics(stream)
-        _, status = os.waitpid(pid, 0)
-        if log_callback is not None:
+        def record_log_error(source, error):
+            with log_error_lock:
+                if not log_errors:
+                    log_errors.append((source, error))
+                log_failed.set()
+
+        def forward_logs(fd, source):
+            try:
+                with fdopen_owned(fd, "rb") as output_stream:
+                    for line in _iter_run_log_fragments(output_stream):
+                        if log_failed.is_set():
+                            continue
+                        try:
+                            log_callback(line, source)
+                        except BaseException as exc:
+                            # 回调失败后继续排空；日志失败不能改变子进程写入和退出行为。
+                            record_log_error(source, exc)
+            except BaseException as exc:
+                record_log_error(source, exc)
+
+        try:
+            close_owned(write_fd)
+            if log_callback is not None:
+                close_owned(log_write)
+                close_owned(err_write)
+                for fd, source in ((log_read, "stdout"), (err_read, "stderr")):
+                    thread = threading.Thread(target=forward_logs, args=(fd, source), daemon=True)
+                    log_threads.append(thread)
+                    log_thread_fds[thread] = fd
+                    thread.start()
+                    owned_fds.discard(fd)
+            # fdopen_owned 失败也会关闭描述符，不能在 finally 中再次关闭它。
+            owned_fds.discard(read_fd)
+            with fdopen_owned(read_fd, "rb") as stream:
+                diagnostics = _read_run_diagnostics(stream)
+            _, status = _wait_child(pid)
+            reaped = True
             for thread in log_threads:
                 thread.join()
-        code = _wait_status(status)
-        if code:
-            detail = diagnostics.strip() or "process exited with code {}".format(code)
-            raise BuildError("RUN failed: " + detail)
-        if log_callback is not None and log_errors:
-            source, error = log_errors[0]
-            raise BuildError("RUN log forwarding failed for {}: {}".format(
-                source, type(error).__name__)) from error
+            code = _wait_status(status)
+            if code:
+                detail = diagnostics.strip() or "process exited with code {}".format(code)
+                raise BuildError("RUN failed: " + detail)
+            if log_errors:
+                source, error = log_errors[0]
+                raise BuildError("RUN log forwarding failed for {}: {}".format(
+                    source, type(error).__name__)) from error
+        except BaseException:
+            log_failed.set()
+            if not reaped:
+                _abort_run(pid)
+            raise
+        finally:
+            # start 被中断时线程可能已启动；以 ident 判定所有权，不 join 未启动的线程。
+            for thread, fd in log_thread_fds.items():
+                if thread.ident is not None:
+                    owned_fds.discard(fd)
+            for fd in owned_fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            for thread in log_threads:
+                if thread.ident is not None:
+                    thread.join()

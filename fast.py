@@ -493,6 +493,9 @@ def main(argv=None):
             import traceback
             traceback.print_exc(file=sys.stderr)
         return 1
+    finally:
+        if reporter is not None:
+            reporter.close()
 
 
 if __name__ == "__main__":

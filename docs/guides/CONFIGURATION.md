@@ -82,6 +82,8 @@ $env:PYIMAGEBUILDER_REGISTRY_PASSWORD = '实际密码'
 
 `passwordEnv` 存的是变量名，程序运行时读取其值。JSON 中不允许 `password` 或 `token` 字段。连接参数通常可用相应命令的 `--username`、`--password-env`、`--ca-file` 覆盖；Fast 日常命令使用 profile 对应的 repositories 设置。
 
+Artifactory 地址也不能写成 `https://用户名:密码@主机/...`：这类地址会在解析或请求前被拒绝，防止凭据进入来源记录。地址中请勿携带其他敏感查询参数；程序不提供通用的 URL 或 RUN 日志脱敏。
+
 需要限制下载并发时，仓库项可设置 `workers`（0–64，0 表示自动选择）。其他连接字段请结合当前子命令的 `--help` 使用。
 
 ## 4. Fast 模板字段

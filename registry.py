@@ -17,7 +17,7 @@ import tarfile
 import tempfile
 import threading
 import zlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -139,7 +139,11 @@ def _challenge(value):
 
 
 class RegistryClient:
-    """管理一个仓库的 V2 鉴权，以及受作用域限制的 manifest/blob 请求。"""
+    """管理一个仓库的 V2 鉴权，以及受作用域限制的 manifest/blob 请求。
+
+    同一实例允许并发下载 blob；manifest_raw 是最近一次 manifest 的响应，
+    不支持同一实例并发解析多个 manifest。cancel 后应为下一次操作新建实例。
+    """
     def __init__(self, reference, username=None, password=None, ca_file=None,
                  insecure_http=False, auth_host=None, timeout=60):
         if (username is None) != (password is None):
@@ -155,12 +159,23 @@ class RegistryClient:
         if auth_host:
             self.auth_hosts.add(auth_host.lower())
         self.tokens = {}
+        self._auth_lock = threading.RLock()
+        self._cancelled = threading.Event()
         self.manifest_raw = None
+
+    def cancel(self):
+        """停止后续请求和鉴权重试；已阻塞的 socket read 仍需返回或超时。"""
+        self._cancelled.set()
+
+    def _check_cancelled(self):
+        if self._cancelled.is_set():
+            raise CancelledError("Registry operation cancelled")
 
     def _url(self, suffix):
         return self.origin + "/v2/" + self.reference.repository + suffix
 
     def _single(self, method, url, headers, body, sink, allowed, max_stream_bytes=None):
+        self._check_cancelled()
         parsed = urlsplit(url)
         if (parsed.scheme not in ("https", "http") or not parsed.hostname or
                 parsed.username or parsed.password or parsed.fragment or
@@ -185,6 +200,7 @@ class RegistryClient:
                 with open(sink, "wb") as output:
                     total = 0
                     for block in iter(lambda: response.read(BUFFER), b""):
+                        self._check_cancelled()
                         total += len(block)
                         if max_stream_bytes is not None and total > max_stream_bytes:
                             raise BuildError("Registry blob exceeds descriptor size")
@@ -239,24 +255,38 @@ class RegistryClient:
         headers = dict(headers or {})
         current = url
         for _ in range(redirects + 1):
+            self._check_cancelled()
             origin = urlsplit(current).netloc.lower() == self.reference.registry.lower()
-            sent = dict(headers)
+            # 调用方显式传入的敏感头也必须遵守同源限制，不能随 blob CDN 跳转泄露。
+            sent = {key: value for key, value in headers.items()
+                    if origin or key.lower() not in ("authorization", "proxy-authorization", "cookie")}
             if origin:
-                if scope in self.tokens:
-                    sent["Authorization"] = "Bearer " + self.tokens[scope]
-                elif self._basic():
-                    sent["Authorization"] = self._basic()
+                with self._auth_lock:
+                    self._check_cancelled()
+                    token = self.tokens.get(scope)
+                authorization = "Bearer " + token if token is not None else self._basic()
+                if authorization is not None:
+                    sent = {key: value for key, value in sent.items() if key.lower() != "authorization"}
+                    sent["Authorization"] = authorization
             position = body.tell() if hasattr(body, "tell") else None
             status, response_headers, raw = self._single(method, current, sent, body,
                                                           sink, set(allowed), max_stream_bytes)
             if status == 401 and origin and "www-authenticate" in response_headers:
-                self._token(response_headers["www-authenticate"], scope)
+                # 并发 401 只刷新一次；其他请求复用刷新后的 token，
+                # 不能把更早请求的过期响应当成再次刷新新 token 的理由。
+                with self._auth_lock:
+                    self._check_cancelled()
+                    token = self.tokens.get(scope)
+                    if token is None or sent.get("Authorization") == "Bearer " + token:
+                        self._token(response_headers["www-authenticate"], scope)
+                    token = self.tokens[scope]
                 if position is not None:
                     body.seek(position)
                 elif body is not None and not isinstance(body, bytes):
                     raise BuildError("Registry upload body cannot be retried after authentication")
+                self._check_cancelled()
                 status, response_headers, raw = self._single(
-                    method, current, {**headers, "Authorization": "Bearer " + self.tokens[scope]},
+                    method, current, {**sent, "Authorization": "Bearer " + token},
                     body, sink, set(allowed), max_stream_bytes)
             if status in (301, 302, 303, 307, 308) and method in ("GET", "HEAD"):
                 location = response_headers.get("location")
@@ -480,7 +510,7 @@ def pull(reference, output, username=None, password=None, ca_file=None,
 
         with reporter.timed("Download Registry layers") if reporter is not None else nullcontext():
             with ThreadPoolExecutor(max_workers=count) as executor, \
-                    cancel_pending_on_error(executor) as submit:
+                    cancel_pending_on_error(executor, getattr(client, "cancel", None)) as submit:
                 futures = [submit(download_layer, index, descriptor)
                            for index, descriptor in enumerate(descriptors)]
                 for future in as_completed(futures):
@@ -511,7 +541,7 @@ def pull(reference, output, username=None, password=None, ca_file=None,
         layers = [None] * len(descriptors)
         with reporter.timed("Decompress and verify Registry layers") if reporter is not None else nullcontext():
             with ThreadPoolExecutor(max_workers=count) as executor, \
-                    cancel_pending_on_error(executor) as submit:
+                    cancel_pending_on_error(executor, getattr(client, "cancel", None)) as submit:
                 futures = [submit(materialize_layer, index, descriptor, diff_id)
                            for index, (descriptor, diff_id) in enumerate(zip(descriptors, diff_ids))]
                 for future in as_completed(futures):

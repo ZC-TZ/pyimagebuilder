@@ -3,6 +3,7 @@
 import errno
 import os
 import threading
+import weakref
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from path_policy import output_path
 
 
 _guard = threading.Lock()
-_locks = {}
+_locks = weakref.WeakValueDictionary()
 _active = threading.local()
 
 
@@ -52,7 +53,12 @@ def file_lock(path, subject="Image reference"):
     path = output_path(path)
     key = os.path.normcase(str(path))
     with _guard:
-        local_lock = _locks.setdefault(key, threading.RLock())
+        local_lock = _locks.get(key)
+        if local_lock is None:
+            local_lock = threading.RLock()
+            _locks[key] = local_lock
+        # 本次调用持有强引用，竞争者和嵌套调用会拿到同一把锁。
+        # 最后一个调用结束后可回收内存中的锁，磁盘锁文件仍永久保留。
     if not local_lock.acquire(blocking=False):
         raise BuildError(subject + " is busy; retry after the other operation completes")
     active = getattr(_active, "paths", None)

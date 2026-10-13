@@ -44,11 +44,12 @@ python -m unittest discover -s tests -p test_image_identity_contract.py -v
 | 无 RUN 的构建和归档处理 | 单元测试、离线兼容样例；实际应用仍需启动检查 |
 | Docker 语义与可加载性 | 有 Docker 的机器上运行 `python conformance.py reference`；具体项目使用 `compare --help` 查参数 |
 | Linux RUN、whiteout、cache/secret mount | 在有 Linux 内核能力的构建机上运行 `conformance.py linux --help`，提供匹配平台的基础 tar、镜像引用及权限 |
+| RUN 取消与后台进程回收 | 在独立 Linux CLI 进程中运行 `tests/linux_run_lifecycle_smoke.py --help`；条件与命令见 [并发与资源生命周期](docs/CONCURRENCY_AND_RESOURCES.md) |
 | Registry / Artifactory 下载与鉴权 | 在目标内网用测试账户与测试仓库验证，避免覆盖正式标签 |
 | amd64 / arm64 跨架构 RUN | 验证目标内核、QEMU/binfmt_misc 和基础镜像可执行文件 |
 | Python 3.7 兼容性 | 已在 Windows/Python 3.7.9 运行完整回归；其他解释器版本和操作系统需分别验证，语法解析不能替代运行测试 |
 
-最近完整回归在 Windows/Python 3.7.9 与 Python 3.12 各运行 604 项测试，各通过 601 项、跳过 3 项；跳过项涉及当前账户不能创建符号链接。真实 Docker、Linux RUN 和内网鉴权尚未在该环境验收。报告测试结果时，应同时说明解释器、操作系统、跳过项和外部依赖。
+最近完整回归在 Windows/Python 3.7.9 与 Python 3.12 各运行 708 项测试，各通过 705 项、跳过 3 项；跳过项涉及当前账户不能创建符号链接。两套离线兼容性检查各通过 7/7。真实 Docker、Linux RUN、WSL 和内网鉴权尚未在该环境验收。报告测试结果时，应同时说明解释器、操作系统、跳过项和外部依赖。
 
 ## 修改与提交
 

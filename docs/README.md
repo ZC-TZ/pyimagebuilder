@@ -36,6 +36,7 @@
 | [路径处理规则](PATH_POLICY.md) | 镜像路径、归档、Windows 文件名、链接与输出边界 |
 | [镜像权限规则](PERMISSION_POLICY.md) | UID/GID、mode、xattr、硬链接、RUN 与缓存的权限契约 |
 | [镜像身份契约](IMAGE_IDENTITY.md) | ImageID、manifest digest、原始 JSON 字节与转存规则 |
+| [并发与资源生命周期](CONCURRENCY_AND_RESOURCES.md) | 锁、取消、线程及子进程收尾、鉴权泄露边界与验收方法 |
 | [开发与维护](../CONTRIBUTING.md) | 测试、目标环境验收与公开仓库提交范围 |
 
 ## 文件放在哪里
