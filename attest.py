@@ -11,7 +11,9 @@ import sys
 from pathlib import Path
 
 import ed25519
-from compat import unlink_missing, is_linked_directory
+from compat import is_linked_directory
+from file_resources import fdopen_owned
+from file_publish import publication_transaction
 from errors import BuildError
 from image_reader import sha256_file
 from sbom import canonical_json
@@ -132,25 +134,20 @@ def read_public_key(path):
 
 
 def keygen(private_path, public_path):
-    """离线生成来源证明签名所需的密钥对。"""
+    """离线生成签名密钥对；失败或中断时回滚本次创建的文件，保留既有文件。"""
     private_path, public_path = Path(private_path), Path(public_path)
     if private_path.resolve() == public_path.resolve():
         raise BuildError("Private and public key paths must differ")
     seed = os.urandom(32)
     private_path.parent.mkdir(parents=True, exist_ok=True)
     public_path.parent.mkdir(parents=True, exist_ok=True)
-    created = []
-    try:
+    with publication_transaction() as created:
         for path, raw, mode in ((private_path, seed, 0o600),
                                 (public_path, ed25519.public_key(seed), 0o644)):
             descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
             created.append(path)
-            with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+            with fdopen_owned(descriptor, "w", encoding="ascii") as stream:
                 stream.write(raw.hex() + "\n")
-    except Exception:
-        for path in created:
-            unlink_missing(path)
-        raise
 
 
 def _load_json(path, label):

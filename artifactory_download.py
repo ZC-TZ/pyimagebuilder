@@ -38,6 +38,7 @@ from urllib.request import (Request, build_opener, HTTPBasicAuthHandler,
                             HTTPPasswordMgrWithDefaultRealm, HTTPRedirectHandler, HTTPSHandler)
 
 from compat import unlink_missing, is_linked_directory
+from file_resources import fdopen_owned
 from file_publish import publication_transaction, publish_new_file
 from path_policy import archive_path, host_components, output_path
 from errors import ArchiveError, BuildError
@@ -632,7 +633,7 @@ def pack_files(root: Path, output: Path, display: ProgressDisplay) -> float:
             # 固定 output.part 可能属于另一任务，不能先删除或覆盖它。
             descriptor, pending = tempfile.mkstemp(prefix="artifact-pack-", suffix=".part", dir=output.parent)
             part_output = Path(pending)
-            with os.fdopen(descriptor, "wb") as sink, tarfile.open(fileobj=sink, mode="w", bufsize=1024 * 1024) as archive:
+            with fdopen_owned(descriptor, "wb") as sink, tarfile.open(fileobj=sink, mode="w", bufsize=1024 * 1024) as archive:
                 for path in files:
                     arcname = path.relative_to(root).as_posix()
                     tarinfo = archive.gettarinfo(str(path), arcname=arcname)

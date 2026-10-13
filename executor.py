@@ -9,6 +9,7 @@ import traceback
 from pathlib import Path
 
 from errors import BuildError, UnsupportedInstruction
+from file_resources import fdopen_owned
 from image_identity import checked_identity_id
 from overlay import mount
 from sandbox import install_filter
@@ -412,9 +413,8 @@ class RunExecutor:
                     log_failed.set()
 
             def forward_logs(fd, source):
-                output_stream = None
                 try:
-                    output_stream = os.fdopen(fd, "rb")
+                    output_stream = fdopen_owned(fd, "rb")
                     with output_stream:
                         for line in _iter_run_log_fragments(output_stream):
                             if log_failed.is_set():
@@ -426,18 +426,12 @@ class RunExecutor:
                                 # 线程中的异常交给等待结束后的主线程报告，不能静默判为成功。
                                 record_log_error(source, exc)
                 except BaseException as exc:
-                    if output_stream is None:
-                        # fdopen 未接管描述符时，转发线程仍负责关闭它。
-                        try:
-                            os.close(fd)
-                        except OSError:
-                            pass
                     record_log_error(source, exc)
             log_threads = [threading.Thread(target=forward_logs, args=(fd, source), daemon=True)
                            for fd, source in ((log_read, "stdout"), (err_read, "stderr"))]
             for thread in log_threads:
                 thread.start()
-        with os.fdopen(read_fd, "rb") as stream:
+        with fdopen_owned(read_fd, "rb") as stream:
             diagnostics = _read_run_diagnostics(stream)
         _, status = os.waitpid(pid, 0)
         if log_callback is not None:

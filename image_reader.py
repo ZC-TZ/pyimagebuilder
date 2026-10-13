@@ -15,6 +15,7 @@ from pathlib import Path
 from errors import ArchiveError, BaseImageNotFound
 from path_policy import archive_path
 from compat import is_linked_directory
+from file_resources import fdopen_owned
 from cache_identity import file_identity, stat_identity
 from platforms import architecture, normalize_platform
 
@@ -343,7 +344,7 @@ class ImageArchiveReader:
                 # 再在同一文件系统内原子发布，不能让读者看到半份层。
                 descriptor, pending = tempfile.mkstemp(prefix="base-layer-", suffix=".part", dir=layer.parent)
                 try:
-                    with os.fdopen(descriptor, "wb") as output, open(target, "rb") as stream:
+                    with fdopen_owned(descriptor, "wb") as output, open(target, "rb") as stream:
                         shutil.copyfileobj(stream, output, BUFFER)
                         output.flush()
                         os.fsync(output.fileno())
@@ -363,7 +364,7 @@ class ImageArchiveReader:
                  "diff_id": expected}
         descriptor, pending = tempfile.mkstemp(prefix="base-entry-", suffix=".part", dir=metadata.parent)
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            with fdopen_owned(descriptor, "w", encoding="utf-8") as stream:
                 json.dump(entry, stream, separators=(",", ":"))
             os.replace(pending, metadata)
         finally:

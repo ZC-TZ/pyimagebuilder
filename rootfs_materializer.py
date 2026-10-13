@@ -10,6 +10,7 @@ from pathlib import Path
 from errors import ArchiveError, BuildError
 from permissions import validate_metadata
 from compat import is_linked_directory
+from file_resources import fdopen_owned
 from rootfs import clean_path, validate_layer_paths
 from path_policy import host_components, host_path_aliases
 
@@ -207,7 +208,7 @@ class RootFSMaterializer:
                         if hasattr(os, "O_NOFOLLOW"):
                             flags |= os.O_NOFOLLOW
                         descriptor = os.open(path, flags, 0o600)
-                        with os.fdopen(descriptor, "wb") as output, stream:
+                        with fdopen_owned(descriptor, "wb") as output, stream:
                             shutil.copyfileobj(stream, output, 4 * 1024 * 1024)
                         self._metadata(path, member)
                     elif member.issym():

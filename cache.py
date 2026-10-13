@@ -11,6 +11,7 @@ from pathlib import Path
 
 from errors import ArchiveError, BuildError
 from compat import is_linked_directory
+from file_resources import fdopen_owned
 from cache_identity import file_identity
 from store_lock import file_lock
 from path_policy import cache_entry_key
@@ -107,7 +108,7 @@ class LayerCache:
                     metadata["file_identity"] = signature
                     descriptor, pending = tempfile.mkstemp(prefix="entry-", suffix=".part", dir=self.entries)
                     try:
-                        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                        with fdopen_owned(descriptor, "w", encoding="utf-8") as output:
                             json.dump(metadata, output, separators=(",", ":"))
                         os.replace(pending, entry)
                     finally:
@@ -144,7 +145,7 @@ class LayerCache:
             if not target.is_file() or target.stat().st_size != source.stat().st_size or sha256_file(target) != digest:
                 descriptor, temporary = tempfile.mkstemp(prefix="layer-", suffix=".part", dir=self.layers)
                 try:
-                    with os.fdopen(descriptor, "wb") as output, open(source, "rb") as stream:
+                    with fdopen_owned(descriptor, "wb") as output, open(source, "rb") as stream:
                         shutil.copyfileobj(stream, output, 4 * 1024 * 1024)
                         output.flush()
                         os.fsync(output.fileno())
@@ -159,7 +160,7 @@ class LayerCache:
                         "file_identity": self._identity(target)}
         descriptor, temporary = tempfile.mkstemp(prefix="entry-", suffix=".part", dir=self.entries)
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            with fdopen_owned(descriptor, "w", encoding="utf-8") as output:
                 json.dump(metadata, output, separators=(",", ":"))
                 output.flush()
                 os.fsync(output.fileno())

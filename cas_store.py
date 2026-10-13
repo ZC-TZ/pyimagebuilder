@@ -19,6 +19,7 @@ import zlib
 from pathlib import Path
 
 from compat import is_linked_directory, unlink_missing
+from file_resources import fdopen_owned
 from errors import ArchiveError, BuildError
 from image_reader import (MAX_JSON, BaseImage, ImageArchiveReader, archive_members, digest_hex,
                           image_history, parse_image_json, read_image_json_file, same_json_value, sha256_file,
@@ -127,7 +128,7 @@ class CASStore:
         hasher = hashlib.sha256()
         written = 0
         try:
-            with os.fdopen(descriptor, "wb") as output:
+            with fdopen_owned(descriptor, "wb") as output:
                 for block in iter(lambda: stream.read(BUFFER), b""):
                     output.write(block)
                     hasher.update(block)
@@ -203,7 +204,7 @@ class CASStore:
         parse_image_json(raw, "new CAS ref")
         descriptor, pending = tempfile.mkstemp(prefix="ref-", suffix=".part", dir=self.refs)
         try:
-            with os.fdopen(descriptor, "wb") as output:
+            with fdopen_owned(descriptor, "wb") as output:
                 output.write(raw)
                 output.flush()
                 os.fsync(output.fileno())
@@ -238,7 +239,7 @@ class CASStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, pending = tempfile.mkstemp(prefix="ref-restore-", suffix=".part", dir=path.parent)
         try:
-            with os.fdopen(descriptor, "wb") as output:
+            with fdopen_owned(descriptor, "wb") as output:
                 output.write(raw)
                 output.flush()
                 os.fsync(output.fileno())
@@ -607,7 +608,7 @@ class CASStore:
                     descriptor, pending = tempfile.mkstemp(prefix="decoded-", suffix=".part",
                                                             dir=self.blobs)
                     try:
-                        with os.fdopen(descriptor, "wb") as target, \
+                        with fdopen_owned(descriptor, "wb") as target, \
                                 gzip.open(self._blob(item["digest"]), "rb") as source_stream:
                             for block in iter(lambda: source_stream.read(BUFFER), b""):
                                 target.write(block)

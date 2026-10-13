@@ -8,6 +8,7 @@ from contextlib import contextmanager, ExitStack, nullcontext
 from pathlib import Path
 
 from compat import unlink_missing
+from file_resources import fdopen_owned
 from path_policy import output_path
 
 
@@ -75,7 +76,7 @@ def publish_new_file(source, destination):
     published = False
     try:
         try:
-            with os.fdopen(descriptor, "wb") as output, open(source, "rb") as stream:
+            with fdopen_owned(descriptor, "wb") as output, open(source, "rb") as stream:
                 shutil.copyfileobj(stream, output, BUFFER)
                 output.flush()
                 os.fsync(output.fileno())
