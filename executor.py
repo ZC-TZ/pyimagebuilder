@@ -350,10 +350,38 @@ class RunExecutor:
             os.close(log_write)
             os.close(err_write)
             import threading
+            log_errors = []
+            log_error_lock = threading.Lock()
+            log_failed = threading.Event()
+
+            def record_log_error(source, error):
+                with log_error_lock:
+                    if not log_errors:
+                        log_errors.append((source, error))
+                    log_failed.set()
+
             def forward_logs(fd, source):
-                with os.fdopen(fd, "rb") as output_stream:
-                    for line in output_stream:
-                        log_callback(line.decode("utf-8", "replace").rstrip("\r\n"), source)
+                output_stream = None
+                try:
+                    output_stream = os.fdopen(fd, "rb")
+                    with output_stream:
+                        for line in output_stream:
+                            if log_failed.is_set():
+                                continue
+                            try:
+                                log_callback(line.decode("utf-8", "replace").rstrip("\r\n"), source)
+                            except BaseException as exc:
+                                # 回调失败后继续排空两个管道，避免改变 RUN 的输出与退出行为。
+                                # 线程中的异常交给等待结束后的主线程报告，不能静默判为成功。
+                                record_log_error(source, exc)
+                except BaseException as exc:
+                    if output_stream is None:
+                        # fdopen 未接管描述符时，转发线程仍负责关闭它。
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                    record_log_error(source, exc)
             log_threads = [threading.Thread(target=forward_logs, args=(fd, source), daemon=True)
                            for fd, source in ((log_read, "stdout"), (err_read, "stderr"))]
             for thread in log_threads:
@@ -368,3 +396,7 @@ class RunExecutor:
         if code:
             detail = diagnostics.strip() or "process exited with code {}".format(code)
             raise BuildError("RUN failed: " + detail)
+        if log_callback is not None and log_errors:
+            source, error = log_errors[0]
+            raise BuildError("RUN log forwarding failed for {}: {}".format(
+                source, type(error).__name__)) from error
