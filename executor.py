@@ -41,6 +41,33 @@ class _CapData(ctypes.Structure):
                 ("inheritable", ctypes.c_uint32)]
 
 
+def _fork_with_pipes(with_logs):
+    """创建 RUN 管道及首个子进程；准备失败时回收已分配的全部描述符。
+
+    成功后由 execute 的父/子分支分别接管管道。仅关闭本次已创建的描述符，
+    一个 close 报错也继续尝试其余描述符，并保留原始创建/中断异常。
+    """
+    descriptors = []
+    try:
+        diagnostics = os.pipe()
+        descriptors.extend(diagnostics)
+        stdout = os.pipe() if with_logs else (None, None)
+        if with_logs:
+            descriptors.extend(stdout)
+        stderr = os.pipe() if with_logs else (None, None)
+        if with_logs:
+            descriptors.extend(stderr)
+        pid = os.fork()
+    except BaseException:
+        for fd in reversed(descriptors):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+    return pid, diagnostics, stdout, stderr
+
+
 def _map_rootless_identity(host_uid, host_gid):
     """仅把当前宿主用户及组映射为 namespace 内的 UID/GID 0。"""
     Path("/proc/self/setgroups").write_text("deny\n", encoding="ascii")
@@ -229,11 +256,11 @@ class RunExecutor:
                 raise BuildError("Unsupported RUN mount type")
             validated_mounts.append((kind, source, normalize_mount_target(target, targets)))
         mounts = validated_mounts
-        read_fd, write_fd = os.pipe()
         log_callback = getattr(self, "log", None)
-        log_read, log_write = os.pipe() if log_callback is not None else (None, None)
-        err_read, err_write = os.pipe() if log_callback is not None else (None, None)
-        pid = os.fork()
+        pid, diagnostic_pipe, stdout_pipe, stderr_pipe = _fork_with_pipes(log_callback is not None)
+        read_fd, write_fd = diagnostic_pipe
+        log_read, log_write = stdout_pipe
+        err_read, err_write = stderr_pipe
         if pid == 0:
             os.close(read_fd)
             if log_callback is not None:
