@@ -4,6 +4,7 @@ import contextlib
 import gc
 import io
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -462,6 +463,109 @@ class ConcurrencyLifecycleTests(unittest.TestCase):
             with self.assertRaises(CancelledError):
                 done.result(timeout=5)
             single.assert_not_called()
+
+    def test_registry_auth_retry_replaces_all_authorization_case_variants(self):
+        for name in ("authorization", "aUthOriZaTion"):
+            with self.subTest(header=name):
+                client = RegistryClient("example.test/p/app:1")
+                seen = []
+
+                def single(_method, url, headers, *_args):
+                    if "/token" in url:
+                        return 200, {}, b'{"token":"new-token"}'
+                    seen.append(headers)
+                    if len(seen) == 1:
+                        return 401, {"www-authenticate": 'Bearer realm="https://example.test/token"'}, b""
+                    return 200, {}, b"ok"
+
+                with patch.object(client, "_single", side_effect=single):
+                    client.request("GET", client._url("/blobs/test"), client._scope("pull"),
+                                   headers={name: "obsolete", "Accept": "blob"})
+                self.assertEqual([value for key, value in seen[1].items()
+                                  if key.lower() == "authorization"], ["Bearer new-token"])
+                self.assertEqual(seen[1]["Accept"], "blob")
+
+    def test_registry_cancel_at_response_end_cannot_return_success(self):
+        for point in ("last_progress", "stream_eof", "json_read"):
+            with self.subTest(point=point), tempfile.TemporaryDirectory() as temporary:
+                client = RegistryClient("example.test/p/app:1")
+
+                class Response(io.BytesIO):
+                    status = 200
+
+                    def getheaders(self):
+                        return [("Content-Length", "4")]
+
+                    def read(self, size=-1):
+                        result = super().read(size)
+                        if point == "json_read" or (point == "stream_eof" and not result):
+                            client.cancel()
+                        return result
+
+                response = Response(b"test")
+
+                class Connection:
+                    closed = False
+
+                    def request(self, *_args, **_kwargs):
+                        pass
+
+                    def getresponse(self):
+                        return response
+
+                    def close(self):
+                        self.closed = True
+                        response.close()
+
+                connection = Connection()
+                partial = Path(temporary) / "partial"
+                if point == "last_progress":
+                    client.progress = lambda *_args: client.cancel()
+                kwargs = {} if point == "json_read" else {"sink": partial, "max_stream_bytes": 4}
+                with patch.object(registry.http.client, "HTTPSConnection", return_value=connection):
+                    with self.assertRaises(CancelledError):
+                        client.request("GET", client._url("/blobs/test"), client._scope("pull"), **kwargs)
+                self.assertTrue(connection.closed)
+                self.assertTrue(response.closed)
+                if partial.exists():
+                    partial.unlink()  # Windows 上确认写入句柄已经释放。
+
+    def test_registry_incomplete_http_response_releases_real_socket(self):
+        for failure in ("cancel", "blob_size", "json_size"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                reader, writer = socket.socketpair()
+                responses = []
+                connection = registry.http.client.HTTPConnection("example.test")
+                connection.sock = reader
+
+                class ObservedResponse(registry.http.client.HTTPResponse):
+                    def __init__(self, *args, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        responses.append(self)
+
+                connection.response_class = ObservedResponse
+                client = RegistryClient("example.test/p/app:1", insecure_http=True)
+                if failure == "cancel":
+                    client.progress = lambda *_args: client.cancel()
+                kwargs = ({} if failure == "json_size" else
+                          {"sink": Path(temporary) / "partial",
+                           "max_stream_bytes": 4 if failure == "blob_size" else 12})
+                try:
+                    # HTTP/1.0 响应由 makefile 持有 socket；getresponse 会先关闭连接对象。
+                    writer.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 12\r\n\r\nabcdefghijkl")
+                    with patch.object(registry.http.client, "HTTPConnection", return_value=connection), \
+                            patch.object(registry, "BUFFER", 4), patch.object(registry, "MAX_JSON", 4):
+                        with self.assertRaises(CancelledError if failure == "cancel" else BuildError):
+                            client.request("GET", client._url("/blobs/test"), client._scope("pull"), **kwargs)
+                    self.assertEqual(len(responses), 1)
+                    self.assertTrue(responses[0].isclosed(), "unread response still owns socket makefile")
+                    self.assertEqual(reader.fileno(), -1, "closing connection did not release response socket")
+                finally:
+                    for response in responses:
+                        response.close()
+                    connection.close()
+                    reader.close()
+                    writer.close()
 
     def test_registry_cancelled_stream_closes_connection_and_partial_file(self):
         client = RegistryClient("example.test/p/app:1")

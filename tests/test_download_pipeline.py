@@ -140,6 +140,54 @@ class DownloadPipelineTests(unittest.TestCase):
             sleep.assert_not_called()
             self.assertEqual(limiter.snapshot()[0], 0)
 
+    def test_artifactory_cancel_between_retries_discards_owned_prefix(self):
+        limiter = artifacts.AdaptiveLimiter(1)
+
+        class PartialResponse(Response):
+            def read(self, size=-1):
+                if self.tell():
+                    raise OSError("transfer interrupted")
+                return super().read(size)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stats = artifacts.TransferStats()
+            reply = PartialResponse(b"12")
+            with patch.object(artifacts, "request", return_value=reply) as request, \
+                    patch.object(artifacts.time, "sleep", side_effect=lambda _: limiter.cancel()):
+                with self.assertRaises(CancelledError):
+                    artifacts.download_one(object(), "https://example/repo/", "blob", root,
+                                           4, limiter, stats, Mock())
+            self.assertFalse((root / "blob").exists())
+            self.assertEqual(stats.snapshot(), 0)
+            self.assertTrue(reply.closed)
+            self.assertEqual(request.call_count, 1)
+            self.assertEqual(limiter.snapshot()[0], 0)
+
+    def test_artifactory_cancel_before_first_transfer_preserves_existing_file(self):
+        limiter = artifacts.AdaptiveLimiter(1)
+        acquire = limiter.acquire
+
+        def acquire_and_cancel():
+            acquire()
+            limiter.cancel()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            existing = root / "blob"
+            existing.write_bytes(b"1234")
+            stats = artifacts.TransferStats()
+            stats.add(4)
+            with patch.object(limiter, "acquire", side_effect=acquire_and_cancel), \
+                    patch.object(artifacts, "request") as request:
+                with self.assertRaises(CancelledError):
+                    artifacts.download_one(object(), "https://example/repo/", "blob", root,
+                                           4, limiter, stats, Mock())
+            self.assertEqual(existing.read_bytes(), b"1234")
+            self.assertEqual(stats.snapshot(), 4)
+            request.assert_not_called()
+            self.assertEqual(limiter.snapshot()[0], 0)
+
 
     def test_valid_resume_and_truncated_body(self):
         for truncated in (False, True):

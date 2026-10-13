@@ -186,10 +186,13 @@ class RegistryClient:
         if parsed.scheme == "https":
             kwargs["context"] = self.ssl_context
         connection = connection_type(parsed.netloc, **kwargs)
+        response = None
         try:
+            self._check_cancelled()
             connection.request(method, urlunsplit(("", "", parsed.path or "/", parsed.query, "")),
                                body=body, headers=headers)
             response = connection.getresponse()
+            self._check_cancelled()
             response_headers = {key.lower(): value for key, value in response.getheaders()}
             status = response.status
             if status in allowed and sink is not None:
@@ -199,8 +202,13 @@ class RegistryClient:
                     raise BuildError("Registry blob exceeds descriptor size")
                 with open(sink, "wb") as output:
                     total = 0
-                    for block in iter(lambda: response.read(BUFFER), b""):
+                    while True:
                         self._check_cancelled()
+                        block = response.read(BUFFER)
+                        self._check_cancelled()
+                        # EOF 也必须经过取消检查，最后一次进度回调可能已请求取消。
+                        if not block:
+                            break
                         total += len(block)
                         if max_stream_bytes is not None and total > max_stream_bytes:
                             raise BuildError("Registry blob exceeds descriptor size")
@@ -208,15 +216,23 @@ class RegistryClient:
                         callback = getattr(self, "progress", None)
                         if callback is not None:
                             callback(total, max_stream_bytes, "Downloading Registry blob")
+                self._check_cancelled()
                 return status, response_headers, b""
             raw = response.read(MAX_JSON + 1)
+            self._check_cancelled()
             if len(raw) > MAX_JSON:
                 raise BuildError("Registry response exceeds 16 MiB")
             return status, response_headers, raw
         except (OSError, http.client.HTTPException) as exc:
             raise BuildError("Registry transport failed: {}".format(exc)) from exc
         finally:
-            connection.close()
+            try:
+                # Connection: close/HTTP 1.0 会把 socket 所有权交给响应的 makefile。
+                # 未读到 EOF 的失败路径必须关闭响应，不能只关闭连接或等 traceback 被回收。
+                if response is not None:
+                    response.close()
+            finally:
+                connection.close()
 
     def _basic(self):
         if self.username is None or self.password is None:
@@ -285,8 +301,12 @@ class RegistryClient:
                 elif body is not None and not isinstance(body, bytes):
                     raise BuildError("Registry upload body cannot be retried after authentication")
                 self._check_cancelled()
+                # HTTP 字段名不区分大小写，不能把旧的显式头与新 Bearer 头一起发送。
+                authenticated = {key: value for key, value in sent.items()
+                                 if key.lower() != "authorization"}
+                authenticated["Authorization"] = "Bearer " + token
                 status, response_headers, raw = self._single(
-                    method, current, {**sent, "Authorization": "Bearer " + token},
+                    method, current, authenticated,
                     body, sink, set(allowed), max_stream_bytes)
             if status in (301, 302, 303, 307, 308) and method in ("GET", "HEAD"):
                 location = response_headers.get("location")

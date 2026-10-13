@@ -720,11 +720,13 @@ def download_one(opener, directory_url: str, name: str, root: Path,
             destination.unlink()
 
     limiter.acquire()
+    transfer_started = False
     try:
         for attempt in range(1, 4):
             limiter.check_cancelled()
             offset = destination.stat().st_size if destination.exists() else 0
             if destination.is_file() and expected_size is not None and offset == expected_size:
+                limiter.check_cancelled()
                 return offset
             if expected_size is not None and offset >= expected_size and offset != expected_size:
                 stats.add(-offset)
@@ -732,6 +734,7 @@ def download_one(opener, directory_url: str, name: str, root: Path,
                 offset = 0
             headers = {"Range": "bytes={}-".format(offset)} if offset else None
             try:
+                transfer_started = True
                 with request(opener, url, extra_headers=headers) as response:
                     resumed = offset > 0 and response.getcode() == 206
                     # HTTP 206 不保证响应起点与已有前缀一致；必须核对 Content-Range。
@@ -804,18 +807,13 @@ def download_one(opener, directory_url: str, name: str, root: Path,
                 limiter.check_cancelled()
                 return actual_size
             except CancelledError:
-                discard_partial()
                 raise
             except Exception as exc:
                 # 打开 wb 后即使一个字节都没收到，也会留下空文件。
                 # expected_size=0 时不能让下一次重试把它误判为成功下载的缓存。
                 if destination.exists() and destination.stat().st_size == 0:
                     discard_partial()
-                try:
-                    limiter.check_cancelled()
-                except CancelledError:
-                    discard_partial()
-                    raise
+                limiter.check_cancelled()
                 if attempt >= 3:
                     discard_partial()
                     raise
@@ -823,6 +821,12 @@ def download_one(opener, directory_url: str, name: str, root: Path,
                     name, attempt + 1, exc
                 ))
                 time.sleep(2)
+    except CancelledError:
+        # 取消也可能发生在重试等待期间；由整个尝试循环统一撤回本次传输残留。
+        # 尚未开始请求时，现有文件仍属于此前的缓存，不能因这次取消而删除。
+        if transfer_started:
+            discard_partial()
+        raise
     finally:
         limiter.release()
 
