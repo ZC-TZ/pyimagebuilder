@@ -697,6 +697,7 @@ def download_one(opener, directory_url: str, name: str, root: Path,
     """下载单个文件，临时中断时最多尝试三次。
 
     续传前核对 Content-Range，响应忽略 Range 时覆盖重下；范围或响应长度错误时丢弃前缀。
+    按已知长度限制读取，在每个读取检查点协作取消；未知长度仍需等到 EOF。
     这里只验证传输范围和大小，镜像 blob 摘要由后续导入或转换过程核对。
     """
     # 此函数也可被独立调用，不能只依赖目录列表阶段的 href 校验。
@@ -711,6 +712,13 @@ def download_one(opener, directory_url: str, name: str, root: Path,
             raise BuildError("Download destination traverses a link: " + str(current))
     destination.parent.mkdir(parents=True, exist_ok=True)
     url = urljoin(directory_url, quote(name, safe="/"))
+
+    def discard_partial():
+        """丢弃不可继续使用的前缀，同时撤回它在传输进度中的计数。"""
+        if destination.exists():
+            stats.add(-destination.stat().st_size)
+            destination.unlink()
+
     limiter.acquire()
     try:
         for attempt in range(1, 4):
@@ -752,17 +760,39 @@ def download_one(opener, directory_url: str, name: str, root: Path,
                         # 服务端忽略 Range，只能覆盖重下；修正已传输统计。
                         stats.add(-offset)
                         offset = 0
+                    length = response.headers.get("Content-Length", "")
+                    limits = []
+                    if expected_size is not None:
+                        limits.append(expected_size - offset)
+                    if range_length is not None:
+                        limits.append(range_length)
+                    if length.isdecimal():
+                        limits.append(int(length))
+                    response_limit = min(limits) if limits else None
                     mode = "ab" if resumed else "wb"
                     with destination.open(mode) as local:
                         received = 0
+                        overlong = False
                         while True:
-                            block = response.read(4 * 1024 * 1024)
+                            limiter.check_cancelled()
+                            # 多读一个字节即可证明超长，不能先把整个错误响应写进磁盘。
+                            read_size = 4 * 1024 * 1024
+                            if response_limit is not None:
+                                read_size = min(read_size, response_limit - received + 1)
+                            block = response.read(read_size)
+                            limiter.check_cancelled()
                             if not block:
+                                break
+                            if response_limit is not None and received + len(block) > response_limit:
+                                overlong = True
                                 break
                             local.write(block)
                             stats.add(len(block))
                             received += len(block)
-                    length = response.headers.get("Content-Length", "")
+                    if overlong:
+                        # 先关闭本地流，Windows 才允许删除不可续传的前缀。
+                        discard_partial()
+                        raise IOError("Artifactory response body exceeds declared size")
                     if ((range_length is not None and received != range_length) or
                             (length.isdecimal() and received != int(length))):
                         stats.add(-destination.stat().st_size)
@@ -771,13 +801,23 @@ def download_one(opener, directory_url: str, name: str, root: Path,
                 actual_size = destination.stat().st_size
                 if expected_size is not None and actual_size != expected_size:
                     raise IOError("文件大小不匹配：期望 {}，实际 {}".format(expected_size, actual_size))
+                limiter.check_cancelled()
                 return actual_size
+            except CancelledError:
+                discard_partial()
+                raise
             except Exception as exc:
+                # 打开 wb 后即使一个字节都没收到，也会留下空文件。
+                # expected_size=0 时不能让下一次重试把它误判为成功下载的缓存。
+                if destination.exists() and destination.stat().st_size == 0:
+                    discard_partial()
+                try:
+                    limiter.check_cancelled()
+                except CancelledError:
+                    discard_partial()
+                    raise
                 if attempt >= 3:
-                    partial_size = destination.stat().st_size if destination.exists() else 0
-                    if partial_size:
-                        stats.add(-partial_size)
-                        destination.unlink()
+                    discard_partial()
                     raise
                 display.log("文件 {} 下载中断，2 秒后第 {}/3 次重试：{}".format(
                     name, attempt + 1, exc

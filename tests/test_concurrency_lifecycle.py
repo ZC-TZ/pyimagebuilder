@@ -196,6 +196,63 @@ class ConcurrencyLifecycleTests(unittest.TestCase):
         finally:
             cleanup_reporter(reporter)
 
+    def test_failed_heartbeat_resume_preserves_body_error(self):
+        for primary in (BuildError("RUN failed"), KeyboardInterrupt()):
+            with self.subTest(primary=type(primary).__name__):
+                reporter = BuildReporter(Renderer())
+                reporter.start("test:1", "linux/amd64")
+                try:
+                    with patch("progress.reporter.threading.Thread.start",
+                               side_effect=RuntimeError("cannot start heartbeat")):
+                        with self.assertRaises(type(primary)) as raised:
+                            with reporter.pause_heartbeat():
+                                raise primary
+                    self.assertIs(raised.exception, primary)
+                    self.assertTrue(reporter.stop.is_set())
+                    self.assertEqual(reporter._paused, 0)
+                finally:
+                    cleanup_reporter(reporter)
+
+    def test_close_failure_preserves_active_error_but_is_not_silently_successful(self):
+        class BrokenClose(Renderer):
+            def close(self):
+                super().close()
+                raise OSError("close output failed")
+
+        for operation in ("start", "success", "fail", "finally"):
+            with self.subTest(operation=operation):
+                event = {"start": "build_start", "success": "build_success",
+                         "fail": "build_failed"}.get(operation)
+                renderer = BrokenClose(event)
+                reporter = BuildReporter(renderer)
+                primary = renderer.failure if event else KeyboardInterrupt()
+                try:
+                    with self.assertRaises(type(primary)) as raised:
+                        if operation == "start":
+                            reporter.start("test:1", "linux/amd64")
+                        else:
+                            reporter.start("test:1", "linux/amd64")
+                            if operation == "success":
+                                reporter.success()
+                            elif operation == "fail":
+                                reporter.fail(BuildError("RUN failed"))
+                            else:
+                                try:
+                                    raise primary
+                                finally:
+                                    reporter.close()
+                    self.assertIs(raised.exception, primary)
+                    self.assertTrue(reporter.finished)
+                    self.assertEqual(renderer.closes, 1)
+                    if reporter.thread is not None:
+                        self.assertFalse(reporter.thread.is_alive())
+                finally:
+                    cleanup_reporter(reporter)
+        reporter = BuildReporter(BrokenClose())
+        with self.assertRaisesRegex(OSError, "close output failed"):
+            reporter.close()
+
+
     def test_retry_after_interrupted_resume_cannot_revive_old_heartbeat(self):
         reporter = BuildReporter(Renderer(), heartbeat_interval=0.01)
         threads = []

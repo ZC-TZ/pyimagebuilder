@@ -10,6 +10,7 @@ import sys
 import tempfile
 import tarfile
 import unittest
+from concurrent.futures import CancelledError
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -38,6 +39,108 @@ class Response(io.BytesIO):
 
 
 class DownloadPipelineTests(unittest.TestCase):
+    def test_artifactory_overlong_body_is_bounded_and_retry_discards_prefix(self):
+        for constraint in ("size", "length", "range"):
+            with self.subTest(constraint=constraint), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                stats = artifacts.TransferStats()
+                headers = {"Content-Length": "4"} if constraint == "length" else {}
+                prefix = b"12" if constraint == "range" else b""
+                if prefix:
+                    (root / "blob").write_bytes(prefix)
+                    stats.add(len(prefix))
+                    headers = {"Content-Range": "bytes 2-3/4"}
+
+                class Overlong(Response):
+                    consumed = 0
+
+                    def read(self, size=-1):
+                        result = super().read(size)
+                        self.consumed += len(result)
+                        return result
+
+                first = Overlong(b"x" * 32768, 206 if prefix else 200, headers)
+                replies = [first, Response(b"1234", headers={"Content-Length": "4"})]
+                with patch.object(artifacts, "request", side_effect=replies) as request, \
+                        patch.object(artifacts.time, "sleep"):
+                    size = artifacts.download_one(object(), "https://example/repo/", "blob", root,
+                                                  4 if constraint == "size" else None,
+                                                  artifacts.AdaptiveLimiter(1), stats, Mock())
+                self.assertLessEqual(first.consumed, 4 - len(prefix) + 1)
+                self.assertTrue(first.closed)
+                self.assertEqual(request.call_count, 2)
+                self.assertEqual(size, 4)
+                self.assertEqual((root / "blob").read_bytes(), b"1234")
+                self.assertEqual(stats.snapshot(), 4)
+
+    def test_artifactory_cancel_during_read_does_not_write_or_retry(self):
+        limiter = artifacts.AdaptiveLimiter(1)
+
+        class CancelResponse(Response):
+            def read(self, size=-1):
+                result = super().read(size)
+                limiter.cancel()
+                return result
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stats = artifacts.TransferStats()
+            reply = CancelResponse(b"1234")
+            with patch.object(artifacts, "request", return_value=reply) as request, \
+                    patch.object(artifacts.time, "sleep") as sleep:
+                with self.assertRaises(CancelledError):
+                    artifacts.download_one(object(), "https://example/repo/", "blob", root,
+                                           4, limiter, stats, Mock())
+            self.assertFalse((root / "blob").exists())
+            self.assertEqual(stats.snapshot(), 0)
+            self.assertTrue(reply.closed)
+            self.assertEqual(request.call_count, 1)
+            sleep.assert_not_called()
+            self.assertEqual(limiter.snapshot()[0], 0)
+
+    def test_artifactory_repeated_overlong_empty_response_leaves_no_partial(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stats = artifacts.TransferStats()
+            replies = [Response(b"unexpected") for _ in range(3)]
+            with patch.object(artifacts, "request", side_effect=replies) as request, \
+                    patch.object(artifacts.time, "sleep"):
+                with self.assertRaisesRegex(OSError, "exceeds declared size"):
+                    artifacts.download_one(object(), "https://example/repo/", "blob", root,
+                                           0, artifacts.AdaptiveLimiter(1), stats, Mock())
+            self.assertEqual(request.call_count, 3)
+            self.assertFalse((root / "blob").exists())
+            self.assertEqual(stats.snapshot(), 0)
+            self.assertTrue(all(reply.closed for reply in replies))
+
+
+    def test_artifactory_cancel_after_transport_failure_discards_resume_prefix(self):
+        limiter = artifacts.AdaptiveLimiter(1)
+
+        class CancelResponse(Response):
+            def read(self, size=-1):
+                limiter.cancel()
+                raise OSError("transport failed while cancelling")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "blob").write_bytes(b"12")
+            stats = artifacts.TransferStats()
+            stats.add(2)
+            reply = CancelResponse(b"", 206, {"Content-Range": "bytes 2-3/4"})
+            with patch.object(artifacts, "request", return_value=reply) as request, \
+                    patch.object(artifacts.time, "sleep") as sleep:
+                with self.assertRaises(CancelledError):
+                    artifacts.download_one(object(), "https://example/repo/", "blob", root,
+                                           4, limiter, stats, Mock())
+            self.assertFalse((root / "blob").exists())
+            self.assertEqual(stats.snapshot(), 0)
+            self.assertTrue(reply.closed)
+            self.assertEqual(request.call_count, 1)
+            sleep.assert_not_called()
+            self.assertEqual(limiter.snapshot()[0], 0)
+
+
     def test_valid_resume_and_truncated_body(self):
         for truncated in (False, True):
             with self.subTest(truncated=truncated), tempfile.TemporaryDirectory() as temporary:
@@ -65,6 +168,25 @@ class DownloadPipelineTests(unittest.TestCase):
                                               artifacts.TransferStats(), Mock())
             self.assertEqual(size, 0)
             self.assertTrue((root / "empty").is_file())
+
+    def test_zero_byte_transport_failure_cannot_become_a_size_cache_hit(self):
+        class FailedResponse(Response):
+            def read(self, size=-1):
+                raise OSError("empty transfer failed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            replies = [FailedResponse(b"") for _ in range(3)]
+            with patch.object(artifacts, "request", side_effect=replies) as request, \
+                    patch.object(artifacts.time, "sleep"):
+                with self.assertRaisesRegex(OSError, "empty transfer failed"):
+                    artifacts.download_one(object(), "https://example/repo/", "empty", root,
+                                           0, artifacts.AdaptiveLimiter(1),
+                                           artifacts.TransferStats(), Mock())
+            self.assertEqual(request.call_count, 3)
+            self.assertFalse((root / "empty").exists())
+            self.assertTrue(all(reply.closed for reply in replies))
+
 
     def test_wrong_range_response_restarts_without_corrupt_prefix(self):
         with tempfile.TemporaryDirectory() as temporary:

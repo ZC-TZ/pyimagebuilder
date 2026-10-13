@@ -96,21 +96,30 @@ class BuildReporter:
 
     def close(self):
         """幂等结束输出并回收心跳线程；不能持有事件锁等待工作线程。"""
+        # finally/except 中的输出收尾不能覆盖 RUN、渲染或用户取消的原始异常。
+        # 单独调用 close 时仍报告关闭失败，避免把正常路径的输出故障当成成功。
+        unwinding = sys.exc_info()[0] is not None
         try:
-            with self.lock:
-                self.stop.set()
-                self.finished = True
-                if not self._closed:
-                    self._closed = True
-                    self.renderer.close()
-        finally:
-            thread = self.thread
-            if (thread is not None and thread.ident is not None and
-                    thread is not threading.current_thread()):
-                thread.join()
-            # 关闭后不再持有异常 traceback；它可能间接保留整个失败构建的输入对象。
-            with self.lock:
-                self._render_error = None
+            try:
+                with self.lock:
+                    self.stop.set()
+                    self.finished = True
+                    if not self._closed:
+                        self._closed = True
+                        self.renderer.close()
+            finally:
+                try:
+                    thread = self.thread
+                    if (thread is not None and thread.ident is not None and
+                            thread is not threading.current_thread()):
+                        thread.join()
+                finally:
+                    # 关闭后不再持有异常 traceback；它可能保留整个失败构建的输入对象。
+                    with self.lock:
+                        self._render_error = None
+        except BaseException:
+            if not unwinding:
+                raise
 
     @contextmanager
     def pause_heartbeat(self):
@@ -123,12 +132,16 @@ class BuildReporter:
             self._paused += 1
             self.stop.set()
             thread = self.thread
+        failed = False
         try:
             if thread is not None and thread.ident is not None:
                 if thread is threading.current_thread():
                     raise RuntimeError("Cannot pause heartbeat from its own thread")
                 thread.join()
             yield
+        except BaseException:
+            failed = True
+            raise
         finally:
             with self.lock:
                 self._paused -= 1
@@ -138,7 +151,9 @@ class BuildReporter:
                             self._start_heartbeat()
                         except BaseException:
                             self.stop.set()
-                            raise
+                            # 仅恢复失败时报告它；RUN 已失败时保留原始异常身份。
+                            if not failed:
+                                raise
 
     def phase_start(self, message):
         """标记 Dockerfile 指令以外的阶段，如下载或导出。"""
