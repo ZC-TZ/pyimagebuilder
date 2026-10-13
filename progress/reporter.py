@@ -67,17 +67,22 @@ class BuildReporter:
                 self._emit("build_start", details={"image": image, "platform": platform, "mode": mode})
                 if self._paused:
                     return
-                self.stop.clear()
-                self.thread = threading.Thread(target=self._heartbeat, daemon=True)
-                self.thread.start()
+                self._start_heartbeat()
         except BaseException:
             if initialized:
                 self.close()
             raise
 
-    def _heartbeat(self):
+    def _start_heartbeat(self):
+        """在事件锁内创建一代心跳；旧代的停止信号不能被恢复操作清除。"""
+        self.stop = threading.Event()
+        stopped = self.stop
+        self.thread = threading.Thread(target=lambda: self._heartbeat(stopped), daemon=True)
+        self.thread.start()
+
+    def _heartbeat(self, stopped):
         try:
-            while not self.stop.wait(self.heartbeat_interval):
+            while not stopped.wait(self.heartbeat_interval):
                 with self.lock:
                     if self.active and self.active_since is not None and not self.finished:
                         duration = time.monotonic() - self.active_since
@@ -87,7 +92,7 @@ class BuildReporter:
             with self.lock:
                 if self._render_error is None and not self.finished:
                     self._render_error = exc
-                self.stop.set()
+                stopped.set()
 
     def close(self):
         """幂等结束输出并回收心跳线程；不能持有事件锁等待工作线程。"""
@@ -128,11 +133,9 @@ class BuildReporter:
             with self.lock:
                 self._paused -= 1
                 if not self._paused and not self.finished and self._render_error is None:
-                    self.stop.clear()
                     if self._started:
-                        self.thread = threading.Thread(target=self._heartbeat, daemon=True)
                         try:
-                            self.thread.start()
+                            self._start_heartbeat()
                         except BaseException:
                             self.stop.set()
                             raise

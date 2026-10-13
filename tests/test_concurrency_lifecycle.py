@@ -196,6 +196,60 @@ class ConcurrencyLifecycleTests(unittest.TestCase):
         finally:
             cleanup_reporter(reporter)
 
+    def test_retry_after_interrupted_resume_cannot_revive_old_heartbeat(self):
+        reporter = BuildReporter(Renderer(), heartbeat_interval=0.01)
+        threads = []
+        thread_type = threading.Thread
+        arrived, resume = threading.Event(), threading.Event()
+        interrupted = KeyboardInterrupt()
+
+        class DelayedThread(thread_type):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.wait_started = self._started.wait
+
+                def interrupted_wait(*_args, **_kwargs):
+                    if not arrived.wait(5):
+                        raise AssertionError("native heartbeat bootstrap did not arrive")
+                    raise interrupted
+                self._started.wait = interrupted_wait
+
+            def _bootstrap(self):
+                arrived.set()
+                resume.wait(5)
+                super()._bootstrap()
+
+        def factory(**kwargs):
+            kind = DelayedThread if len(threads) == 1 else thread_type
+            thread = kind(**kwargs)
+            threads.append(thread)
+            return thread
+
+        try:
+            with patch("progress.reporter.threading.Thread", side_effect=factory):
+                reporter.start("test:1", "linux/amd64")
+                with self.assertRaises(KeyboardInterrupt) as failure:
+                    with reporter.pause_heartbeat():
+                        pass
+                self.assertIs(failure.exception, interrupted)
+                self.assertIsNone(threads[1].ident)
+                # 调用方处理启动失败后再次暂停/恢复；旧代必须保持永久停止。
+                with reporter.pause_heartbeat():
+                    pass
+            self.assertEqual(len(threads), 3)
+            self.assertIs(reporter.thread, threads[2])
+            resume.set()
+            self.assertTrue(threads[1].wait_started(5))
+            threads[1].join(0.2)
+            self.assertFalse(threads[1].is_alive(), "retry revived an untracked heartbeat generation")
+            self.assertTrue(threads[2].is_alive())
+            reporter.log("reporter still works after retry")
+        finally:
+            resume.set()
+            if len(threads) > 1:
+                threads[1].wait_started(5)
+            cleanup_reporter(reporter, threads)
+
     def test_concurrent_terminal_calls_emit_only_one_result(self):
         renderer = Renderer()
         reporter = BuildReporter(renderer)

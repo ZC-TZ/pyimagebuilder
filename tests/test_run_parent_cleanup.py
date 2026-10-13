@@ -55,6 +55,8 @@ class RunParentCleanupTests(unittest.TestCase):
 
         def factory(**kwargs):
             index = len(threads)
+            if mode == "construct" and index == fail_thread:
+                raise error
             thread = FailedThread(**kwargs) if mode == "thread" and index == fail_thread else thread_type(**kwargs)
             threads.append(thread)
             return thread
@@ -109,6 +111,94 @@ class RunParentCleanupTests(unittest.TestCase):
         for index in (0, 1):
             with self.subTest(index=index):
                 self.run_failure("thread", fail_thread=index)
+
+    def test_log_thread_constructor_failure_cancels_pending_handoff(self):
+        for index in (0, 1):
+            with self.subTest(index=index):
+                self.run_failure("construct", fail_thread=index)
+
+    def test_interrupted_thread_bootstrap_cannot_consume_a_reused_descriptor(self):
+        # 模拟 OS 已创建线程、Python 尚未登记 ident 时 start 的握手被中断。
+        # 后续 FD 立即用于其他操作，迟启动的日志线程不能打开或关闭它。
+        for delayed_index in (0, 1):
+            with self.subTest(stream=delayed_index):
+                pairs = [os.pipe() for _ in range(3)]
+                descriptors = [fd for pair in pairs for fd in pair]
+                threads, callbacks = [], []
+                arrived, resume = threading.Event(), threading.Event()
+                thread_type = threading.Thread
+                interrupted = KeyboardInterrupt()
+                replacement_read = replacement_write = None
+
+                class DelayedThread(thread_type):
+                    def __init__(self, **kwargs):
+                        super().__init__(**kwargs)
+                        self.wait_started = self._started.wait
+
+                        def interrupted_wait(*_args, **_kwargs):
+                            if not arrived.wait(5):
+                                raise AssertionError("native bootstrap did not arrive")
+                            raise interrupted
+                        self._started.wait = interrupted_wait
+
+                    def _bootstrap(self):
+                        arrived.set()
+                        resume.wait(5)
+                        super()._bootstrap()
+
+                def factory(**kwargs):
+                    kind = DelayedThread if len(threads) == delayed_index else thread_type
+                    thread = kind(**kwargs)
+                    threads.append(thread)
+                    return thread
+
+                runner = object.__new__(executor.RunExecutor)
+                runner.network, runner.sandbox = "none", "legacy"
+                runner.log = lambda *values: callbacks.append(values)
+                late_fd = pairs[delayed_index + 1][0]
+                try:
+                    with patch.object(executor, "_fork_with_pipes", return_value=(123456, *pairs)), \
+                            patch.object(executor, "_abort_run") as abort, \
+                            patch.object(threading, "Thread", side_effect=factory):
+                        with self.assertRaises(KeyboardInterrupt) as failure:
+                            runner.execute(SimpleNamespace(), Command(True, "true"), {}, "/", "", ["/bin/sh", "-c"])
+                    self.assertIs(failure.exception, interrupted)
+                    abort.assert_called_once_with(123456)
+                    self.assertIsNone(threads[-1].ident)
+                    replacement_read, replacement_write = os.pipe()
+                    if replacement_write == late_fd:
+                        replacement_write = os.dup(replacement_write)
+                    if replacement_read != late_fd:
+                        os.dup2(replacement_read, late_fd)
+                        os.close(replacement_read)
+                    replacement_read = None
+                    payload = b"data owned by another operation\n"
+                    os.write(replacement_write, payload)
+                    os.close(replacement_write)
+                    replacement_write = None
+                    resume.set()
+                    self.assertTrue(threads[-1].wait_started(5))
+                    for thread in threads:
+                        thread.join(5)
+                        self.assertFalse(thread.is_alive())
+                    try:
+                        os.fstat(late_fd)
+                    except OSError:
+                        self.fail("late log thread closed a descriptor owned by another operation")
+                    self.assertEqual(os.read(late_fd, len(payload)), payload)
+                    self.assertEqual(callbacks, [])
+                finally:
+                    resume.set()
+                    for thread in threads:
+                        if isinstance(thread, DelayedThread):
+                            thread.wait_started(5)
+                        if thread.ident is not None:
+                            thread.join(5)
+                    for fd in descriptors + [fd for fd in (replacement_read, replacement_write) if fd is not None]:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
 
     def test_waitpid_failure_does_not_skip_pipe_cleanup(self):
         self.run_failure("wait")

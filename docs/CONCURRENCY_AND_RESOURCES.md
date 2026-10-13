@@ -31,6 +31,8 @@
 
 `BuildReporter.start()` 只允许调用一次。`success()`、`fail()` 和 `close()` 都结束心跳，关闭渲染器；并发终态调用最多发布一个终态事件。join 在事件锁外进行，未启动线程和当前线程不被 join。后台输出失败由下一次前台输出报告，不能静默当成成功。
 
+每一代心跳绑定独立的停止事件。暂停时永久停止旧代，恢复时创建新事件；恢复过程的线程启动握手被中断后再重试，也不会清除旧代的停止标记、复活已失去句柄的心跳线程。
+
 CLI 在 finally 中调用 close，覆盖主线程异常、KeyboardInterrupt 和 WSL 提前返回。库调用者仍需负责资源生命周期：
 
 ```python
@@ -56,6 +58,10 @@ Python 官方明确指出，多线程进程中的 fork 不安全；Python 3.12 �
 这不是任意宿主中的 fork 安全保证：原生 C 线程及并发创建线程不能由这个检查完整覆盖。含 RUN 的集成请使用独立 Python CLI 进程。普通无 RUN 构建不受这一限制。
 
 父进程遇到取消或准备错误时，请求 supervisor 清理 namespace init，回收 supervisor，再清理管道和日志线程。supervisor 先确认 runner 尚未被回收，再发送 SIGKILL、waitpid；不会向已回收的旧 PID 发信号。Linux 的 PID namespace init 被终止后，内核会终止其中其他进程，包括另建 session 的后台程序。[Linux PID namespaces 文档](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html)
+
+日志线程通过锁保护的交接表领取管道，父进程也在同一把锁下撤销未领取的交接，再关闭仍归自己所有的描述符。`ident` 只用于判断是否可以 join，不能证明操作系统尚未创建线程。线程启动握手被中断时，迟启动的线程不会打开已释放、可能已被其他操作复用的描述符。
+
+尚未完成 Python bootstrap 的原生线程不能立即 join；它恢复调度后会看到交接撤销或自己那一代的停止事件并退出。短暂存续期间，执行器的活跃线程检查仍可能拒绝新的 RUN，不承诺强制终止线程调度。
 
 该流程已有系统调用替身测试，真实内核行为仍需下一节验收。不保证硬杀父进程、supervisor 被外部 SIGKILL、机器断电、重复中断或长期不可中断内核调用后的清理。Windows 到 WSL 的外层取消也需单独现场验证。
 

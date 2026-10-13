@@ -489,15 +489,17 @@ class RunExecutor:
                 _exit_with_diagnostics(write_fd)
         owned_fds = {fd for pair in (diagnostic_pipe, stdout_pipe, stderr_pipe)
                      for fd in pair if fd is not None}
+        fd_owner_lock = threading.Lock()
+        pending_log_fds = set()
         log_threads = []
-        log_thread_fds = {}
         log_errors = []
         log_error_lock = threading.Lock()
         log_failed = threading.Event()
         reaped = False
 
         def close_owned(fd):
-            owned_fds.discard(fd)
+            with fd_owner_lock:
+                owned_fds.discard(fd)
             os.close(fd)
 
         def record_log_error(source, error):
@@ -508,6 +510,13 @@ class RunExecutor:
 
         def forward_logs(fd, source):
             try:
+                # start 握手被中断时，原生线程可能已创建而 ident 尚未登记。
+                # 只有领到所有权才可打开 FD；取消先撤销交接，迟启动线程直接退出。
+                with fd_owner_lock:
+                    if fd not in pending_log_fds:
+                        return
+                    pending_log_fds.remove(fd)
+                    owned_fds.discard(fd)
                 with fdopen_owned(fd, "rb") as output_stream:
                     for line in _iter_run_log_fragments(output_stream):
                         if log_failed.is_set():
@@ -526,13 +535,14 @@ class RunExecutor:
                 close_owned(log_write)
                 close_owned(err_write)
                 for fd, source in ((log_read, "stdout"), (err_read, "stderr")):
+                    with fd_owner_lock:
+                        pending_log_fds.add(fd)
                     thread = threading.Thread(target=forward_logs, args=(fd, source), daemon=True)
                     log_threads.append(thread)
-                    log_thread_fds[thread] = fd
                     thread.start()
-                    owned_fds.discard(fd)
             # fdopen_owned 失败也会关闭描述符，不能在 finally 中再次关闭它。
-            owned_fds.discard(read_fd)
+            with fd_owner_lock:
+                owned_fds.discard(read_fd)
             with fdopen_owned(read_fd, "rb") as stream:
                 diagnostics = _read_run_diagnostics(stream)
             _, status = _wait_child(pid)
@@ -553,11 +563,12 @@ class RunExecutor:
                 _abort_run(pid)
             raise
         finally:
-            # start 被中断时线程可能已启动；以 ident 判定所有权，不 join 未启动的线程。
-            for thread, fd in log_thread_fds.items():
-                if thread.ident is not None:
-                    owned_fds.discard(fd)
-            for fd in owned_fds:
+            # 领取与撤销使用同一把锁；ident 只决定可否 join，不再决定 FD 所有权。
+            with fd_owner_lock:
+                pending_log_fds.clear()
+                remaining_fds = tuple(owned_fds)
+                owned_fds.clear()
+            for fd in remaining_fds:
                 try:
                     os.close(fd)
                 except OSError:
