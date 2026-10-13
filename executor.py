@@ -1,5 +1,6 @@
 """在 Linux namespace 和镜像 rootfs 中实际执行 RUN。"""
 
+import codecs
 import ctypes
 import os
 import platform
@@ -29,6 +30,56 @@ MS_NOEXEC = 8
 PR_SET_NO_NEW_PRIVS = 38
 PR_CAPBSET_DROP = 24
 LINUX_CAPABILITY_VERSION_3 = 0x20080522
+RUN_LOG_FRAGMENT_BYTES = 64 * 1024
+RUN_DIAGNOSTIC_BYTES = 256 * 1024
+
+
+def _iter_run_log_fragments(stream):
+    """按有限字节读取日志；长行可提前转发，UTF-8 跨段字符保持完整。"""
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    pending_cr = ""
+    while True:
+        # 给上一段尚未完成的字符和 CR 留位置，单段缓冲不随整行长度增长。
+        size = RUN_LOG_FRAGMENT_BYTES - len(decoder.getstate()[0]) - len(pending_cr)
+        raw = stream.readline(size)
+        if not raw:
+            tail = pending_cr + decoder.decode(b"", final=True)
+            if tail:
+                yield tail.rstrip("\r\n")
+            return
+        complete = raw.endswith(b"\n") or len(raw) < size
+        text = pending_cr + decoder.decode(raw, final=complete)
+        pending_cr = ""
+        if complete:
+            decoder.reset()
+            yield text.rstrip("\r\n")
+        else:
+            # CRLF 恰好跨读取边界时，不把换行的 CR 当作可见内容转发。
+            if text.endswith("\r"):
+                pending_cr, text = "\r", text[:-1]
+            if text:
+                yield text
+
+
+def _read_run_diagnostics(stream):
+    """排空诊断管道，仅保留有限的开头和结尾，兼顾调用栈与最终失败原因。"""
+    head = None
+    retained = bytearray()
+    half = RUN_DIAGNOSTIC_BYTES // 2
+    while True:
+        chunk = stream.read(RUN_LOG_FRAGMENT_BYTES)
+        if not chunk:
+            break
+        retained.extend(chunk)
+        if head is None and len(retained) > RUN_DIAGNOSTIC_BYTES:
+            head = bytes(retained[:half])
+        if head is not None:
+            del retained[:-half]
+    if head is None:
+        raw = bytes(retained)
+    else:
+        raw = head + b"\n...[RUN diagnostics truncated]...\n" + bytes(retained)
+    return raw.decode("utf-8", "replace")
 
 
 class _CapHeader(ctypes.Structure):
@@ -365,11 +416,11 @@ class RunExecutor:
                 try:
                     output_stream = os.fdopen(fd, "rb")
                     with output_stream:
-                        for line in output_stream:
+                        for line in _iter_run_log_fragments(output_stream):
                             if log_failed.is_set():
                                 continue
                             try:
-                                log_callback(line.decode("utf-8", "replace").rstrip("\r\n"), source)
+                                log_callback(line, source)
                             except BaseException as exc:
                                 # 回调失败后继续排空两个管道，避免改变 RUN 的输出与退出行为。
                                 # 线程中的异常交给等待结束后的主线程报告，不能静默判为成功。
@@ -387,7 +438,7 @@ class RunExecutor:
             for thread in log_threads:
                 thread.start()
         with os.fdopen(read_fd, "rb") as stream:
-            diagnostics = stream.read().decode("utf-8", "replace")
+            diagnostics = _read_run_diagnostics(stream)
         _, status = os.waitpid(pid, 0)
         if log_callback is not None:
             for thread in log_threads:

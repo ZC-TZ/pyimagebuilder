@@ -234,6 +234,11 @@ repositories
 命令本身的非零退出优先于日志异常；命令成功但日志回调失败仍抛出 BuildError，因此调用方不会生成或缓存该 RUN 层。
 管道本身的读取异常也需传回主线程，但不能保证损坏的管道可继续排空；主线程取消流程不在此规则的覆盖范围。
 
+日志读取使用有界 readline（最多 64 KiB）及增量 UTF-8 解码；没有换行的长输出也能在 EOF 前分段转发。
+分段不截断日志内容，但不保留超长行的单事件边界；CRLF 跨段时保留换行语义。
+诊断管道按固定大小读取到 EOF，保留不超过 256 KiB 的首尾字节与截断提示，避免异常文本无限占用内存。
+诊断截断点落在多字节字符内部时允许出现替换字符；日志回调的存储与阻塞行为不受执行器缓冲上限约束。
+
 1. 在 Linux 上，从已校验的 base layers 和 Phase 1 新层安全还原真实 rootfs，依次应用 OCI whiteout，保留 uid/gid、mode、mtime、链接和可表示的 xattr。拒绝越界路径。Windows 原生模式不物化 Linux rootfs。
 2. 为每条 `RUN` fork 子进程，在子进程中 unshare mount/PID namespace，默认也 unshare network namespace；把 mount 传播设为 private 后，挂载只读 lower rootfs、同文件系统上的 `upperdir/workdir` 与 `merged`。OverlayFS 不可用时失败。父构建进程不进入这些 namespace。
 3. 在命名空间内挂载最小 `/proc`、tmpfs `/dev`、`/dev/pts`，chroot 到 merged，然后按 Dockerfile 当前 `ENV`、`WORKDIR`、`USER`、`SHELL` 执行命令。PID namespace 在 unshare 后 fork；等待并传播退出码，非零即失败。子进程退出时命名空间内的挂载消失。`/sys`、DNS 注入和 cgroup 资源限制尚未实现；seccomp 收紧由前述 hardened/rootless 沙箱负责。

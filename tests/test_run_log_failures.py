@@ -18,7 +18,7 @@ from executor import RunExecutor
 
 class RunLogFailureTests(unittest.TestCase):
     def execute_with_output(self, callback, outputs, diagnostics=b"", exit_code=0,
-                            stream_fault=None):
+                            stream_fault=None, write_gate=None):
         """模拟子进程写端，仍使用执行器的真实读端及日志线程。"""
         descriptors, pairs, writers, log_threads = [], [], [], []
         writer_errors, thread_errors, written = [], [], {}
@@ -38,6 +38,8 @@ class RunLogFailureTests(unittest.TestCase):
                 offset = 0
                 while offset < len(payload):
                     offset += os.write(fd, payload[offset:offset + 4096])
+                    if write_gate is not None and source == "stdout" and offset == 64 * 1024:
+                        self.assertTrue(write_gate.wait(2), "No log fragment before output EOF")
                 written[source] = offset
             except BaseException as exc:
                 writer_errors.append((source, exc))
@@ -88,6 +90,9 @@ class RunLogFailureTests(unittest.TestCase):
                     stream.close()
 
                 def __iter__(self):
+                    raise error
+
+                def readline(self, size=-1):
                     raise error
 
             return BrokenReader()
