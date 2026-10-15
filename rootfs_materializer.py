@@ -8,7 +8,7 @@ import tarfile
 from pathlib import Path
 
 from errors import ArchiveError, BuildError
-from permissions import validate_metadata
+from permissions import normalized_metadata, validate_metadata
 from compat import is_linked_directory
 from file_resources import fdopen_owned
 from rootfs import clean_path, validate_layer_paths
@@ -113,16 +113,17 @@ class RootFSMaterializer:
 
     def _validate_ownership(self, member):
         """写盘前检查属主、xattr 编码及 RUN 保留属性，拒绝 chown 哨兵值。"""
-        validate_metadata(member, materialize=True)
+        mode = validate_metadata(member, materialize=True)
         prefix = "SCHILY.xattr." + ("user.overlay." if self.rootless else "trusted.overlay.")
         if any(key.startswith(prefix) for key in member.pax_headers):
             # 来自归档的普通属性不能在下次挂载中变成内核 whiteout/opaque/metacopy。
             raise BuildError("Image layer contains reserved OverlayFS xattr for RUN: " + member.name)
         if self.rootless and (member.uid != 0 or member.gid != 0):
             raise BuildError("Rootless RUN supports only uid/gid 0 in image layers: " + member.name)
+        return mode
 
     def _metadata(self, path, member, symlink=False):
-        self._validate_ownership(member)
+        mode = self._validate_ownership(member)
         try:
             if self.rootless:
                 if hasattr(os, "chown"):
@@ -144,7 +145,7 @@ class RootFSMaterializer:
         try:
             # ACL xattr 会修改 mode；chown/xattr 完成后再恢复头中的 setuid/setgid/sticky。
             if not symlink:
-                os.chmod(path, member.mode, follow_symlinks=False)
+                os.chmod(path, mode, follow_symlinks=False)
             os.utime(path, (member.mtime, member.mtime), follow_symlinks=False)
         except (OSError, NotImplementedError, OverflowError, ValueError) as exc:
             raise BuildError("Cannot preserve layer mode/time for {}: {}".format(path, exc)) from exc
@@ -152,7 +153,7 @@ class RootFSMaterializer:
     def apply(self, layer_path):
         """应用镜像层并保留元数据，始终检查 rootfs 路径边界。"""
         with tarfile.open(layer_path, "r:") as archive:
-            members = [(clean_path(member.name), member) for member in archive]
+            members = [(clean_path(member.name), normalized_metadata(member)) for member in archive]
             seen = set()
             for name, _ in members:
                 if name in seen:

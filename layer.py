@@ -17,7 +17,7 @@ from image_reader import sha256_file
 from image_identity import checked_identity_id
 from rootfs import clean_path
 from path_policy import container_path, host_components
-from permissions import validate_metadata
+from permissions import normalized_metadata, validate_metadata
 
 
 def _safe_name(name):
@@ -365,7 +365,7 @@ class LayerBuilder:
                 if not (member.isdir() or member.isfile() or member.issym() or member.islnk() or
                         member.isfifo() or member.ischr() or member.isblk()):
                     raise UnsupportedInstruction("Unsupported ADD archive member: " + name)
-                members.append((name, member))
+                members.append((name, normalized_metadata(member)))
             regular = {name for name, member in members if member.isfile()}
             symlinks = {name for name, member in members if member.issym()}
             for name, member in members:
@@ -568,7 +568,7 @@ class LayerBuilder:
             if not entry.layer:
                 return None
             with tarfile.open(entry.layer, "r:") as original:
-                return original.getmember(entry.member)
+                return normalized_metadata(original.getmember(entry.member))
 
         def file_entry(path):
             seen = set()

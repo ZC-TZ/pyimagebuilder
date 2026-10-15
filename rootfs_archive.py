@@ -26,6 +26,7 @@ from image_store import _archive_path, default_store
 from image_writer import ImageArchiveWriter
 from oci_writer import OCIImageWriter
 from platforms import architecture, normalize_platform
+from permissions import normalized_metadata
 from progress import make_reporter
 from registry import parse_reference
 from reproducible import parse_epoch, timestamp
@@ -65,7 +66,7 @@ def _supported(member):
 
 def _header(member, name):
     """复制镜像元数据；改名时移除旧路径/大小覆盖，稀疏文件展开为普通文件。"""
-    result = copy.copy(member)
+    result = copy.copy(normalized_metadata(member))
     result.name = name
     result.pax_headers = {key: value for key, value in member.pax_headers.items()
                           if key not in ("path", "linkpath", "size") and

@@ -24,6 +24,12 @@
 
 build 出错需要更多上下文时加 `--debug`；持续集成建议 `--progress plain`。其他入口先查看其 `--help`，并非所有子命令都有同样参数。
 
+## Invalid layer permission mode: 16877
+
+`16877` 是八进制 `040755`，包含目录类型位和 `0755` 权限。旧版把完整 st_mode 当成纯权限而拒绝，可能在基础镜像已成功下载后，于 FROM 失败。
+
+更新代码后，匹配 tar typeflag 的类型位仅在内存中去除，保留 setuid/setgid/sticky；原始层、DiffID 和基础镜像配置字节保持不变。类型冲突、未知高位、负数和非整数仍拒绝。不要修改基础镜像、把权限改成 777 或删除镜像库；保持原 config.json 与 data/image-store，再执行原打包命令即可复用已下载镜像。
+
 ## 为什么改了配置却没生效
 
 当前目录可能有另一份 config.json，或 `PYIMAGEBUILDER_CONFIG` 指向别处。使用显式 `--config` 确认文件，并核对相对路径的基准：配置文件目录，而不是 main.py 目录或包所在目录。

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from errors import ArchiveError
 from path_policy import archive_path, container_path
-from permissions import merge_metadata, validate_metadata
+from permissions import merge_metadata, normalized_metadata, validate_metadata
 
 
 @dataclass
@@ -163,6 +163,7 @@ class RootFSIndex:
             members = []
             seen = set()
             for member in archive:
+                member = normalized_metadata(member)
                 path = clean_path(member.name)
                 if path in seen:
                     raise ArchiveError("Duplicate path in layer: " + (path or "."))
