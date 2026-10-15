@@ -1029,6 +1029,7 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
                 raise RuntimeError("config.rootfs.diff_ids 数量与 manifest.layers 不一致")
             layer_paths = []
             for index, (descriptor, diff_id) in enumerate(zip(descriptors, diff_ids), 1):
+                layer_started = time.monotonic()
                 if not isinstance(descriptor, dict):
                     raise RuntimeError("Registry manifest 的 layer descriptor 格式无效")
                 blob = find_blob(raw_root, descriptor.get("digest"), "layer.digest")
@@ -1039,9 +1040,13 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
                 materialize_layer(blob, decoded, str(descriptor.get("mediaType", "")),
                                   diff_id, index, len(descriptors), display,
                                   descriptor.get("digest"))
+                decoded_size = decoded.stat().st_size
                 cas_store.store_decoded_layer(decoded, diff_id)
                 decoded.unlink()
                 layer_paths.append(blob)
+                # 高频字节进度仍节流，但每层成功入库后必须留一条持久完成记录。
+                display.log("转换镜像层 {}/{} | 完成（解包、校验、入库） | {} | {:.2f}s".format(
+                    index, len(descriptors), format_size(decoded_size), time.monotonic() - layer_started))
         else:
             decoded_layers = convert_registry_to_docker_archive(
                 raw_root, archive_root, image_reference, display)
@@ -1066,6 +1071,8 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
         if cas_only:
             # 保留基础镜像入口对 media type 与配置的检查；层内容已在发布前验证。
             cas_store.open_base(image_reference, target_platform, "artifactory")
+            display.log("镜像层准备完成：{}/{} 层，基础镜像已写入 CAS".format(
+                len(descriptors), len(descriptors)))
             return
         display.log("格式转换完成，耗时 {}；开始生成 Docker tar…".format(
             format_duration(conversion_elapsed)))
