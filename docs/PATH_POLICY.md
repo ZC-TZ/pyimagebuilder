@@ -62,7 +62,7 @@ URL 的路径按 POSIX 规则处理，不使用宿主系统 Path 推断文件名
 cas inspect --source 和 save --source 等指定单一来源的读取只检查所选来源；普通 pull 仍按既有规则先检查 local 来源。
 --replace 可替换普通文件中的损坏 ref 内容，但不会把目录或链接当作可覆盖的旧 ref。
 
-指令缓存版本为 **23**，旧规则生成的指令层自动失效。CAS schema 仍为 1，基础层缓存版本为 3，正常镜像 blob 不需要重新下载。权限处理详见 [镜像权限规则](PERMISSION_POLICY.md)。
+指令缓存版本为 **24**，旧规则生成的指令层自动失效。CAS schema 仍为 1，基础层缓存版本为 4，正常镜像 blob 不需要重新下载。权限处理详见 [镜像权限规则](PERMISSION_POLICY.md)。
 
 ## 测试与边界
 

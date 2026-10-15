@@ -4,6 +4,7 @@ import sys
 
 from .progress_bar import progress_text, size
 from .renderer_base import Renderer
+from .layers import LAYER_EVENTS, format_layer_event
 
 
 class PlainRenderer(Renderer):
@@ -21,7 +22,9 @@ class PlainRenderer(Renderer):
         kind = event.type
         if self.quiet and kind not in ("build_success", "build_failed"):
             return
-        if kind == "build_start":
+        if kind in LAYER_EVENTS:
+            self._line(format_layer_event(event))
+        elif kind == "build_start":
             self._line("PyBuilder | Building {} [{}]".format(
                 event.details.get("image", "image"), event.details.get("platform", "unknown")))
         elif kind == "phase_start":

@@ -43,6 +43,7 @@ from task_resources import cancel_pending_on_error
 from file_publish import publication_transaction, publish_new_file
 from path_policy import archive_path, host_components, output_path
 from errors import ArchiveError, BuildError
+from progress.layers import LayerProgress
 from image_reader import read_image_json_file, verify_layer_tar
 
 
@@ -475,7 +476,7 @@ def verify_registry_blob(path: Path, digest: str, description: str) -> None:
 
 def materialize_layer(blob: Path, target: Path, media_type: str,
                       expected_diff_id: str, index: int, total: int,
-                      display: ProgressDisplay, expected_blob_digest=None) -> str:
+                      display: ProgressDisplay, expected_blob_digest=None, progress=None) -> str:
     """将 Registry 传输层解压为 docker save 所需的 layer.tar。"""
     expected_hex = parse_sha256_digest(expected_diff_id, "rootfs.diff_ids[{}]".format(index - 1))
     with blob.open("rb") as source:
@@ -487,7 +488,6 @@ def materialize_layer(blob: Path, target: Path, media_type: str,
 
     hasher = hashlib.sha256()
     written = 0
-    last_report = time.monotonic()
     try:
         with blob.open("rb") as raw, target.open("wb") as destination:
             checked = DigestReader(raw)
@@ -500,12 +500,8 @@ def materialize_layer(blob: Path, target: Path, media_type: str,
                     destination.write(block)
                     hasher.update(block)
                     written += len(block)
-                    now = time.monotonic()
-                    if now - last_report >= (0.5 if display.is_tty else 5.0):
-                        display.status("转换镜像层 {}/{} | 已解包 {}".format(
-                            index, total, format_size(written)
-                        ))
-                        last_report = now
+                    if progress is not None:
+                        progress(written)
             # 压缩内容末尾的剩余字节也属于传输 blob，必须计入 Registry 摘要。
             if compressed:
                 for _ in iter(lambda: checked.read(4 * 1024 * 1024), b""):
@@ -544,7 +540,7 @@ def chain_id(parent_chain_id: Optional[str], diff_id: str) -> str:
 
 def convert_registry_to_docker_archive(raw_root: Path, archive_root: Path,
                                        image_reference: str,
-                                       display: ProgressDisplay) -> List[Path]:
+                                       display: ProgressDisplay, reporter=None) -> List[Path]:
     """重构 docker save 兼容目录，返回按 manifest 顺序排列的已验证解码层。"""
     manifest_path = raw_root / "manifest.json"
     if not manifest_path.is_file():
@@ -577,33 +573,35 @@ def convert_registry_to_docker_archive(raw_root: Path, archive_root: Path,
     layer_paths = []
     parent_chain = None
 
+    preparation = LayerProgress("prepare", len(layers), reporter, display, source="artifactory", image=image_reference)
     for index, (layer, expected_diff_id) in enumerate(zip(layers, diff_ids), 1):
-        digest = layer.get("digest")
-        if not isinstance(digest, str):
-            raise RuntimeError("manifest.layers[{}] 缺少 digest".format(index - 1))
-        blob = find_blob(raw_root, digest, "layers[{}].digest".format(index - 1))
+        with preparation.layer(index, layer.get("digest", "")) as task:
+            digest = layer.get("digest")
+            if not isinstance(digest, str):
+                raise RuntimeError("manifest.layers[{}] 缺少 digest".format(index - 1))
+            blob = find_blob(raw_root, digest, "layers[{}].digest".format(index - 1))
 
-        # 先写临时层，得到 diff_id 后才能计算与父层相关的 chain ID。
-        temporary_layer = archive_root / (".layer-{}.tar".format(index))
-        diff_id = materialize_layer(
-            blob, temporary_layer, str(layer.get("mediaType", "")),
-            str(expected_diff_id), index, len(layers), display, digest
-        )
-        current_chain = chain_id(parent_chain, diff_id)
-        current_hex = parse_sha256_digest(current_chain, "chain ID")
-        layer_directory = archive_root / current_hex
-        layer_directory.mkdir(parents=True, exist_ok=True)
-        os.replace(str(temporary_layer), str(layer_directory / "layer.tar"))
+            # 先写临时层，得到 diff_id 后才能计算与父层相关的 chain ID。
+            temporary_layer = archive_root / (".layer-{}.tar".format(index))
+            diff_id = materialize_layer(
+                blob, temporary_layer, str(layer.get("mediaType", "")),
+                str(expected_diff_id), index, len(layers), display, digest, progress=task.update
+            )
+            current_chain = chain_id(parent_chain, diff_id)
+            current_hex = parse_sha256_digest(current_chain, "chain ID")
+            layer_directory = archive_root / current_hex
+            layer_directory.mkdir(parents=True, exist_ok=True)
+            os.replace(str(temporary_layer), str(layer_directory / "layer.tar"))
 
-        # VERSION/json 是旧版 daemon 读取 docker save 包时使用的兼容元数据。
-        (layer_directory / "VERSION").write_text("1.0\n", encoding="ascii")
-        legacy_metadata = {"id": current_hex}
-        if parent_chain is not None:
-            legacy_metadata["parent"] = parse_sha256_digest(parent_chain, "parent chain ID")
-        write_json(layer_directory / "json", legacy_metadata)
-        layer_paths.append("{}/layer.tar".format(current_hex))
-        parent_chain = current_chain
-        display.status("转换镜像层 {}/{} | 完成".format(index, len(layers)))
+            # VERSION/json 是旧版 daemon 读取 docker save 包时使用的兼容元数据。
+            (layer_directory / "VERSION").write_text("1.0\n", encoding="ascii")
+            legacy_metadata = {"id": current_hex}
+            if parent_chain is not None:
+                legacy_metadata["parent"] = parse_sha256_digest(parent_chain, "parent chain ID")
+            write_json(layer_directory / "json", legacy_metadata)
+            layer_paths.append("{}/layer.tar".format(current_hex))
+            parent_chain = current_chain
+            task.current = (layer_directory / "layer.tar").stat().st_size
 
     repository, tag = split_image_reference(image_reference)
     docker_manifest = [{
@@ -616,6 +614,7 @@ def convert_registry_to_docker_archive(raw_root: Path, archive_root: Path,
     # repositories 属于旧格式索引；保留它可兼容仍依赖该文件的 Docker 版本。
     top_layer_hex = parse_sha256_digest(parent_chain, "top chain ID") if parent_chain else config_hex
     write_json(archive_root / "repositories", {repository: {tag: top_layer_hex}})
+    preparation.finish()
     display.finish_line()
     return [archive_root / name for name in layer_paths]
 
@@ -1028,28 +1027,25 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
             if not isinstance(diff_ids, list) or len(diff_ids) != len(descriptors):
                 raise RuntimeError("config.rootfs.diff_ids 数量与 manifest.layers 不一致")
             layer_paths = []
+            preparation = LayerProgress("prepare", len(descriptors), reporter, display,
+                                        source="artifactory", image=image_reference)
             for index, (descriptor, diff_id) in enumerate(zip(descriptors, diff_ids), 1):
-                layer_started = time.monotonic()
-                if not isinstance(descriptor, dict):
-                    raise RuntimeError("Registry manifest 的 layer descriptor 格式无效")
-                blob = find_blob(raw_root, descriptor.get("digest"), "layer.digest")
-                _check_cas_layer_encoding(descriptor, blob, diff_id)
-                decoded = workspace / "decoded.tar"
-                # 相同 DiffID 的旧解码层只能证明旧数据有效，不能代替本次 blob 的校验。
-                # 逐层验证、入库并删除临时层，限制 CAS-only 的临时磁盘占用。
-                materialize_layer(blob, decoded, str(descriptor.get("mediaType", "")),
-                                  diff_id, index, len(descriptors), display,
-                                  descriptor.get("digest"))
-                decoded_size = decoded.stat().st_size
-                cas_store.store_decoded_layer(decoded, diff_id)
-                decoded.unlink()
-                layer_paths.append(blob)
-                # 高频字节进度仍节流，但每层成功入库后必须留一条持久完成记录。
-                display.log("转换镜像层 {}/{} | 完成（解包、校验、入库） | {} | {:.2f}s".format(
-                    index, len(descriptors), format_size(decoded_size), time.monotonic() - layer_started))
+                with preparation.layer(index, descriptor.get("digest", "") if isinstance(descriptor, dict) else "") as task:
+                    if not isinstance(descriptor, dict):
+                        raise RuntimeError("Registry manifest 的 layer descriptor 格式无效")
+                    blob = find_blob(raw_root, descriptor.get("digest"), "layer.digest")
+                    _check_cas_layer_encoding(descriptor, blob, diff_id)
+                    decoded = workspace / "decoded.tar"
+                    materialize_layer(blob, decoded, str(descriptor.get("mediaType", "")),
+                                      diff_id, index, len(descriptors), display,
+                                      descriptor.get("digest"), progress=task.update)
+                    task.current = decoded.stat().st_size
+                    cas_store.store_decoded_layer(decoded, diff_id)
+                    decoded.unlink()
+                    layer_paths.append(blob)
         else:
             decoded_layers = convert_registry_to_docker_archive(
-                raw_root, archive_root, image_reference, display)
+                raw_root, archive_root, image_reference, display, reporter)
             if cas_store is not None:
                 manifest, manifest_raw = read_image_json_file(raw_root / "manifest.json",
                                                               "Artifactory manifest")
@@ -1057,10 +1053,14 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
                 layer_paths = [find_blob(raw_root, item["digest"], "layer.digest")
                                for item in manifest["layers"]]
                 config = load_json_object(config_path, "镜像 config blob")
-                for descriptor, blob, layer, diff_id in zip(
-                        manifest["layers"], layer_paths, decoded_layers, config["rootfs"]["diff_ids"]):
-                    _check_cas_layer_encoding(descriptor, blob, diff_id)
-                    cas_store.store_decoded_layer(layer, diff_id)
+                storing = LayerProgress("store", len(decoded_layers), reporter, display,
+                                        source="artifactory", image=image_reference)
+                for number, (descriptor, blob, layer, diff_id) in enumerate(zip(
+                        manifest["layers"], layer_paths, decoded_layers, config["rootfs"]["diff_ids"]), 1):
+                    with storing.layer(number, diff_id) as task:
+                        _check_cas_layer_encoding(descriptor, blob, diff_id)
+                        cas_store.store_decoded_layer(layer, diff_id)
+                        task.current = layer.stat().st_size
         conversion_elapsed = time.monotonic() - conversion_started
         if reporter is not None:
             reporter.record_timing("Convert Artifactory layers", conversion_elapsed)
@@ -1068,11 +1068,12 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
             cas_store.import_registry(manifest_raw, config_path, layer_paths,
                                       image_reference, target_platform, replace=True,
                                       verified_diff_ids=True)
+            if not cas_only:
+                storing.finish()
         if cas_only:
             # 保留基础镜像入口对 media type 与配置的检查；层内容已在发布前验证。
             cas_store.open_base(image_reference, target_platform, "artifactory")
-            display.log("镜像层准备完成：{}/{} 层，基础镜像已写入 CAS".format(
-                len(descriptors), len(descriptors)))
+            preparation.finish()
             return
         display.log("格式转换完成，耗时 {}；开始生成 Docker tar…".format(
             format_duration(conversion_elapsed)))

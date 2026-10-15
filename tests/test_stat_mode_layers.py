@@ -13,17 +13,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from builder import build
 from cas_store import CASStore
-from errors import BuildError
+from errors import ArchiveError, BuildError
 from fast import quick_build
-from image_reader import ImageArchiveReader, sha256_file
+from image_reader import ImageArchiveReader, sha256_file, verify_layer_tar
 from image_writer import ImageArchiveWriter
-from permissions import validate_metadata
+from permissions import merge_metadata, validate_metadata
+from optimizer import optimize_image
 from rootfs import RootFSIndex
 from rootfs_archive import merge_rootfs, prepare_rootfs
 from rootfs_materializer import RootFSMaterializer
 
 
-def full_mode_layer(path, links=False):
+def full_mode_layer(path, links=False, hardlinks=True):
     """手写 mode 与 checksum；tarfile 写入器会先去掉类型位，无法生成复现输入。"""
     raw = bytearray()
     entries = [(".", tarfile.DIRTYPE, stat.S_IFDIR | 0o755, b""),
@@ -33,8 +34,9 @@ def full_mode_layer(path, links=False):
                ("etc/group", tarfile.REGTYPE, stat.S_IFREG | 0o644, b"tomcat:x:1000:\n"),
                ("soft/tomcat/start.sh", tarfile.REGTYPE, stat.S_IFREG | 0o4755, b"#!/bin/sh\n")]
     if links:
-        entries.extend([("soft/tomcat/current.sh", tarfile.SYMTYPE, stat.S_IFLNK | 0o777, b""),
-                        ("soft/tomcat/start-copy.sh", tarfile.LNKTYPE, stat.S_IFREG | 0o4755, b"")])
+        entries.append(("soft/tomcat/current.sh", tarfile.SYMTYPE, stat.S_IFLNK | 0o777, b""))
+        if hardlinks:
+            entries.append(("soft/tomcat/start-copy.sh", tarfile.LNKTYPE, stat.S_IFREG | 0o4755, b""))
     for name, kind, mode, payload in entries:
         member = tarfile.TarInfo(name)
         member.type, member.size = kind, len(payload)
@@ -55,6 +57,53 @@ def full_mode_layer(path, links=False):
 
 
 class StatModeLayerTests(unittest.TestCase):
+    def test_invalid_mode_cannot_enter_decoded_cas_even_with_matching_digest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            header = bytearray(tarfile.TarInfo("bad-entry").tobuf())
+            header[100:108] = b"0040755\0"
+            header[148:156] = b"        "
+            header[148:156] = ("%06o\0 " % sum(header)).encode("ascii")
+            path = root / "bad.tar"
+            path.write_bytes(header + b"\0" * 1024)
+            with path.open("rb") as stream, self.assertRaisesRegex(ArchiveError, "bad-entry"):
+                verify_layer_tar(stream, "source-layer")
+            store = CASStore(root / "store")
+            diff = "sha256:" + sha256_file(path)
+            with self.assertRaisesRegex(ArchiveError, "bad-entry"):
+                store.store_decoded_layer(path, diff)
+            self.assertFalse(store._blob(diff).exists())
+
+    def test_merge_normalizes_full_mode_without_modifying_source(self):
+        previous, current = tarfile.TarInfo("app"), tarfile.TarInfo("app")
+        previous.type = current.type = tarfile.DIRTYPE
+        current.mode = stat.S_IFDIR | 0o2755
+        result = merge_metadata(previous, current)
+        self.assertEqual(result.mode, 0o2755)
+        self.assertEqual(current.mode, stat.S_IFDIR | 0o2755)
+
+    def test_optimizer_removes_equivalent_symlink_mode_encoding_layer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = full_mode_layer(root / "first.tar", links=True, hardlinks=False)
+            second = root / "second.tar"
+            with tarfile.open(second, "w") as archive:
+                member = tarfile.TarInfo("soft/tomcat/current.sh")
+                member.type, member.mode, member.linkname = tarfile.SYMTYPE, 0o777, "start.sh"
+                archive.addfile(member)
+            config = {"os": "linux", "architecture": "amd64", "config": {},
+                      "rootfs": {"type": "layers", "diff_ids": ["sha256:" + sha256_file(p) for p in (first, second)]},
+                      "history": [{"created_by": "first"}, {"created_by": "equivalent"}]}
+            source, output = root / "source.tar", root / "out.tar"
+            ImageArchiveWriter().write_new(source, config, [first, second], "example/app:1")
+            result = optimize_image(source, output)
+            self.assertIn(2, result["removed_layer_numbers"])
+            image = ImageArchiveReader(output, root / "read").read("example/app:1")
+            index = RootFSIndex()
+            for path in image.layers:
+                index.apply_layer(path)
+            self.assertEqual(index.read_file("/soft/tomcat/current.sh"), b"#!/bin/sh\n")
+
     def test_index_accepts_full_stat_mode_without_changing_layer_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:
             layer = full_mode_layer(Path(temporary) / "layer.tar")

@@ -12,12 +12,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from errors import ArchiveError, BaseImageNotFound
+from errors import ArchiveError, BaseImageNotFound, BuildError
+from permissions import validate_metadata
 from path_policy import archive_path
 from compat import is_linked_directory
 from file_resources import fdopen_owned
 from cache_identity import file_identity, stat_identity
 from platforms import architecture, normalize_platform
+from progress.layers import LayerProgress
 
 
 BUFFER = 4 * 1024 * 1024
@@ -25,7 +27,8 @@ MAX_JSON = 16 * 1024 * 1024
 SHA256 = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
 # 旧条目只识别首个 tar 头，未证明成员负载完整；首次复用需重新验证。
 # 版本 3 将可信身份绑定到实际读取的归档句柄，排除读取中换源产生的旧条目。
-BASE_CACHE_VERSION = 3
+# 版本 4 在首次验证时同时预检权限/属主/xattr，旧结构校验凭据不能代替它。
+BASE_CACHE_VERSION = 4
 
 
 def digest_hex(value):
@@ -70,13 +73,18 @@ def verify_layer_tar(stream, label):
 
     SHA-256 匹配只证明字节一致；任意垃圾数据同样可以拥有正确的 DiffID。
     在已核对摘要的可寻址流上遍历 tar 头，跳过文件负载，避免再完整读取大层。
-    此检查不解包文件；路径、whiteout 和文件系统语义仍由 rootfs 消费者核对。
+    同时预检权限/属主/xattr 声明；不改写头或层。路径、whiteout 仍由 rootfs 消费者核对。
     """
     try:
         size = stream.seek(0, 2)
         stream.seek(0)
         with tarfile.open(fileobj=stream, mode="r:") as archive:
             for member in archive:
+                try:
+                    validate_metadata(member)
+                except BuildError as exc:
+                    raise ArchiveError("Invalid layer metadata in {} at {!r}: {}".format(
+                        label, member.name, exc)) from exc
                 if member.size < 0:
                     raise ArchiveError("Negative layer member size: " + label)
                 # GNU sparse 的 size 是展开后长度，归档仅存储 sparse 映射中的数据段。
@@ -372,7 +380,7 @@ class ImageArchiveReader:
                 os.unlink(pending)
         return layer
 
-    def read(self, from_reference, expected_platform=None, progress=None):
+    def read(self, from_reference, expected_platform=None, progress=None, reporter=None):
         """选取指定引用及平台，验证 config/layer 摘要并提取层。
 
         显式本地映射在归档仅含一个镜像时允许引用别名；多镜像归档要求准确匹配。
@@ -453,38 +461,45 @@ class ImageArchiveReader:
                 image_history(config, len(diff_ids))
                 self.workspace.mkdir(parents=True, exist_ok=True)
                 paths = []
+                reading = LayerProgress("read", len(names), reporter, source="archive", image=from_reference)
                 for index, (name, expected) in enumerate(zip(names, diff_ids), 1):
-                    normalized = outer_name(name)
-                    member = members.get(normalized)
-                    if member is None or not member.isfile():
-                        raise ArchiveError("Missing layer: " + normalized)
-                    digest_hex(expected)
-                    cached, location = self._cached_layer(normalized, expected)
-                    if cached is not None:
-                        paths.append(cached)
-                        continue
-                    target = self.workspace / ("base-layer-{}.tar".format(index))
-                    stream = archive.extractfile(member)
-                    if stream is None:
-                        raise ArchiveError("Unreadable layer: " + normalized)
-                    hasher = hashlib.sha256()
-                    with stream, open(target, "wb") as output:
-                        copied = 0
-                        while True:
-                            block = stream.read(BUFFER)
-                            if not block:
-                                break
-                            output.write(block)
-                            hasher.update(block)
-                            copied += len(block)
-                            if progress is not None:
-                                progress(copied, member.size, "Extracting base layer {}/{}".format(index, len(names)))
-                    if hasher.hexdigest() != digest_hex(expected):
-                        raise ArchiveError("Layer {} DiffID mismatch".format(index))
-                    with open(target, "rb") as checked_layer:
-                        verify_layer_tar(checked_layer, "base layer {}".format(index))
-                    paths.append(self._publish_layer(target, location, expected))
-                return BaseImage(config, paths, selected.get("RepoTags") or [], selected,
+                    with reading.layer(index, expected) as task:
+                        normalized = outer_name(name)
+                        member = members.get(normalized)
+                        if member is None or not member.isfile():
+                            raise ArchiveError("Missing layer: " + normalized)
+                        digest_hex(expected)
+                        cached, location = self._cached_layer(normalized, expected)
+                        if cached is not None:
+                            paths.append(cached)
+                            task.cached = True
+                            task.current = cached.stat().st_size
+                            continue
+                        target = self.workspace / ("base-layer-{}.tar".format(index))
+                        stream = archive.extractfile(member)
+                        if stream is None:
+                            raise ArchiveError("Unreadable layer: " + normalized)
+                        hasher = hashlib.sha256()
+                        with stream, open(target, "wb") as output:
+                            copied = 0
+                            while True:
+                                block = stream.read(BUFFER)
+                                if not block:
+                                    break
+                                output.write(block)
+                                hasher.update(block)
+                                copied += len(block)
+                                task.update(copied, member.size)
+                                if progress is not None:
+                                    progress(copied, member.size, "Extracting base layer {}/{}".format(index, len(names)))
+                        if hasher.hexdigest() != digest_hex(expected):
+                            raise ArchiveError("Layer {} DiffID mismatch".format(index))
+                        with open(target, "rb") as checked_layer:
+                            verify_layer_tar(checked_layer, "base layer {}".format(index))
+                        paths.append(self._publish_layer(target, location, expected))
+                image = BaseImage(config, paths, selected.get("RepoTags") or [], selected,
                                  "sha256:" + hashlib.sha256(config_raw).hexdigest(), config_raw)
         except (tarfile.TarError, json.JSONDecodeError, UnicodeDecodeError, TypeError, KeyError) as exc:
             raise ArchiveError("Invalid Docker save archive: {}".format(exc)) from exc
+        reading.finish()
+        return image

@@ -33,6 +33,7 @@ from image_reader import (BaseImage, ImageArchiveReader, archive_members, digest
 from image_writer import ImageArchiveWriter
 from file_publish import publication_transaction, publish_new_file
 from task_resources import cancel_pending_on_error
+from progress.layers import LayerProgress
 from oci_writer import (CONFIG_TYPE, INDEX_TYPE, LAYER_TYPE, MANIFEST_TYPE,
                         OCIImageWriter)
 from platforms import architecture, normalize_platform
@@ -504,28 +505,18 @@ def pull(reference, output, username=None, password=None, ca_file=None,
         count = min(workers or 4, len(descriptors)) if descriptors else 1
         for descriptor in descriptors:
             _descriptor(descriptor, (LAYER_TYPE, OCI_GZIP_LAYER, DOCKER_GZIP_LAYER))
+        downloading = LayerProgress("download", len(descriptors), reporter, source="registry", image=reference)
+        preparing = LayerProgress("prepare", len(descriptors), reporter, source="registry", image=reference)
+        worker_state = threading.local()
         if reporter is not None:
-            reporter.log("Registry layers: {} download worker(s)".format(count))
-            download_progress = {}
-            progress_lock = threading.Lock()
-            worker_state = threading.local()
-            expected_bytes = sum(descriptor["size"] for descriptor in descriptors)
-
-            def aggregate_progress(current, _total, _label):
-                """在锁内汇总各下载线程的累计字节，避免并发进度相互覆盖。"""
-                index = worker_state.index
-                with progress_lock:
-                    download_progress[index] = current
-                    completed_bytes = sum(download_progress.values())
-                reporter.progress(completed_bytes, expected_bytes, "Downloading Registry layers")
-
-            client.progress = aggregate_progress
+            client.progress = lambda current, total, _label: worker_state.task.update(current, total)
 
         def download_layer(index, descriptor):
             compressed = workspace / ("download-{}.blob".format(index))
-            if reporter is not None:
-                worker_state.index = index
-            client.blob(descriptor, compressed)
+            with downloading.layer(index + 1, descriptor["digest"]) as task:
+                worker_state.task = task
+                client.blob(descriptor, compressed)
+                task.current = compressed.stat().st_size
             return index
 
         with reporter.timed("Download Registry layers") if reporter is not None else nullcontext():
@@ -535,26 +526,31 @@ def pull(reference, output, username=None, password=None, ca_file=None,
                            for index, descriptor in enumerate(descriptors)]
                 for future in as_completed(futures):
                     index = future.result()
-                    if reporter is not None:
-                        reporter.log("Downloaded Registry layer {}/{}".format(index + 1, len(descriptors)))
+        downloading.finish()
 
         def materialize_layer(index, descriptor, diff_id):
             """解压或移动传输 blob，核对 DiffID 与 tar 格式，返回原 manifest 位置及层路径。"""
-            compressed = workspace / ("download-{}.blob".format(index))
-            layer = workspace / ("layer-{}.tar".format(index))
-            if descriptor["mediaType"] == LAYER_TYPE:
-                os.replace(compressed, layer)
-            else:
-                try:
-                    with gzip.open(compressed, "rb") as source, open(layer, "wb") as target:
-                        shutil.copyfileobj(source, target, BUFFER)
-                except (OSError, EOFError, zlib.error) as exc:
-                    raise BuildError("Invalid compressed Registry layer: " + str(exc)) from exc
-            if sha256_file(layer) != digest_hex(diff_id):
-                raise BuildError("Registry layer DiffID or tar format mismatch")
-            with open(layer, "rb") as checked_layer:
-                verify_layer_tar(checked_layer, "Registry layer {}".format(index + 1))
-            return index, layer
+            with preparing.layer(index + 1, diff_id) as task:
+                compressed = workspace / ("download-{}.blob".format(index))
+                layer = workspace / ("layer-{}.tar".format(index))
+                if descriptor["mediaType"] == LAYER_TYPE:
+                    os.replace(compressed, layer)
+                else:
+                    try:
+                        with gzip.open(compressed, "rb") as source, open(layer, "wb") as target:
+                            copied = 0
+                            for block in iter(lambda: source.read(BUFFER), b""):
+                                target.write(block)
+                                copied += len(block)
+                                task.update(copied)
+                    except (OSError, EOFError, zlib.error) as exc:
+                        raise BuildError("Invalid compressed Registry layer: " + str(exc)) from exc
+                if sha256_file(layer) != digest_hex(diff_id):
+                    raise BuildError("Registry layer DiffID or tar format mismatch")
+                with open(layer, "rb") as checked_layer:
+                    verify_layer_tar(checked_layer, "Registry layer {}".format(index + 1))
+                task.current = layer.stat().st_size
+                return index, layer
 
         # 并发任务完成顺序不固定，必须按 manifest 位置保存结果，
         # 保持 rootfs 应用顺序与 config.diff_ids 一致。
@@ -567,8 +563,7 @@ def pull(reference, output, username=None, password=None, ca_file=None,
                 for future in as_completed(futures):
                     index, layer = future.result()
                     layers[index] = layer
-                    if reporter is not None:
-                        reporter.log("Verified Registry layer {}/{}".format(index + 1, len(descriptors)))
+        preparing.finish()
         local_tag = docker_archive_tag(client.reference.full)
 
         def publish_cas():
@@ -576,8 +571,11 @@ def pull(reference, output, username=None, password=None, ca_file=None,
 
             保留未压缩层是为了让后续构建直接复用，避免重新解压传输 blob。
             """
-            for layer, diff_id in zip(layers, diff_ids):
-                cas_store.store_decoded_layer(layer, diff_id)
+            storing = LayerProgress("store", len(layers), reporter, source="registry", image=reference)
+            for number, (layer, diff_id) in enumerate(zip(layers, diff_ids), 1):
+                with storing.layer(number, diff_id) as task:
+                    cas_store.store_decoded_layer(layer, diff_id)
+                    task.current = layer.stat().st_size
             raw_layers = [workspace / ("download-{}.blob".format(index))
                           if descriptor["mediaType"] != LAYER_TYPE else layers[index]
                           for index, descriptor in enumerate(descriptors)]
@@ -585,6 +583,7 @@ def pull(reference, output, username=None, password=None, ca_file=None,
                 manifest_raw,
                 config_path, raw_layers, stored_reference, target_platform,
                 source="registry", replace=True, verified_diff_ids=True)
+            storing.finish()
 
         def publish_products(products):
             """发布结果并登记本次取得的文件所有权；外围事务覆盖下载目录退出。"""

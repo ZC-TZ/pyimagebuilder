@@ -20,6 +20,7 @@ from pathlib import Path
 
 from compat import is_linked_directory, unlink_missing
 from file_resources import fdopen_owned
+from progress.layers import LayerProgress
 from errors import ArchiveError, BuildError
 from image_reader import (MAX_JSON, BaseImage, ImageArchiveReader, archive_members, digest_hex,
                           image_history, parse_image_json, read_image_json_file, same_json_value, sha256_file,
@@ -574,7 +575,7 @@ class CASStore:
                 updated["layers"][index]["diff_id_verified"] = True
             self._publish_ref(updated, replace=True)
 
-    def open_base(self, reference, platform="linux/amd64", source=None):
+    def open_base(self, reference, platform="linux/amd64", source=None, reporter=None):
         """返回含配置和有序 layer.tar 路径的 BaseImage，供 builder 直接消费 CAS。
 
         缺少解码层或 blob→DiffID 校验记录时，先解压并核对本次结果，再入库。
@@ -595,44 +596,54 @@ class CASStore:
             raise ArchiveError("Invalid CAS base config") from exc
         paths = []
         verified_indices = []
+        checking = LayerProgress("verify", len(value["layers"]), reporter, source="cas", image=reference)
         for index, item in enumerate(value["layers"]):
-            media_type = item["mediaType"]
-            diff_id = item["diff_id"]
-            digest_hex(diff_id)
-            if media_type.endswith(".tar") and item["digest"] == diff_id:
-                layer = self._blob(diff_id)
-            elif media_type.endswith("+gzip") or media_type.endswith(".gzip"):
-                layer = self._blob(diff_id)
-                if not layer.is_file() or item.get("diff_id_verified") is not True:
-                    self.blobs.mkdir(parents=True, exist_ok=True)
-                    descriptor, pending = tempfile.mkstemp(prefix="decoded-", suffix=".part",
-                                                            dir=self.blobs)
-                    try:
-                        with fdopen_owned(descriptor, "wb") as target, \
-                                gzip.open(self._blob(item["digest"]), "rb") as source_stream:
-                            for block in iter(lambda: source_stream.read(BUFFER), b""):
-                                target.write(block)
-                        # 即使同 DiffID 的旧文件存在，也必须验证新解码结果，
-                        # 否则仅复用旧解码层会掩盖错误的 blob→DiffID 对应关系。
-                        self.store_decoded_layer(pending, diff_id)
-                        verified_indices.append(index)
-                    except (OSError, EOFError, zlib.error) as exc:
-                        raise ArchiveError("Cannot decode CAS base layer: " + str(exc)) from exc
-                    finally:
-                        unlink_missing(pending)
-                if layer.is_symlink() or sha256_file(layer) != digest_hex(diff_id):
-                    raise ArchiveError("CAS decoded layer is corrupt: " + diff_id)
-            else:
-                raise BuildError("Unsupported CAS layer compression: " + media_type)
-            with open(layer, "rb") as checked_layer:
-                verify_layer_tar(checked_layer, "CAS base layer: " + diff_id)
-            paths.append(layer)
+            with checking.layer(index + 1, item["diff_id"]) as task:
+                task.cached = (self._blob(item["diff_id"]).is_file() and
+                               (item["mediaType"].endswith(".tar") or item.get("diff_id_verified") is True))
+                media_type = item["mediaType"]
+                diff_id = item["diff_id"]
+                digest_hex(diff_id)
+                if media_type.endswith(".tar") and item["digest"] == diff_id:
+                    layer = self._blob(diff_id)
+                elif media_type.endswith("+gzip") or media_type.endswith(".gzip"):
+                    layer = self._blob(diff_id)
+                    if not layer.is_file() or item.get("diff_id_verified") is not True:
+                        self.blobs.mkdir(parents=True, exist_ok=True)
+                        descriptor, pending = tempfile.mkstemp(prefix="decoded-", suffix=".part",
+                                                                dir=self.blobs)
+                        try:
+                            with fdopen_owned(descriptor, "wb") as target, \
+                                    gzip.open(self._blob(item["digest"]), "rb") as source_stream:
+                                copied = 0
+                                for block in iter(lambda: source_stream.read(BUFFER), b""):
+                                    target.write(block)
+                                    copied += len(block)
+                                    task.update(copied)
+                            # 即使同 DiffID 的旧文件存在，也必须验证新解码结果，
+                            # 否则仅复用旧解码层会掩盖错误的 blob→DiffID 对应关系。
+                            self.store_decoded_layer(pending, diff_id)
+                            verified_indices.append(index)
+                        except (OSError, EOFError, zlib.error) as exc:
+                            raise ArchiveError("Cannot decode CAS base layer: " + str(exc)) from exc
+                        finally:
+                            unlink_missing(pending)
+                    if layer.is_symlink() or sha256_file(layer) != digest_hex(diff_id):
+                        raise ArchiveError("CAS decoded layer is corrupt: " + diff_id)
+                else:
+                    raise BuildError("Unsupported CAS layer compression: " + media_type)
+                with open(layer, "rb") as checked_layer:
+                    verify_layer_tar(checked_layer, "CAS base layer: " + diff_id)
+                paths.append(layer)
+                task.current = layer.stat().st_size
         self._record_verified_diff_ids(value, verified_indices)
-        return BaseImage(config, paths, [reference],
+        image = BaseImage(config, paths, [reference],
                          {"CASManifest": value["manifest"], "Source": value["source"]},
                          value["config"], config_raw,
                          manifest_raw=read_image_json_file(self._blob(value["manifest"]), "CAS base manifest")[1],
                          manifest_digest=value["manifest"])
+        checking.finish()
+        return image
 
 
 def main(argv=None):

@@ -19,6 +19,8 @@
 
 符号链接不执行 chmod，避免意外修改目标。硬链接共享 inode：后续链接头的权限更新要体现在所有仍可见的别名上；删除或覆盖一个名字不代表其他名字也被替换。
 
+原始层和配置的字节身份保持不变；规范化只发生在解析副本中。优化器比较有效权限，即使某层使用完整st_mode、另一层只编码权限位，也不会误判为权限变化。
+
 ## 2. 目录更新与扩展属性
 
 上层目录头更新已有目录时，采用新的 mode、UID/GID、时间，并保留未被新头覆盖的 SCHILY.xattr。根目录采用同一规则。下层目录被 whiteout 删除后重新创建、或被其他节点类型替换，不再继承已删除节点的属性。
@@ -58,9 +60,9 @@ Fast 的 dist.zip 当前不按 ZIP 的 Unix 外部权限字段恢复 mode，解�
 
 ## 5. 验证、缓存与边界
 
-- 有效层 UID/GID 范围为 0..4294967294；拒绝 chown 哨兵值。mode 只接受 0000..7777 的 Unix 权限位，包含 setuid/setgid/sticky。
-- 在应用 whiteout、改变索引或物化整层前检查权限声明；生产层也在 tar 编码前检查，避免 tarfile 静默截掉非法 mode 高位。
-- 指令缓存版本为 **23**，旧版本的构建结果失效；CAS schema 仍为 1，基础层缓存版本为 3，不要求重下载合法基础镜像 blob。
+- 有效层 UID/GID 范围为 0..4294967294；拒绝 chown 哨兵值。mode 支持 0000..7777 权限位及匹配 tar typeflag 的完整 st_mode（如040755）；解析副本使用有效权限，包含 setuid/setgid/sticky。类型冲突、负数、非整数和未知高位仍拒绝。
+- 下载/解码层入CAS、归档读取时先检查权限/属主/xattr声明，错误包含层与成员路径；在应用 whiteout、改变索引或物化整层前再次检查；生产层也在 tar 编码前检查，避免 tarfile 静默截掉非法 mode 高位。
+- 缓存版本及升级行为以 [缓存规则](CACHE_POLICY.md) 为准；不要求重下载合法基础镜像 blob。
 - `tests/test_permission_contract.py` 覆盖目录继承、opaque、重建、COPY、CAS/cache、双格式 flatten、优化与系统调用顺序；其他权限测试覆盖 inode、root、USER、链接和自动目录。
 - `tests/test_overlay_xattrs.py` 覆盖实际挂载 namespace 的标记识别、非活动 namespace 属性保留、非法 whiteout、目录 xattr 删除拒绝，以及构建失败不发布或缓存。
 - `tests/test_layer_acceptance_cache.py` 覆盖无效链接/属主、RUN 写盘失败不发布该指令缓存，以及修复执行条件后重试、有效命中和先前成功指令缓存保留。

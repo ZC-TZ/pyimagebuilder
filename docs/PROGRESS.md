@@ -80,17 +80,46 @@ Image:     sfcx_back:1.3.4
 
 Artifactory 来源会显示 URL、下载文件进度、格式转换与打包状态；第二次构建会显示 `Cached base ...`。
 
-Fast 使用 Artifactory → CAS 时，大层处理中的字节进度仍按时间节流，但每层完成解包、摘要/tar 校验和解码层入库后，都会保留一条完成记录，快速小层也不会省略：
+### 统一的层任务事件
+
+Artifactory（CAS 和 Docker tar）、Registry、CAS 读取、本地 tar 读取与构建索引共用
+`progress.layers.LayerProgress`。每层固定发出开始和成功/失败事件，中间字节事件逐层节流；
+小层不会因为不到五秒而缺失完成记录。缓存命中仍校验数据，标记“复用缓存”，不会伪装成重新下载。
 
 ```text
-转换镜像层 1/21 | 完成（解包、校验、入库） | 264.0 MiB | 5.20s
-转换镜像层 2/21 | 完成（解包、校验、入库） | 8.0 MiB | 0.12s
-...
-转换镜像层 21/21 | 完成（解包、校验、入库） | 10.0 KiB | 0.01s
-镜像层准备完成：21/21 层，基础镜像已写入 CAS
+    > 准备镜像层 1/21 | 开始
+    OK 准备镜像层 1/21 | 完成 | 264.0 MiB | 5.20s | 已完成 1/21
+    > 准备镜像层 2/21 | 开始
+    OK 准备镜像层 2/21 | 完成 | 8.0 MiB | 0.12s | 已完成 2/21
+    ...
+    OK 准备镜像层完成 | 21/21 层
+    > 校验基础层 1/21 | 开始
+    OK 校验基础层 1/21 | 完成（复用缓存） | 264.0 MiB | 0.30s | 已完成 1/21
 ```
 
-大小是解包后的 layer tar 字节数，单层耗时包含该层查找、解包、校验、解码层入库及临时文件清理；汇总在整张镜像的 CAS 引用导入与可用性检查成功后输出。失败层不输出完成记录，引用导入或可用性检查失败时不输出该汇总。JSON 模式中的这些记录是 `step_log` 事件，保持现有事件 schema。
+层序号表示 manifest 中的位置；“已完成”才是本组实际完成数量。并发时第21层可能先完成，
+此时显示“21/21，已完成1/21”，不能把它当成全部完成。零层组明确汇总为0/0。
+失败/取消不发该层成功事件，失败或漏处理的组不能发成功汇总；错误输出再次失败也不替换原始错误。
+TTY 中间状态按终端列宽刷新，完成行持久保存；普通日志不覆盖行。
+
+| JSON type | 含义 |
+| --- | --- |
+| `layer_start` | 单层任务开始 |
+| `layer_progress` | 单层字节进度，独立节流 |
+| `layer_complete` | 本层操作成功，含大小、耗时、缓存复用状态 |
+| `layer_failed` | 失败或取消，保留当前大小和错误原因 |
+| `layers_complete` | 本组所有任务成功，包含零层组 |
+
+这些事件不再塞进 `step_log`。JSON 消费者直接读 `details.group_id`、`operation`、
+`layer_index`、`layers_total`、`layers_completed`、`digest`、`cached`、`source`、
+`image`，字节数为顶层 `current` / `amount`，耗时为 `duration`。
+同一group_id对应同一组任务；阶段间不能把压缩下载字节与解码tar字节相加。
+
+operation 分别为 `download`（下载传输blob）、`prepare`（解包/校验）、
+`store`（写CAS）、`verify`（校验本地CAS基础层）、`read`（读取本地基础tar）、
+`index`（应用到虚拟rootfs）。Artifactory直接入CAS的prepare还包含解码层入库及临时文件清理，
+其汇总在CAS引用导入和可用性检查后发出；Docker tar导出路径分别报告prepare/store。
+层组汇总不是整个构建成功，归档导出和发布仍须随后完成，最终以build_success为准。
 
 ## 5. RUN 失败
 

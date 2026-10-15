@@ -26,6 +26,7 @@ from image_writer import ImageArchiveWriter
 from oci_writer import OCIImageWriter
 from reproducible import parse_epoch
 from rootfs import RootFSIndex, clean_path
+from permissions import normalized_metadata
 
 
 BUFFER = 4 * 1024 * 1024
@@ -150,7 +151,7 @@ def _signature(index, memo):
         identity = (entry.layer, entry.member)
         if identity not in memo:
             with tarfile.open(entry.layer, "r:") as archive:
-                member = archive.getmember(entry.member)
+                member = normalized_metadata(archive.getmember(entry.member))
                 content = None
                 if member.isfile():
                     stream = archive.extractfile(member)

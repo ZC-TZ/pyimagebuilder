@@ -25,6 +25,7 @@ from rootfs import RootFSIndex
 from rootfs_materializer import RootFSMaterializer
 from reproducible import parse_epoch
 from platforms import architecture, host_architecture, normalize_platform, require_foreign_binfmt
+from progress.layers import LayerProgress
 from attest import artifact_paths, create_provenance, read_private_key, sign_envelope
 from sbom import canonical_json, create_sbom
 from build_args import expand
@@ -363,7 +364,7 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                                         "Read and index base archive") if reporter is not None else nullcontext():
                         if is_cas:
                             cas = CASStore(base_path["store"])
-                            base = cas.open_base(reference, stage_platform, base_path["source"])
+                            base = cas.open_base(reference, stage_platform, base_path["source"], reporter=reporter)
                             base_inputs[reference + "@" + stage_platform] = {
                                 "sha256": base.source_manifest["CASManifest"].split(":", 1)[1]}
                         else:
@@ -375,14 +376,14 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                             if reporter is None:
                                 base = reader.read(reference, stage_platform)
                             else:
-                                base = reader.read(reference, stage_platform,
-                                                   progress=lambda current, total, label:
-                                                   reporter.progress(current, total, label))
+                                base = reader.read(reference, stage_platform, reporter=reporter)
                         rootfs = RootFSIndex()
+                        indexing = LayerProgress("index", len(base.layers), reporter, source="builder", image=reference)
                         for layer_index, layer_path in enumerate(base.layers, 1):
-                            rootfs.apply_layer(layer_path)
-                            if reporter is not None:
-                                reporter.progress(layer_index, len(base.layers), "Applying base layers", unit="layers")
+                            with indexing.layer(layer_index, base.config["rootfs"]["diff_ids"][layer_index - 1]) as task:
+                                rootfs.apply_layer(layer_path)
+                                task.current = layer_path.stat().st_size
+                        indexing.finish()
                     layers = list(base.layers)
                     config = ImageConfig(base.config, source_date_epoch, base.original_config_bytes(),
                                          base.original_manifest_bytes())

@@ -72,7 +72,7 @@ def merge_metadata(previous, current, clear_capability=False):
     目录头更新不会重建目录。硬链接也复用 inode，但其 lchown 会清除普通
     文件的旧 capability；显式新 capability 仍由当前头重新设置。
     """
-    updated = copy.copy(current)
+    updated = copy.copy(normalized_metadata(current))
     attrs = {key: value for key, value in previous.pax_headers.items()
              if key.startswith(XATTR_PREFIX) and
              not (clear_capability and key == XATTR_PREFIX + "security.capability")}

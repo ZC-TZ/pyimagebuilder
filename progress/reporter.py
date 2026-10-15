@@ -7,6 +7,7 @@ import time
 from contextlib import contextmanager
 
 from .events import BuildEvent
+from .layers import LAYER_EVENTS
 from .renderer_json import JsonRenderer
 from .renderer_plain import PlainRenderer
 from .renderer_tty import TTYRenderer
@@ -188,6 +189,12 @@ class BuildReporter:
     def cache_hit(self, message="layer"):
         """报告指令复用了缓存层。"""
         self._emit("step_cache_hit", message)
+
+    def layer_event(self, kind, message="", **fields):
+        """发布结构化层任务事件；Dockerfile step 字段仍由当前构建上下文维护。"""
+        if kind not in LAYER_EVENTS:
+            raise ValueError("Unknown layer event: " + kind)
+        self._emit(kind, message, **fields)
 
     def cache_miss(self):
         """报告指令需要重新生成层。"""
