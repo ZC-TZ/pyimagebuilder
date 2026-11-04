@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 import uuid
@@ -61,6 +62,33 @@ def record_build(directory, tag, platform, image_format, output, *, mode="build"
     return target
 
 
+def _read_record(path):
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+        raise ValueError("Build record must be a regular JSON file no larger than 64 KiB")
+    row = json.loads(path.read_text(encoding="utf-8"))
+    if (not isinstance(row, dict) or row.get("schemaVersion") != 1 or
+            row.get("id") != path.stem or
+            not all(isinstance(row.get(key), str)
+                    for key in ("completedAt", "tag", "platform", "mode")) or
+            not isinstance(row.get("artifacts"), list) or not row["artifacts"] or
+            not all(isinstance(item, dict) and isinstance(item.get("path"), str) and
+                    item.get("format") in ("docker", "oci") for item in row["artifacts"])):
+        raise ValueError("Invalid build record")
+    return row
+
+
+def get_build(directory, identity):
+    """按台账自身的 ID 读取记录，不接受路径或文件名参数。"""
+    name = identity + ".json"
+    if not RECORD_NAME.fullmatch(name):
+        return None
+    try:
+        return _read_record(directory / name)
+    except FileNotFoundError:
+        return None
+
+
 def list_builds(directory, project=None, tag=None, limit=None):
     """按打包完成时间倒序查询，忽略仍在写入的临时文件。"""
     try:
@@ -71,15 +99,7 @@ def list_builds(directory, project=None, tag=None, limit=None):
     rows = []
     for path in paths:
         try:
-            row = json.loads(path.read_text(encoding="utf-8"))
-            if (not isinstance(row, dict) or row.get("schemaVersion") != 1 or
-                    row.get("id") != path.stem or
-                    not all(isinstance(row.get(key), str)
-                            for key in ("completedAt", "tag", "platform", "mode")) or
-                    not isinstance(row.get("artifacts"), list) or not row["artifacts"] or
-                    not all(isinstance(item, dict) and isinstance(item.get("path"), str) and
-                            item.get("format") in ("docker", "oci") for item in row["artifacts"])):
-                raise ValueError("Invalid build record")
+            row = _read_record(path)
         except (OSError, ValueError) as exc:
             raise BuildError("Cannot read build record {}: {}".format(path, exc)) from exc
         if project is not None and row.get("project") != project:

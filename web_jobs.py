@@ -12,9 +12,10 @@ from collections import OrderedDict, deque
 from pathlib import Path
 
 from errors import BuildError
-from fast import PROJECT, VERSION
+from fast import fast_target, load_profile
 from file_resources import fdopen_owned
 from path_policy import output_path
+from web_job_journal import JobJournal, form_snapshot
 
 
 LABELS = {"fast": "快速打包", "build": "Dockerfile 构建", "check": "检查 Dockerfile",
@@ -60,6 +61,35 @@ def _target(data):
     return target
 
 
+def fast_plan(data, config, profiles):
+    """验证 Fast 表单并预览实际标签、部署位置和两个可能的输出。"""
+    package = _path(_required(data, "package")).resolve()
+    project = _required(data, "project")
+    version = _required(data, "version")
+    profile_name = _choice(data, "profile", profiles, "")
+    if not package.is_file():
+        raise BuildError("找不到应用包：" + str(package))
+    if config is None:
+        raise BuildError("Fast 需要配置文件")
+    profile = load_profile(config, profile_name)
+    kind = _choice(data, "format", FORMATS, "docker")
+    platform = _choice(data, "platform", PLATFORMS, PLATFORMS[0])
+    explicit = _text(data, "output")
+    front, tag, target = fast_target(package, project, version, profile, _path(explicit) if explicit else None)
+    outputs = [target]
+    if kind == "both":
+        outputs.append(output_path(target.with_name(target.stem + ".oci.tar")))
+    if any(path.suffix.lower() != ".tar" for path in outputs):
+        raise BuildError("输出路径必须以 .tar 结尾")
+    if any(path in (package, config, profile.get("baseTar"), profile.get("serverConfig")) for path in outputs):
+        raise BuildError("输出路径不能和输入文件相同")
+    deploy = profile["deployDir"] + "/" + project + ("f/" if front else ".war")
+    return {"package": package, "project": project, "version": version, "profile": profile_name,
+            "platform": platform, "format": kind, "tag": tag, "outputs": outputs,
+            "base": profile["baseImage"], "deploy": deploy,
+            "conflicts": [path for path in outputs if path.exists()]}
+
+
 def command_for(action, data, config, profiles):
     """只拼装已知子命令的参数；路径不是选项，仓库凭据由原 CLI 读取。"""
     platform = _choice(data, "platform", PLATFORMS, PLATFORMS[0])
@@ -68,22 +98,12 @@ def command_for(action, data, config, profiles):
     progress = ["--progress=json"]
     outputs = []
     if action == "fast":
-        package = _path(_required(data, "package"))
-        project = _required(data, "project")
-        version = _required(data, "version")
-        profile = _choice(data, "profile", profiles, "")
-        if any(not pattern.fullmatch(value) or value in (".", "..")
-               for pattern, value in ((PROJECT, project), (VERSION, version))):
-            raise BuildError("Invalid project or version")
-        if not package.is_file() or (package.suffix.lower() != ".war" and package.name.lower() != "dist.zip"):
-            raise BuildError("Select an existing WAR or dist.zip on the server")
-        target = _target(data)
-        kind = _choice(data, "format", FORMATS, "docker")
-        args = [action, str(package), project, version, "--profile=" + profile,
-                "--format=" + kind, "--output=" + str(target)] + shared + common + progress
-        outputs = [target]
-        if kind == "both":
-            outputs.append(target.with_name(target.stem + ".oci.tar"))
+        plan = fast_plan(data, config, profiles)
+        outputs = plan["outputs"]
+        if plan["conflicts"]:
+            raise BuildError("输出文件已存在：" + "、".join(map(str, plan["conflicts"])))
+        args = [action, str(plan["package"]), plan["project"], plan["version"], "--profile=" + plan["profile"],
+                "--format=" + plan["format"], "--output=" + str(outputs[0])] + shared + common + progress
     elif action in ("build", "check"):
         context = _path(_required(data, "context"))
         if not context.is_dir():
@@ -159,10 +179,11 @@ def open_artifact(path):
 
 
 class Jobs:
-    """保留有限数量的内存日志；交付历史仍由原有 CLI 持久化。"""
+    """日志留在当前会话，任务状态与构建表单单独保存。"""
 
     def __init__(self, directory):
         self.directory = directory
+        self.journal = JobJournal(directory)
         self.condition = threading.Condition()
         self.jobs = OrderedDict()
         self.queue = deque()
@@ -170,7 +191,7 @@ class Jobs:
         self.worker = threading.Thread(target=self._run, name="web-build-worker")
         self.worker.start()
 
-    def submit(self, action, args, outputs, label):
+    def submit(self, action, args, outputs, label, form=None):
         with self.condition:
             if self.closed or len(self.queue) >= 20:
                 raise BuildError("Web job queue is full or closing")
@@ -183,10 +204,21 @@ class Jobs:
             identity = uuid.uuid4().hex
             self.jobs[identity] = {"id": identity, "action": action, "args": args, "outputs": outputs,
                                    "state": "queued", "logs": deque(maxlen=250), "files": [],
-                                   "status": "", "process": None, "label": label}
+                                   "status": "", "process": None, "label": label,
+                                   "form": form_snapshot(action, form or {})}
             self.queue.append(identity)
+            self._save(self.jobs[identity])
             self.condition.notify()
             return identity
+
+    def _save(self, job):
+        try:
+            self.journal.write(job)
+        except (OSError, ValueError):
+            # 台账由 CLI 单独提交；可选的任务摘要写失败不能改变归档的构建结果。
+            if not job.get("journal_warning"):
+                job["logs"].append("任务摘要未能写入磁盘，关闭工作台后可能无法查看。")
+                job["journal_warning"] = True
 
     def snapshot(self, identity=None):
         with self.condition:
@@ -206,6 +238,7 @@ class Jobs:
             if job["state"] == "queued":
                 self.queue.remove(identity)
                 job["state"] = "cancelled"
+                self._save(job)
             elif job["state"] == "running" and os.name == "posix" and not job.get("interrupt"):
                 process = job["process"]
                 if process is not None and process.poll() is None:
@@ -237,6 +270,7 @@ class Jobs:
                     return
                 job = self.jobs[self.queue.popleft()]
                 job["state"] = "running"
+                self._save(job)
                 options = {"start_new_session": True} if os.name == "posix" else {
                     "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
                 try:
@@ -249,6 +283,7 @@ class Jobs:
                 except (OSError, ValueError) as exc:
                     job["logs"].append(str(exc))
                     job["state"] = "failed"
+                    self._save(job)
                     continue
             self._collect(job, process)
 
@@ -290,3 +325,4 @@ class Jobs:
                     except OSError:
                         pass
             job["process"] = None
+            self._save(job)

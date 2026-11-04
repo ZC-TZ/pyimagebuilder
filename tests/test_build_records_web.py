@@ -120,7 +120,7 @@ class WorkbenchTests(unittest.TestCase):
             "repositories": {"harbor.example": {"username": "not-for-browser", "passwordEnv": "NO_EXPOSE"}},
             "fast": {"defaultProfile": "tomcat", "profiles": {"tomcat": {
                 "baseImage": "example/base:1", "baseTar": str(make_base(self.root)),
-                "flavor": "tomcat", "owner": "0:0"}}},
+                "flavor": "tomcat", "owner": "0:0", "outputDir": "deliveries"}}},
         }), encoding="utf-8")
         settings, _ = load_settings(config)
         self.workspace = Workbench(settings, config, self.root / "records")
@@ -190,6 +190,72 @@ class WorkbenchTests(unittest.TestCase):
         self.run_job("remove", {"reference": "hisq_back:1", "source": "local", "confirm": "hisq_back:1"})
         self.assertNotIn(b"hisq_back:1", self.http("/images")[2])
         self.assertIn(b"hisq_back:1", self.http("/history")[2])
+
+    def test_fast_preview_matches_default_and_reuse_survives_a_new_workbench(self):
+        import zipfile
+        package = self.root / "dist.zip"
+        with zipfile.ZipFile(package, "w") as bundle:
+            bundle.writestr("dist/index.html", "index")
+        fields = {"package": str(package), "project": "hisq", "version": "2.0.0",
+                  "profile": "tomcat", "format": "both"}
+        status, _, body = self.http("/preview-fast", fields)
+        self.assertEqual(status, 200, body)
+        plan = json.loads(body)
+        output = self.root / "deliveries" / "hisq_front-2.0.0.tar"
+        secondary = output.with_name("hisq_front-2.0.0.oci.tar")
+        self.assertEqual(plan["outputs"], [str(output), str(secondary)])
+        self.assertEqual(plan["tag"], "hisq_front:2.0.0")
+        self.assertIn("hisqf", plan["deploy"])
+        self.assertFalse(output.parent.exists())
+        output.parent.mkdir()
+        secondary.write_bytes(b"existing")
+        self.assertEqual(json.loads(self.http("/preview-fast", fields)[2])["conflicts"], [str(secondary)])
+        self.assertEqual(self.http("/submit/fast", fields)[0], 400)
+        secondary.unlink()
+        _, identity = self.run_job("fast", fields)
+        self.assertTrue(output.is_file())
+        self.assertTrue(secondary.is_file())
+        fresh = Workbench(self.workspace.settings, self.workspace.config, self.workspace.directory)
+        self.addCleanup(fresh.close)
+        archived = fresh.get_job(identity)
+        self.assertTrue(archived["archived"])
+        self.assertEqual(archived["state"], "success")
+        self.assertEqual(archived["logs"], [])
+        self.assertNotIn("output", archived["form"])
+        self.assertIn(b'value="2.0.0"', self.http("/reuse?id=" + identity)[2])
+
+    def test_history_checks_content_even_after_equal_size_replacement(self):
+        import hashlib
+        archive = self.root / "prior.tar"
+        archive.write_bytes(b"original")
+        record = build_records.record_build(
+            self.workspace.directory, "hisq:1", "linux/amd64", "docker", archive,
+            digest="sha256:" + hashlib.sha256(b"original").hexdigest())
+        route = "/history-download?id=" + record.stem + "&file=0"
+        self.assertEqual(self.http(route)[2], b"original")
+        archive.write_bytes(b"replaced")
+        self.assertEqual(self.http(route)[0], 409)
+        self.assertEqual(self.http("/history-download?id=../config&file=0")[0], 404)
+        archive.unlink()
+        self.assertIn("文件已移走或删除", self.http("/history")[2].decode())
+
+    def test_space_preview_lists_candidates_without_removing_files(self):
+        store = self.workspace.settings["cache"]["imageStore"]
+        store.mkdir()
+        cached = store / "old.tar"
+        cached.write_bytes(b"12345")
+        delivery = self.root / "release.tar"
+        delivery.write_bytes(b"1234567")
+        for path in (cached, delivery):
+            os.utime(path, (1000, 1000))
+        build_records.record_build(self.workspace.directory, "release:1", "linux/amd64", "docker", delivery)
+        status, _, page = self.http("/space?kind=images&days=30")
+        self.assertEqual(status, 200, page)
+        self.assertIn(b"old.tar", page)
+        self.assertIn(b"5 B", page)
+        self.assertIn(b"release.tar", self.http("/space?kind=deliveries&days=30")[2])
+        self.assertTrue(cached.is_file())
+        self.assertTrue(delivery.is_file())
 
     def test_config_redaction_session_and_origin_checks(self):
         self.assertEqual(self.http("/workbench", authenticated=False)[0], 404)

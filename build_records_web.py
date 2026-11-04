@@ -2,11 +2,13 @@
 
 import socket
 import sys
+import json
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlencode
 
-from build_records import list_builds
+from build_records import get_build, list_builds
 from errors import BuildError
 
 
@@ -41,6 +43,7 @@ font-size:12px;font-weight:700;margin-right:6px}
 .controls .muted{margin-right:auto}
 .tabs{display:flex;gap:8px 18px;flex-wrap:wrap;margin:0 0 22px;font-weight:700}
 .job-form{padding-top:10px;margin-bottom:0}
+.preview{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:10px}
 .check{display:flex;align-items:center;gap:8px}
 .check input{width:auto}
 dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:4px 14px;margin:8px 0}
@@ -60,29 +63,43 @@ def _url(project="", tag="", page=1, root="/"):
     return root + "?" + urlencode(params) if params else root
 
 
-def _artifact(item):
+ARTIFACT_STATES = {"available": "文件在，下载时校验摘要", "missing": "文件已移走或删除",
+                   "unverified": "文件在，无可用摘要", "changed": "文件大小已变更",
+                   "unsafe": "非普通归档", "unreadable": "无法读取"}
+
+
+def _artifact(item, workspace=None, identity=None, index=None):
     kind = item["format"].upper()
     path = escape(item["path"])
     count = item.get("bytes")
     size = " <small>({:,} B)</small>".format(count) if type(count) is int and count >= 0 else ""
-    return '<li><span class="badge">{}</span><code>{}</code>{}</li>'.format(kind, path, size)
+    actions = ""
+    if workspace is not None:
+        from web_artifacts import artifact_state
+        state, _ = artifact_state(item)
+        actions = "　<small>{}</small>".format(ARTIFACT_STATES[state])
+        if state == "available":
+            query = urlencode({"id": identity, "file": index})
+            actions += '　<a href="{}/history-download?{}">校验并下载</a>'.format(workspace.prefix, escape(query))
+    return '<li><span class="badge">{}</span><code>{}</code>{}{}</li>'.format(kind, path, size, actions)
 
 
-def _card(row):
+def _card(row, workspace=None):
     fields = [row["completedAt"], row["platform"]]
     if row["mode"] == "fast":
         fields += ["Fast"] + [row[key] for key in ("project", "version", "profile") if isinstance(row.get(key), str)]
     else:
         fields += ["普通构建"]
     metadata = "".join("<span>{}</span>".format(escape(value)) for value in fields)
-    artifacts = "".join(_artifact(item) for item in row["artifacts"])
+    artifacts = "".join(_artifact(item, workspace, row.get("id"), index)
+                        for index, item in enumerate(row["artifacts"]))
     return '<article><h2>{}</h2><div class="meta muted">{}</div><ul>{}</ul></article>'.format(
         escape(row["tag"]), metadata, artifacts)
 
 
 def _page(directory, project, tag, page, rows, more, error=False, workspace=None):
     root = workspace.prefix + "/history" if workspace is not None else "/"
-    cards = "".join(_card(row) for row in rows)
+    cards = "".join(_card(row, workspace) for row in rows)
     if not cards:
         message = "暂时无法读取台账，请查看启动终端。" if error else "没有符合条件的记录。"
         cards = '<p class="empty">{}</p>'.format(message)
@@ -110,13 +127,14 @@ def _page(directory, project, tag, page, rows, more, error=False, workspace=None
         escape(project), escape(tag), root, cards, "".join(controls))
 
 
-def _workbench_page(workspace, title, body, refresh=False):
+def _workbench_page(workspace, title, body, refresh=False, fast_script=False):
     return """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">{}<title>{} · PyImageBuilder</title>
-<style>{}</style></head><body><main><header><h1>镜像构建工作台</h1>
+<style>{}</style>{}</head><body><main><header><h1>镜像构建工作台</h1>
 <p class="muted">{}</p></header>{}<section class="records">{}</section></main></body></html>""".format(
         '<meta http-equiv="refresh" content="2">' if refresh else "", escape(title),
-        STYLE, escape(title), workspace.nav(), body)
+        STYLE, '<script defer src="{}/fast.js"></script>'.format(workspace.prefix) if fast_script else "",
+        escape(title), workspace.nav(), body)
 
 
 def _query(value):
@@ -148,19 +166,22 @@ def make_server(directory, port=8765, limit=None, workspace=None):
         def log_message(self, _format, *_args):
             pass  # 不记录每次筛选的项目名或镜像标签。
 
-        def _reply(self, status, body, html=False):
+        def _reply(self, status, body, html=False, content_type=None):
             data = body.encode("utf-8", errors="xmlcharrefreplace")
             self.send_response(status)
-            self.send_header("Content-Type", ("text/html" if html else "text/plain") + "; charset=utf-8")
+            self.send_header("Content-Type", (content_type or ("text/html" if html else "text/plain")) + "; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("Referrer-Policy", "same-origin")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Security-Policy",
-                             "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; "
+                             "default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; base-uri 'none'; "
                              "form-action 'self'; frame-ancestors 'none'")
             self.end_headers()
             self.wfile.write(data)
+
+        def _json(self, status, value):
+            return self._reply(status, json.dumps(value, ensure_ascii=True), content_type="application/json")
 
         def _host(self):
             port = self.server.server_port
@@ -207,8 +228,8 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                                           len(rows) > end, workspace=workspace), html=True)
 
         def _get_workbench(self, route, query):
-            from web_workbench import download
-            views = {"/workbench": ("构建与打包", workspace.builds), "/jobs": ("本次会话的任务", workspace.tasks),
+            from web_workbench import FAST_SCRIPT, SPACE_KINDS, download, send_artifact
+            views = {"/workbench": ("构建与打包", workspace.builds), "/jobs": ("最近任务", workspace.tasks),
                      "/images": ("本地镜像库", workspace.images), "/config": ("配置概览", workspace.configuration)}
             if route == "/download" and len(query) <= 200:
                 try:
@@ -219,16 +240,52 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                 except ValueError:
                     return self._reply(400, "Invalid artifact selector")
                 return download(self, workspace.jobs.snapshot(identity), index)
-            try:
-                if route in views:
-                    title, view = views[route]
-                    return self._reply(200, _workbench_page(workspace, title, view()), html=True)
-                if route == "/job" and len(query) <= 200:
+            if route == "/history-download" and len(query) <= 200:
+                try:
                     params = parse_qs(query)
                     identity, = params.get("id", [""])
-                    job = workspace.jobs.snapshot(identity)
+                    index, = params.get("file", ["-1"])
+                    index = int(index)
+                    row = get_build(directory, identity)
+                except (OSError, ValueError):
+                    return self._reply(400, "Invalid build record or artifact")
+                if row is None or not 0 <= index < len(row["artifacts"]):
+                    return self._reply(404, "Artifact not found")
+                from web_artifacts import verified_artifact
+                item = row["artifacts"][index]
+                state, stream = verified_artifact(item)
+                if stream is None:
+                    return self._reply(409, ARTIFACT_STATES[state] + "，或文件内容已变更。")
+                with stream:
+                    return send_artifact(self, stream, Path(item["path"]).name, item["bytes"])
+            try:
+                if route == "/fast.js" and not query:
+                    return self._reply(200, FAST_SCRIPT, content_type="application/javascript")
+                if route == "/space" and len(query) <= 100:
+                    fields = parse_qs(query)
+                    kind, = fields.get("kind", [None])
+                    days, = fields.get("days", ["30"])
+                    if (kind is not None and kind not in SPACE_KINDS or not days.isascii() or
+                            not days.isdecimal() or len(days) > 5 or int(days) > 36500):
+                        raise ValueError("Invalid space preview options")
+                    return self._reply(200, _workbench_page(workspace, "空间与清理预览",
+                                       workspace.space(kind, int(days))), html=True)
+                if route in views:
+                    title, view = views[route]
+                    return self._reply(200, _workbench_page(workspace, title, view(),
+                                       fast_script=route == "/workbench"), html=True)
+                if route in ("/job", "/reuse") and len(query) <= 200:
+                    params = parse_qs(query)
+                    identity, = params.get("id", [""])
+                    job = workspace.get_job(identity)
                     if job is None:
                         return self._reply(404, "Job not found")
+                    if route == "/reuse":
+                        if not job.get("form"):
+                            return self._reply(404, "No reusable form")
+                        return self._reply(200, _workbench_page(workspace, "复用构建参数",
+                                           workspace.builds(job["action"], job["form"]),
+                                           fast_script=job["action"] == "fast"), html=True)
                     body, refresh = workspace.job_page(job)
                     return self._reply(200, _workbench_page(workspace, "任务详情", body, refresh), html=True)
             except (BuildError, OSError, ValueError) as exc:
@@ -245,6 +302,11 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                 return self._reply(403, "Invalid request origin")
             path, _, query = self.path.partition("?")
             route = session_route(path, workspace.prefix)
+            if route == "/preview-fast" and not query:
+                try:
+                    return self._json(200, workspace.preview_fast(form_data(self)))
+                except (BuildError, OSError, ValueError) as exc:
+                    return self._json(400, {"error": str(exc)})
             try:
                 if route is not None and route.startswith("/submit/") and not query:
                     identity = workspace.submit(route[len("/submit/"):], form_data(self))

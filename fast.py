@@ -249,6 +249,16 @@ def _extract_dist(archive_path, destination, reporter=None):
             extracted += item.file_size
 
 
+def fast_target(artifact, project, version, profile, output=None):
+    """计算 CLI 与网页共用的标签和默认归档路径，不创建文件。"""
+    front, project, version = _validate_request(artifact, project, version)
+    suffix = "front" if front else "back"
+    tag = "{}_{}:{}".format(project, suffix, version)
+    target = Path(output) if output is not None else (
+        profile.get("outputDir") or artifact.parent) / "{}_{}-{}.tar".format(project, suffix, version)
+    return front, tag, output_path(target)
+
+
 def quick_build(artifact, project, version, config_path=None, *,
                 tag=None, output=None, image_format="docker", platform="linux/amd64",
                 source_date_epoch=0, cache_dir=None, profile_name=None,
@@ -261,12 +271,8 @@ def quick_build(artifact, project, version, config_path=None, *,
     config_path = _config_path(config_path)
     settings, _ = load_settings(config_path, required=True)
     profile = load_profile(config_path, profile_name)
-    front, project, version = _validate_request(artifact, project, version)
-    suffix = "front" if front else "back"
-    tag = tag or "{}_{}:{}".format(project, suffix, version)
-    output = Path(output) if output is not None else (
-        profile.get("outputDir") or artifact.parent) / "{}_{}-{}.tar".format(project, suffix, version)
-    output = output_path(output)
+    front, default_tag, output = fast_target(artifact, project, version, profile, output)
+    tag = tag or default_tag
     if output == artifact or output == config_path or output == profile.get("baseTar"):
         raise BuildError("Output must differ from the inputs")
     if output.exists():
