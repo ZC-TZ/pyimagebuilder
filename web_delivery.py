@@ -127,10 +127,12 @@ class Delivery:
             self.pending[token] = (now + 600, plan)
             return token
 
-    def confirm(self, token, action="push"):
+    def confirm(self, token, action, accept):
         with self.lock:
             entry = self.pending.get(token)
             if entry is None or entry[0] <= time.monotonic() or entry[1]["action"] != action:
                 raise BuildError("确认已过期、已使用或操作不匹配，请重新预览")
+            # 入队被拒绝时仍可重试。校验和接收放在同一把锁内，避免重复提交。
+            result = accept(entry[1])
             del self.pending[token]
-            return entry[1]
+            return result

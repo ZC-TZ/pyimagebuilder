@@ -63,6 +63,13 @@ def host_components(parts, windows=None, wildcards=False):
             raise BuildError("Unsupported Windows path component: " + repr(part))
 
 
+def resolve_host_path(value):
+    try:
+        return Path(value).resolve()
+    except RuntimeError as exc:
+        raise BuildError("Cannot resolve local path {}: {}".format(value, exc)) from exc
+
+
 def output_path(value):
     """解析交付输出，但拒绝最终节点的链接，包括指向不存在文件的链接。
 
@@ -73,7 +80,7 @@ def output_path(value):
     if "\0" in str(raw) or raw.is_symlink():
         raise BuildError("Output path must not contain NUL or be a symlink")
     host_components([part for part in raw.parts if part not in (raw.anchor, ".", "..")])
-    return raw.resolve()
+    return resolve_host_path(raw)
 
 
 def stored_file_path(value, label, error_type=BuildError):

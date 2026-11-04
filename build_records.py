@@ -66,7 +66,10 @@ def _read_record(path):
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
         raise ValueError("Build record must be a regular JSON file no larger than 64 KiB")
-    row = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        row = json.loads(path.read_text(encoding="utf-8"))
+    except RecursionError as exc:
+        raise ValueError("Build record JSON is nested too deeply") from exc
     if (not isinstance(row, dict) or row.get("schemaVersion") != 1 or
             row.get("id") != path.stem or
             not all(isinstance(row.get(key), str)

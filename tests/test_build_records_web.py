@@ -95,6 +95,16 @@ class BuildRecordsWebTests(unittest.TestCase):
         self.assertEqual(serve.call_args[0], (self.directory, 0, "hisq", None, 8))
         self.assertIn("settings", serve.call_args[1])
 
+    def test_deeply_nested_build_record_returns_a_ledger_error_page(self):
+        self.record("hisq:1", "hisq")
+        record, = self.directory.glob("*.json")
+        record.write_text("[" * 8000 + "0" + "]" * 8000, encoding="utf-8")
+        with patch.object(build_records_web.sys, "stderr", new=io.StringIO()) as terminal:
+            status, _, page = self.request()
+        self.assertEqual(status, 500)
+        self.assertIn("暂时无法读取台账", page)
+        self.assertIn("nested too deeply", terminal.getvalue())
+
     def test_browser_reset_before_request_line_does_not_report_server_error(self):
         finished = threading.Event()
         shutdown_request = self.server.shutdown_request
@@ -435,6 +445,53 @@ class WorkbenchTests(unittest.TestCase):
         status, _, page = result
         self.assertEqual(status, 200, page)
         return re.search(rb'name="token" value="([^"]+)"', page).group(1).decode("ascii")
+
+    def test_confirmation_remains_usable_when_queue_rejects_submission(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from errors import BuildError
+        token = self.workspace.delivery.offer({"action": "cache-clean"})
+        with patch.object(self.workspace, "submit_delivery", side_effect=BuildError("Web job queue is full")):
+            self.assertEqual(self.http("/cache/confirm", {"token": token})[0], 400)
+        with patch.object(self.workspace, "submit_delivery", return_value="a" * 32) as submit:
+            start = threading.Barrier(2)
+
+            def confirm():
+                start.wait(5)
+                return self.http("/cache/confirm", {"token": token})[0]
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first, second = pool.submit(confirm), pool.submit(confirm)
+                self.assertEqual(sorted((first.result(), second.result())), [303, 400])
+            submit.assert_called_once_with({"action": "cache-clean"})
+
+    def test_unreadable_job_summary_does_not_break_the_task_list(self):
+        journal = self.workspace.jobs.journal
+        good, broken = "a" * 32, "b" * 32
+        journal.write({"id": good, "action": "fast", "state": "success", "label": "kept",
+                       "form": {"project": "kept"}})
+        (journal.directory / (broken + ".json")).write_text(
+            '{"form":' + "[" * 8000 + "0" + "]" * 8000 + "}", encoding="utf-8")
+        self.assertEqual(self.http("/job?id=" + broken)[0], 404)
+        status, _, body = self.http("/jobs")
+        self.assertEqual(status, 200)
+        self.assertIn(b"kept", body)
+
+    def test_fast_preview_and_submit_report_unresolvable_package_path(self):
+        package = self.root / "loop.war"
+        fields = {"package": str(package), "project": "hisq", "version": "1", "profile": "tomcat"}
+        real_resolve = Path.resolve
+
+        def resolve(path, *args, **kwargs):
+            if path == package:
+                raise RuntimeError("Symlink loop")
+            return real_resolve(path, *args, **kwargs)
+
+        with patch.object(Path, "resolve", resolve):
+            status, _, body = self.http("/preview-fast", fields)
+            self.assertEqual(status, 400)
+            self.assertIn("Symlink loop", json.loads(body)["error"])
+            self.assertEqual(self.http("/submit/fast", fields)[0], 400)
+        self.assertFalse(self.workspace.jobs.snapshot())
 
     def test_cache_cleanup_rechecks_candidates_and_refuses_active_builds(self):
         from cache import LayerCache

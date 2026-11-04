@@ -22,7 +22,7 @@ from settings import cache_directory, config_path, load_settings, repository_set
 from compat import unlink_missing
 from file_publish import publication_transaction
 from path_policy import (archive_path as safe_archive_path, container_path, host_components,
-                         host_path_aliases, output_path)
+                         host_path_aliases, output_path, resolve_host_path)
 
 
 DEFAULTS = {
@@ -55,12 +55,12 @@ def _validate_atom(value, field, pattern=PROJECT):
 
 def _resolved_config_path(value, config_path):
     path = Path(value)
-    return (path if path.is_absolute() else config_path.parent / path).resolve()
+    return resolve_host_path(path if path.is_absolute() else config_path.parent / path)
 
 
 def load_profile(config_path, profile_name=None):
     """解析并校验 Fast profile，包括基础镜像来源、部署目录和可选 TongWeb XML。"""
-    config_path = Path(config_path).resolve()
+    config_path = resolve_host_path(config_path)
     settings, _ = load_settings(config_path, required=True)
     section = settings["fast"]
     selected = profile_name or section.get("defaultProfile")
@@ -265,7 +265,7 @@ def quick_build(artifact, project, version, config_path=None, *,
                 reporter=None, cache_stats=None, build_info=None,
                 verify_cache=False):
     """根据应用包、显式主题名和版本号准备临时 Dockerfile，再调用通用构建器。"""
-    artifact = Path(artifact).resolve()
+    artifact = resolve_host_path(artifact)
     if not artifact.is_file():
         raise BuildError("Application package not found: " + str(artifact))
     config_path = _config_path(config_path)

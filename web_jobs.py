@@ -15,7 +15,7 @@ from errors import BuildError
 from build_args import arguments
 from fast import fast_target, load_profile
 from file_resources import fdopen_owned
-from path_policy import output_path
+from path_policy import output_path, resolve_host_path
 from web_job_journal import JobJournal, form_snapshot
 
 
@@ -69,7 +69,7 @@ def _target(data):
 
 def fast_plan(data, config, profiles):
     """验证 Fast 表单并预览实际标签、部署位置和两个可能的输出。"""
-    package = _path(_required(data, "package")).resolve()
+    package = resolve_host_path(_path(_required(data, "package")))
     project = _required(data, "project")
     version = _required(data, "version")
     profile_name = _choice(data, "profile", profiles, "")

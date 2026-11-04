@@ -338,12 +338,10 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                     fields = form_data(self)
                     if set(fields) != {"token"}:
                         raise ValueError("Invalid confirmation")
-                    action = "profile-save" if route == "/profile/confirm" else "cache-clean"
-                    plan = workspace.delivery.confirm(fields["token"], action)
-                    if action == "profile-save":
-                        workspace.save_profile(plan)
+                    if route == "/profile/confirm":
+                        workspace.delivery.confirm(fields["token"], "profile-save", workspace.save_profile)
                         return self._redirect(workspace.prefix + "/config")
-                    identity = workspace.submit_delivery(plan)
+                    identity = workspace.delivery.confirm(fields["token"], "cache-clean", workspace.submit_delivery)
                 elif route == "/delivery/prepare" and not query:
                     plan = workspace.delivery.plan(form_data(self))
                     if plan["action"] == "push":
@@ -355,7 +353,7 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                     fields = form_data(self)
                     if set(fields) != {"token"}:
                         raise ValueError("Invalid push confirmation")
-                    identity = workspace.submit_delivery(workspace.delivery.confirm(fields["token"]))
+                    identity = workspace.delivery.confirm(fields["token"], "push", workspace.submit_delivery)
                 elif route is not None and route.startswith("/submit/") and not query:
                     identity = workspace.submit(route[len("/submit/"):], form_data(self))
                 elif route == "/cancel" and len(query) <= 100:

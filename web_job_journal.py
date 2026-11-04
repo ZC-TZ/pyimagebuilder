@@ -65,7 +65,7 @@ class JobJournal:
                 return None
             item["form"] = form_snapshot(item["action"], item["form"])
             return item
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             return None
 
     def recent(self, limit=60):
