@@ -73,6 +73,105 @@ FAST_SCRIPT = r"""
 """
 
 
+JOB_SCRIPT = r"""
+(() => {
+  const output = document.getElementById('job-output');
+  if (!output) return;
+  const latest = document.getElementById('job-latest');
+  const follow = document.getElementById('job-follow');
+  const details = document.getElementById('job-details');
+  const status = document.getElementById('job-status');
+  const pollStatus = document.getElementById('job-poll-status');
+  const exportLog = document.getElementById('job-export');
+  let after = Number(output.dataset.after);
+  let first = after - output.childElementCount;
+  let detailsHTML = details.innerHTML;
+  let following = true;
+
+  function showFollow() {
+    const message = following ? '正在跟随最新日志' : '已暂停跟随，可继续查看上方日志';
+    if (follow.textContent !== message) follow.textContent = message;
+  }
+  function jump() {
+    following = true;
+    output.scrollTop = output.scrollHeight;
+    showFollow();
+  }
+  function atBottom() {
+    return output.scrollHeight - output.clientHeight - output.scrollTop <= 2;
+  }
+  latest.hidden = false;
+  latest.addEventListener('click', jump);
+  output.addEventListener('scroll', () => {
+    following = atBottom();
+    showFollow();
+  });
+  jump();
+
+  async function poll() {
+    let again = true;
+    const request = new AbortController();
+    const timeout = setTimeout(() => request.abort(), 10000);
+    try {
+      const response = await fetch(output.dataset.url + '&after=' + after, {signal: request.signal});
+      if (response.status === 404) {
+        again = false;
+        pollStatus.textContent = '此任务已不在当前会话，已停止更新。';
+        pollStatus.hidden = false;
+        return;
+      }
+      if (!response.ok) throw new Error('Cannot read job progress');
+      const next = await response.json();
+      if (next.details !== detailsHTML) {
+        details.innerHTML = next.details;
+        detailsHTML = next.details;
+      }
+      if (status.textContent !== next.status) status.textContent = next.status;
+      if (!next.archived && next.end !== after) {
+        following = atBottom();
+        const top = output.scrollTop;
+        const removed = Math.max(0, next.start - first);
+        let keepTop = top;
+        // 日志窗口淘汰旧行时，扣掉实际高度，保留仍在窗口内的阅读位置。
+        if (!following && removed) {
+          const retained = output.children[removed];
+          keepTop = retained ? Math.max(0, top - (retained.getBoundingClientRect().top -
+            output.firstElementChild.getBoundingClientRect().top)) : 0;
+        }
+        for (let i = 0; i < removed && output.firstElementChild; i++) {
+          output.firstElementChild.remove();
+        }
+        const fragment = document.createDocumentFragment();
+        for (const text of next.lines) {
+          const line = document.createElement('span');
+          line.textContent = text;
+          fragment.appendChild(line);
+        }
+        output.appendChild(fragment);
+        first = next.start;
+        after = next.end;
+        if (following) jump();
+        else {
+          output.scrollTop = keepTop;
+          showFollow();
+        }
+      }
+      exportLog.hidden = next.archived || !output.childElementCount;
+      again = next.running;
+      pollStatus.hidden = true;
+    } catch (error) {
+      pollStatus.textContent = '暂时无法更新日志，正在重试…';
+      pollStatus.hidden = false;
+    } finally {
+      clearTimeout(timeout);
+      if (again) setTimeout(poll, 2000);
+    }
+  }
+  if (output.dataset.running === '1') setTimeout(poll, 2000);
+})();
+"""
+
+
 def _e(value):
     return escape(str(value))
 
@@ -433,11 +532,10 @@ class Workbench:
         item = self.jobs.journal.read(identity)
         return self._archived(item) if item is not None and item["action"] in LABELS else None
 
-    def job_page(self, job):
+    def job_details(self, job):
         identity, state = job["id"], job["state"]
         running = state in ("queued", "running")
-        content = '<div class="job-summary">{} <code>{}</code></div><p class="muted">{}</p>'.format(
-            _job_state(state), _e(job["label"]), _e(job["status"]))
+        content = '<div class="job-summary">{} <code>{}</code></div>'.format(_job_state(state), _e(job["label"]))
         if state == "queued" or (state == "running" and os.name == "posix" and not job.get("interrupt")):
             content += '<form method="post" action="{}/cancel?{}"><button class="secondary">取消任务</button></form>'.format(
                 self.prefix, urlencode({"id": identity}))
@@ -460,12 +558,34 @@ class Workbench:
                 "下载归档" if path.suffix.lower() == ".tar" else "下载附属文件", _e(path))
         if job.get("archived"):
             content += "<p>这里只保存任务结果；成功的归档请到打包台账查看。</p>"
-        else:
-            content += '<h2>任务日志</h2><pre tabindex="0" aria-label="任务日志">{}</pre>'.format(_e("\n".join(job["logs"]) or "等待输出…"))
-            if job["logs"]:
-                content += '<p><a class="button compact" href="{}/job-log?{}">导出当前日志</a>　<small>分享前请检查命令输出。</small></p>'.format(
-                    self.prefix, urlencode({"id": identity}))
-        return _section(LABELS[job["action"]], content), running
+        return content
+
+    def job_page(self, job):
+        running = job["state"] in ("queued", "running")
+        content = '<div id="job-details">{}</div><p class="muted" id="job-status">{}</p>'.format(
+            self.job_details(job), _e(job["status"]))
+        if not job.get("archived"):
+            query = urlencode({"id": job["id"]})
+            lines = "".join('<span>{}</span>'.format(_e(line)) for line in job["logs"])
+            content += ('<div class="actions"><h2>任务日志</h2>'
+                        '<button type="button" class="secondary" id="job-latest" hidden>跳到最新</button>'
+                        '<small class="muted" id="job-follow" role="status"></small></div>'
+                        '<p class="muted" id="job-poll-status" role="status" hidden></p>'
+                        '<pre id="job-output" tabindex="0" aria-label="任务日志" data-url="{0}/job-progress?{1}" '
+                        'data-after="{2}" data-running="{3}">{4}</pre>'
+                        '<p id="job-export"{5}><a class="button compact" href="{0}/job-log?{1}">导出当前日志</a>'
+                        '　<small>分享前请检查命令输出。</small></p>').format(
+                            self.prefix, query, job["log_end"], int(running), lines, "" if lines else " hidden")
+            if running:
+                content += '<noscript><p><a href="{}/job?{}">刷新任务状态和日志</a></p></noscript>'.format(self.prefix, query)
+        return _section(LABELS[job["action"]], content)
+
+    def job_progress(self, job, after):
+        end = job.get("log_end", 0)
+        start = end - len(job["logs"])
+        return {"details": self.job_details(job), "status": job["status"],
+                "running": job["state"] in ("queued", "running"), "archived": bool(job.get("archived")),
+                "start": start, "end": end, "lines": job["logs"][max(0, after - start):]}
 
     def submit(self, action, data):
         args, outputs = command_for(action, data, self.config_arg, self.profiles)

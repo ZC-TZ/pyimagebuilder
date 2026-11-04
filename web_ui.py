@@ -133,6 +133,10 @@ li+li{margin-top:6px}
 .job-row:last-child{border-bottom:0}.job-row strong{margin-right:7px}
 pre{font:12px/1.6 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere;background:#152238;color:#e2ecfb;padding:12px 14px;border-radius:9px;
   max-height:460px;overflow:auto;margin:9px 0}
+#job-output{overflow-anchor:none}
+#job-output>span{display:block;min-height:1.6em}
+#job-output:empty::before{content:"等待输出…"}
+#job-latest[hidden]{display:none}
 .tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
 .operation-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 .tile-value{font-size:24px;letter-spacing:-.035em;font-weight:750}.tile-path{display:block;margin-top:6px}

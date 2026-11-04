@@ -182,6 +182,38 @@ class WorkbenchTests(unittest.TestCase):
         output.write_bytes(b"not the registered file")
         self.assertEqual(self.http(download)[0], 409)
 
+    def test_job_progress_returns_only_new_lines_even_after_log_rotation(self):
+        jobs = self.workspace.jobs
+        with jobs.condition:
+            identity = jobs.submit("fast", [], [], "hisq", {"project": "hisq"})
+            jobs.queue.remove(identity)
+            job = jobs.jobs[identity]
+            for number in range(250):
+                jobs._append_log(job, "line {}".format(number))
+            job["state"] = "running"
+
+        body = self.http("/job?id=" + identity)[2]
+        self.assertNotIn(b'http-equiv="refresh"', body)
+        self.assertIn(b'data-after="250"', body)
+        self.assertIn(b"/job.js", body)
+        with jobs.condition:
+            jobs._append_log(job, "<script>literal log</script>")
+            job.update(state="success", status="Done", code=0)
+
+        url = "/job-progress?id=" + identity + "&after="
+        self.assertEqual(self.http(url + "250", authenticated=False)[0], 404)
+        self.assertEqual(self.http(url + "250&after=1")[0], 400)
+        status, headers, raw = self.http(url + "250")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        progress = json.loads(raw)
+        self.assertEqual((progress["start"], progress["end"]), (1, 251))
+        self.assertEqual(progress["lines"], ["<script>literal log</script>"])
+        self.assertEqual(progress["status"], "Done")
+        self.assertFalse(progress["running"])
+        self.assertIn("复用参数", progress["details"])
+        self.assertEqual(json.loads(self.http(url + "251")[2])["lines"], [])
+
     def test_fast_then_manage_local_image(self):
         war = self.root / "app.war"
         war.write_bytes(b"war")

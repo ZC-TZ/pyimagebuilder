@@ -93,7 +93,7 @@ PAGES = {
     "构建与打包": ("build", "从应用包或 Dockerfile 构建镜像，生成可交付的归档。"),
     "复用构建参数": ("build", "核对项目、版本和输出路径后，可再次提交。"),
     "最近任务": ("jobs", "查看进度、历史结果和可下载的产物。"),
-    "任务详情": ("jobs", ""),
+    "任务详情": ("jobs", "运行期间自动更新任务状态和日志。"),
     "本地镜像库": ("images", "按标签、平台或来源查找镜像并执行产物操作。"),
     "产物操作": ("", "基于选中的归档或镜像执行校验、分析与交付。"),
     "推送确认": ("", ""),
@@ -104,13 +104,10 @@ PAGES = {
 }
 
 
-def _workbench_page(workspace, title, body, refresh=False, fast_script=False, active=None):
+def _workbench_page(workspace, title, body, fast_script=False, active=None, job_script=False):
     default_active, description = PAGES.get(title, ("", ""))
-    head = '<meta http-equiv="refresh" content="2">' if refresh else ""
-    if fast_script:
-        head += '<script defer src="{}/fast.js"></script>'.format(workspace.prefix)
-    if refresh:
-        description = "任务执行期间每两秒刷新一次。"
+    script = "fast.js" if fast_script else "job.js" if job_script else None
+    head = '<script defer src="{}/{}"></script>'.format(workspace.prefix, script) if script else ""
     return document(title, '<section class="records">{}</section>'.format(body),
                     workspace.nav(default_active if active is None else active), description, head)
 
@@ -206,7 +203,7 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                                           len(rows) > end, workspace=workspace), html=True)
 
         def _get_workbench(self, route, query):
-            from web_workbench import FAST_SCRIPT, SPACE_KINDS, download, send_artifact
+            from web_workbench import FAST_SCRIPT, JOB_SCRIPT, SPACE_KINDS, download, send_artifact
             views = {"/workbench": ("构建与打包", workspace.builds), "/jobs": ("最近任务", workspace.tasks),
                      "/config": ("配置概览", workspace.configuration)}
             if route == "/download" and len(query) <= 200:
@@ -237,6 +234,17 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                 with stream:
                     return send_artifact(self, stream, Path(item["path"]).name, item["bytes"])
             try:
+                if route == "/job-progress" and len(query) <= 100:
+                    fields = parse_qs(query, keep_blank_values=True)
+                    if set(fields) != {"id", "after"} or any(len(values) != 1 for values in fields.values()):
+                        raise ValueError("Invalid job progress selector")
+                    identity, after = fields["id"][0], fields["after"][0]
+                    if not after.isascii() or not after.isdecimal() or len(after) > 16:
+                        raise ValueError("Invalid job log cursor")
+                    job = workspace.get_job(identity)
+                    if job is None:
+                        return self._reply(404, "Job not found")
+                    return self._json(200, workspace.job_progress(job, int(after)))
                 if route == "/job-log" and len(query) <= 100:
                     identity, = parse_qs(query).get("id", [""])
                     job = workspace.jobs.snapshot(identity)
@@ -253,6 +261,8 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                     return self.wfile.write(body)
                 if route == "/fast.js" and not query:
                     return self._reply(200, FAST_SCRIPT, content_type="application/javascript")
+                if route == "/job.js" and not query:
+                    return self._reply(200, JOB_SCRIPT, content_type="application/javascript")
                 if route == "/profile" and len(query) <= 256:
                     name, = parse_qs(query).get("name", [None])
                     return self._reply(200, _workbench_page(workspace, "Fast 模板管理",
@@ -297,11 +307,11 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                         return self._reply(200, _workbench_page(workspace, "复用构建参数",
                                            workspace.builds(job["action"], job["form"]),
                                            fast_script=job["action"] == "fast"), html=True)
-                    body, refresh = workspace.job_page(job)
-                    return self._reply(200, _workbench_page(workspace, "任务详情", body, refresh), html=True)
+                    return self._reply(200, _workbench_page(workspace, "任务详情", workspace.job_page(job),
+                                       job_script=not job.get("archived")), html=True)
             except (BuildError, OSError, ValueError) as exc:
                 return self._reply(400, _workbench_page(workspace, "无法完成请求", '<p class="empty">{}</p>'.format(
-                    escape(str(exc))), False), html=True)
+                    escape(str(exc)))), html=True)
             return self._reply(404, "Not found")
 
         def do_POST(self):

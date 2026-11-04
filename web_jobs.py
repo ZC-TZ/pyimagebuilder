@@ -240,7 +240,7 @@ class Jobs:
                 del self.jobs[oldest]
             identity = uuid.uuid4().hex
             self.jobs[identity] = {"id": identity, "action": action, "args": args, "outputs": outputs,
-                                   "state": "queued", "logs": deque(maxlen=250), "files": [],
+                                   "state": "queued", "logs": deque(maxlen=250), "log_end": 0, "files": [],
                                    "status": "", "process": None, "label": label,
                                    "form": form_snapshot(action, form or {}), "delivery": delivery}
             self.queue.append(identity)
@@ -248,13 +248,18 @@ class Jobs:
             self.condition.notify()
             return identity
 
+    @staticmethod
+    def _append_log(job, line):
+        job["logs"].append(line[:4000])
+        job["log_end"] += 1
+
     def _save(self, job):
         try:
             self.journal.write(job)
         except (OSError, ValueError):
             # 台账由 CLI 单独提交；可选的任务摘要写失败不能改变归档的构建结果。
             if not job.get("journal_warning"):
-                job["logs"].append("任务摘要未能写入磁盘，关闭工作台后可能无法查看。")
+                self._append_log(job, "任务摘要未能写入磁盘，关闭工作台后可能无法查看。")
                 job["journal_warning"] = True
 
     def snapshot(self, identity=None):
@@ -319,7 +324,7 @@ class Jobs:
                                                env=env, **options)
                     job["process"] = process
                 except (OSError, ValueError) as exc:
-                    job["logs"].append(str(exc))
+                    self._append_log(job, str(exc))
                     job["state"] = "failed"
                     self._save(job)
                     continue
@@ -347,10 +352,10 @@ class Jobs:
                             if event["type"] in ("heartbeat", "step_progress", "layer_progress"):
                                 continue
                             line = "{}: {}".format(event["type"], message)
-                        job["logs"].append(line[:4000])
+                        self._append_log(job, line)
         except OSError as exc:
             with self.condition:
-                job["logs"].append(str(exc))
+                self._append_log(job, str(exc))
         code = process.wait()
         with self.condition:
             job["state"] = "success" if code == 0 else ("cancelled" if job.get("interrupt") else "failed")
