@@ -83,6 +83,7 @@ JOB_SCRIPT = r"""
   const status = document.getElementById('job-status');
   const pollStatus = document.getElementById('job-poll-status');
   const exportLog = document.getElementById('job-export');
+  const omitted = document.getElementById('job-log-omitted');
   let after = Number(output.dataset.after);
   let first = after - output.childElementCount;
   let detailsHTML = details.innerHTML;
@@ -116,6 +117,7 @@ JOB_SCRIPT = r"""
       const response = await fetch(output.dataset.url + '&after=' + after, {signal: request.signal});
       if (response.status === 404) {
         again = false;
+        output.dataset.running = '0';
         pollStatus.textContent = '此任务已不在当前会话，已停止更新。';
         pollStatus.hidden = false;
         return;
@@ -150,6 +152,10 @@ JOB_SCRIPT = r"""
         output.appendChild(fragment);
         first = next.start;
         after = next.end;
+        if (first) {
+          omitted.textContent = String(first);
+          omitted.parentElement.hidden = false;
+        }
         if (following) jump();
         else {
           output.scrollTop = keepTop;
@@ -158,6 +164,7 @@ JOB_SCRIPT = r"""
       }
       exportLog.hidden = next.archived || !output.childElementCount;
       again = next.running;
+      if (!again) output.dataset.running = '0';
       pollStatus.hidden = true;
     } catch (error) {
       pollStatus.textContent = '暂时无法更新日志，正在重试…';
@@ -567,15 +574,18 @@ class Workbench:
         if not job.get("archived"):
             query = urlencode({"id": job["id"]})
             lines = "".join('<span>{}</span>'.format(_e(line)) for line in job["logs"])
+            omitted = job["log_end"] - len(job["logs"])
             content += ('<div class="actions"><h2>任务日志</h2>'
                         '<button type="button" class="secondary" id="job-latest" hidden>跳到最新</button>'
                         '<small class="muted" id="job-follow" role="status"></small></div>'
-                        '<p class="muted" id="job-poll-status" role="status" hidden></p>'
                         '<pre id="job-output" tabindex="0" aria-label="任务日志" data-url="{0}/job-progress?{1}" '
                         'data-after="{2}" data-running="{3}">{4}</pre>'
                         '<p id="job-export"{5}><a class="button compact" href="{0}/job-log?{1}">导出当前日志</a>'
-                        '　<small>分享前请检查命令输出。</small></p>').format(
-                            self.prefix, query, job["log_end"], int(running), lines, "" if lines else " hidden")
+                        '　<small>分享前请检查命令输出。</small></p>'
+                        '<p class="muted" id="job-poll-status" role="status" hidden></p>'
+                        '<p class="muted"{6}>前 <span id="job-log-omitted">{7}</span> 条日志已移出窗口。</p>').format(
+                            self.prefix, query, job["log_end"], int(running), lines, "" if lines else " hidden",
+                            "" if omitted else " hidden", omitted)
             if running:
                 content += '<noscript><p><a href="{}/job?{}">刷新任务状态和日志</a></p></noscript>'.format(self.prefix, query)
         return _section(LABELS[job["action"]], content)

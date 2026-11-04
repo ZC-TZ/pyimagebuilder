@@ -28,6 +28,8 @@ LABELS = {"fast": "快速打包", "build": "Dockerfile 构建", "check": "检查
           "cache-clean": "清理过期构建缓存", "profile-test": "测试 Fast 基础镜像"}
 PLATFORMS = ("linux/amd64", "linux/arm64")
 FORMATS = ("docker", "oci", "both")
+LOG_LINE_CHARS = 4000
+LOG_RECORD_BYTES = 512 * 1024
 
 
 def _text(data, name, default=""):
@@ -250,7 +252,9 @@ class Jobs:
 
     @staticmethod
     def _append_log(job, line):
-        job["logs"].append(line[:4000])
+        if len(line) > LOG_LINE_CHARS:
+            line = line[:LOG_LINE_CHARS - 1] + "…"
+        job["logs"].append(line)
         job["log_end"] += 1
 
     def _save(self, job):
@@ -265,8 +269,11 @@ class Jobs:
     def snapshot(self, identity=None):
         with self.condition:
             def view(job):
-                return {key: list(value) if key in ("logs", "files") else value
-                        for key, value in job.items() if key not in ("args", "process", "outputs")}
+                snapshot = {key: list(value) if key in ("logs", "files") else value
+                            for key, value in job.items() if key not in ("args", "process", "outputs")}
+                if job["state"] == "running" and job.get("interrupt"):
+                    snapshot["status"] = "正在取消"
+                return snapshot
             if identity is None:
                 return [view(job) for job in reversed(self.jobs.values())]
             job = self.jobs.get(identity)
@@ -290,7 +297,6 @@ class Jobs:
                         pass
                     else:
                         job["interrupt"] = True
-                        job["status"] = "正在取消"
 
     def close(self):
         with self.condition:
@@ -333,8 +339,15 @@ class Jobs:
     def _collect(self, job, process):
         try:
             with process.stdout as stream:
-                for raw in iter(lambda: stream.readline(65536), b""):
-                    line = raw.decode("utf-8", errors="replace").strip()
+                for raw in iter(lambda: stream.readline(LOG_RECORD_BYTES), b""):
+                    line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if len(raw) == LOG_RECORD_BYTES and not raw.endswith(b"\n"):
+                        # 有界读取，确保超长记录的后半段不会被误认作新的 JSON 事件。
+                        with self.condition:
+                            self._append_log(job, line[:LOG_LINE_CHARS - 1] + "…")
+                        while raw and not raw.endswith(b"\n"):
+                            raw = stream.readline(LOG_RECORD_BYTES)
+                        continue
                     try:
                         event = json.loads(line)
                     except (ValueError, RecursionError):
@@ -348,7 +361,7 @@ class Jobs:
                             message = event.get("message") or event.get("phase") or event["type"]
                             if type(current) is int and type(total) is int and total > 0:
                                 message = "{} · {:.0%}".format(message, min(max(current, 0), total) / total)
-                            job["status"] = str(message)[:4000]
+                            job["status"] = str(message)[:LOG_LINE_CHARS]
                             if event["type"] in ("heartbeat", "step_progress", "layer_progress"):
                                 continue
                             line = "{}: {}".format(event["type"], message)

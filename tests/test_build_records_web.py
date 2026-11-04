@@ -1,6 +1,7 @@
 """用回环 HTTP 验证网页读取同一台账及浏览器访问边界。"""
 
 import http.client
+import io
 import json
 import os
 import re
@@ -13,7 +14,7 @@ import unittest
 from pathlib import Path
 from http.server import ThreadingHTTPServer
 from urllib.parse import urlencode
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import build_records
 import build_records_web
@@ -213,6 +214,48 @@ class WorkbenchTests(unittest.TestCase):
         self.assertFalse(progress["running"])
         self.assertIn("复用参数", progress["details"])
         self.assertEqual(json.loads(self.http(url + "251")[2])["lines"], [])
+        finished = self.http("/job?id=" + identity)[2].decode("utf-8")
+        self.assertIn('<span id="job-log-omitted">1</span>', finished)
+
+    def test_collect_preserves_long_structured_log_and_drains_oversized_line(self):
+        jobs = self.workspace.jobs
+        with jobs.condition:
+            identity = jobs.submit("build", [], [], "test")
+            jobs.queue.remove(identity)
+            job = jobs.jobs[identity]
+            job["state"] = "running"
+        long_message = json.dumps({"type": "step_log", "elapsed": 1, "message": "构" * 21500},
+                                  ensure_ascii=True).encode("ascii")
+        embedded_event = b'{"type":"step_log","elapsed":1,"message":"embedded"}'
+        stream = io.BytesIO(long_message + b"\n" + b"x" * (1024 * 1024) + embedded_event +
+                            b"\n" + b"  next physical line\n")
+        jobs._collect(job, Mock(stdout=stream, wait=Mock(return_value=0)))
+        logs = jobs.snapshot(identity)["logs"]
+        self.assertEqual(len(logs), 3)
+        self.assertTrue(logs[0].startswith("step_log: 构"))
+        self.assertTrue(logs[0].endswith("…"))
+        self.assertTrue(logs[1].endswith("…"))
+        self.assertEqual(logs[2], "  next physical line")
+
+    def test_progress_cannot_overwrite_cancelling_status(self):
+        jobs = self.workspace.jobs
+        with jobs.condition:
+            identity = jobs.submit("build", [], [], "test")
+            jobs.queue.remove(identity)
+            job = jobs.jobs[identity]
+            job.update(state="running", interrupt=True, status="Preparing")
+        stream = io.BytesIO(b'{"type":"heartbeat","elapsed":1,"message":"Building"}\n')
+
+        def finish():
+            progress = self.workspace.job_progress(jobs.snapshot(identity), 0)
+            self.assertTrue(progress["running"])
+            self.assertEqual(progress["status"], "正在取消")
+            return 130
+
+        jobs._collect(job, Mock(stdout=stream, wait=finish))
+        result = jobs.snapshot(identity)
+        self.assertEqual(result["state"], "cancelled")
+        self.assertNotEqual(result["status"], "正在取消")
 
     def test_fast_then_manage_local_image(self):
         war = self.root / "app.war"
