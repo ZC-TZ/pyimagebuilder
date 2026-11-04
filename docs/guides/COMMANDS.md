@@ -13,7 +13,7 @@
 | `python main.py build CONTEXT -t IMAGE -o archive.tar` | 使用 Dockerfile 构建 |
 | `python main.py build CONTEXT --check` | 静态检查，不下载或执行 RUN |
 | `python main.py builds --project hisq` | 按时间倒序查看本机记录的 Fast 打包；去掉项目筛选则列出全部构建 |
-| `python main.py builds --web` | 启动本机只读台账网页，在浏览器筛选和翻页 |
+| `python main.py --web` | 启动本机工作台，进行打包、构建、镜像库操作和历史查询；`builds --web` 也是入口 |
 
 首次步骤：[Fast 指南](FAST.md) · [Dockerfile 构建](BUILD.md)。`main.py` 也接受省略 build 的旧式构建参数；新命令示例统一使用显式 build。
 

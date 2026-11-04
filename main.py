@@ -171,9 +171,9 @@ def main(argv=None):
     if argv and argv[0] == "fast":
         from fast import main as fast_main
         return fast_main(argv[1:])
-    if argv and argv[0] == "builds":
+    if argv and argv[0] in ("builds", "--web"):
         from build_records import main as builds_main
-        return builds_main(argv[1:])
+        return builds_main(argv if argv[0] == "--web" else argv[1:])
     if argv and argv[0] == "cas":
         from cas_store import main as cas_main
         return cas_main(argv[1:])

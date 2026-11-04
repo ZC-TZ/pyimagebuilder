@@ -1,4 +1,4 @@
-"""台账的只读本机网页，复用 CLI 的记录读取逻辑。"""
+"""本机打包工作台的 HTTP 入口，复用台账查询与 CLI。"""
 
 import socket
 import sys
@@ -23,8 +23,8 @@ p{margin:0 0 8px}
 code{font:inherit;overflow-wrap:anywhere}
 form{display:flex;flex-wrap:wrap;gap:12px;align-items:end;margin-bottom:24px}
 label{display:grid;gap:4px;flex:1 1 210px;font-weight:600}
-input,button,.button{border:1px solid var(--line);border-radius:8px;font:inherit;padding:9px 12px}
-input{width:100%;color:var(--ink);background:#fff}
+input,select,button,.button{border:1px solid var(--line);border-radius:8px;font:inherit;padding:9px 12px}
+input,select{width:100%;color:var(--ink);background:#fff}
 button{color:#fff;background:var(--accent);border-color:var(--accent);cursor:pointer}
 a{color:var(--accent)}
 .button{display:inline-block;background:#fff;text-decoration:none;white-space:nowrap}
@@ -39,11 +39,17 @@ font-size:12px;font-weight:700;margin-right:6px}
 .meta{display:flex;gap:4px 16px;flex-wrap:wrap;font-size:14px}
 .controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:18px}
 .controls .muted{margin-right:auto}
+.tabs{display:flex;gap:8px 18px;flex-wrap:wrap;margin:0 0 22px;font-weight:700}
+.job-form{padding-top:10px;margin-bottom:0}
+.check{display:flex;align-items:center;gap:8px}
+.check input{width:auto}
+dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:4px 14px;margin:8px 0}
+dd{margin:0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#edf4f5;padding:12px;border-radius:8px}
 @media(max-width:550px){main{padding:26px 14px}article,.empty{padding:12px}form{gap:8px}}
 """
 
 
-def _url(project="", tag="", page=1):
+def _url(project="", tag="", page=1, root="/"):
     params = {}
     if project:
         params["project"] = project
@@ -51,7 +57,7 @@ def _url(project="", tag="", page=1):
         params["tag"] = tag
     if page > 1:
         params["page"] = page
-    return "/?" + urlencode(params) if params else "/"
+    return root + "?" + urlencode(params) if params else root
 
 
 def _artifact(item):
@@ -74,7 +80,8 @@ def _card(row):
         escape(row["tag"]), metadata, artifacts)
 
 
-def _page(directory, project, tag, page, rows, more, error=False):
+def _page(directory, project, tag, page, rows, more, error=False, workspace=None):
+    root = workspace.prefix + "/history" if workspace is not None else "/"
     cards = "".join(_card(row) for row in rows)
     if not cards:
         message = "暂时无法读取台账，请查看启动终端。" if error else "没有符合条件的记录。"
@@ -85,21 +92,31 @@ def _page(directory, project, tag, page, rows, more, error=False):
         links.append(("上一页", page - 1))
     if more:
         links.append(("下一页", page + 1))
-    controls.extend('<a class="button" href="{}">{}</a>'.format(escape(_url(project, tag, number)), label)
+    controls.extend('<a class="button" href="{}">{}</a>'.format(escape(_url(project, tag, number, root)), label)
                     for label, number in links)
     return """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>打包台账 · PyImageBuilder</title><style>{}</style></head>
 <body><main><header><h1>打包台账</h1>
 <p class="muted">按完成时间倒序排列（UTC）。路径为打包时的原始位置。</p>
-<p class="muted"><code>{}</code></p></header>
-<form action="/" method="get">
+<p class="muted"><code>{}</code></p></header>{}
+<form action="{}" method="get">
 <label>项目<input name="project" value="{}" placeholder="例如 hisq"></label>
 <label>镜像标签<input name="tag" value="{}" placeholder="例如 hisq_front:1.0.0"></label>
-<button type="submit">筛选</button><a class="button" href="/">清除筛选</a>
+<button type="submit">筛选</button><a class="button" href="{}">清除筛选</a>
 </form><section class="records" aria-label="构建记录">{}</section>
 <nav class="controls" aria-label="分页">{}</nav></main></body></html>""".format(
-        STYLE, escape(str(directory)), escape(project), escape(tag), cards, "".join(controls))
+        STYLE, escape(str(directory)), workspace.nav() if workspace is not None else "", root,
+        escape(project), escape(tag), root, cards, "".join(controls))
+
+
+def _workbench_page(workspace, title, body, refresh=False):
+    return """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">{}<title>{} · PyImageBuilder</title>
+<style>{}</style></head><body><main><header><h1>镜像构建工作台</h1>
+<p class="muted">{}</p></header>{}<section class="records">{}</section></main></body></html>""".format(
+        '<meta http-equiv="refresh" content="2">' if refresh else "", escape(title),
+        STYLE, escape(title), workspace.nav(), body)
 
 
 def _query(value):
@@ -114,8 +131,8 @@ def _query(value):
     return fields.get("project", [""])[0], fields.get("tag", [""])[0], int(page)
 
 
-def make_server(directory, port=8765, limit=None):
-    """只开放台账页面；固定绑定回环地址，并拒绝外站 Host。"""
+def make_server(directory, port=8765, limit=None, workspace=None):
+    """固定绑定回环地址；写操作还要求会话路径和同源表单。"""
 
     class LedgerHandler(BaseHTTPRequestHandler):
         def setup(self):
@@ -137,7 +154,7 @@ def make_server(directory, port=8765, limit=None):
             self.send_header("Content-Type", ("text/html" if html else "text/plain") + "; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
-            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Referrer-Policy", "same-origin")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Security-Policy",
                              "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; "
@@ -145,16 +162,34 @@ def make_server(directory, port=8765, limit=None):
             self.end_headers()
             self.wfile.write(data)
 
-        def do_GET(self):
+        def _host(self):
             port = self.server.server_port
             allowed = {"127.0.0.1:{}".format(port), "localhost:{}".format(port)}
             if port == 80:
                 allowed.update(("127.0.0.1", "localhost"))
             hosts = self.headers.get_all("Host") or []
-            if len(hosts) != 1 or hosts[0].lower() not in allowed:
+            return hosts[0].lower() if len(hosts) == 1 and hosts[0].lower() in allowed else None
+
+        def _redirect(self, path):
+            self.send_response(303)
+            self.send_header("Location", path)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "same-origin")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_GET(self):
+            if not self._host():
                 return self._reply(403, "Invalid Host")
             route, _, query = self.path.partition("?")
-            if route != "/":
+            if workspace is not None:
+                from web_workbench import session_route
+                route = session_route(route, workspace.prefix)
+                if route is None:
+                    return self._reply(404, "Open the session URL printed in the terminal")
+                if route != "/history":
+                    return self._get_workbench(route, query)
+            elif route != "/":
                 return self._reply(404, "Not found")
             try:
                 project, tag, page = _query(query)
@@ -166,25 +201,87 @@ def make_server(directory, port=8765, limit=None):
                                    end + 1 if limit is None else min(limit, end + 1))
             except (BuildError, OSError, ValueError) as exc:
                 print("Cannot read build records: {}".format(exc), file=sys.stderr)
-                return self._reply(500, _page(directory, project, tag, page, [], False, error=True), html=True)
+                return self._reply(500, _page(directory, project, tag, page, [], False,
+                                              error=True, workspace=workspace), html=True)
             return self._reply(200, _page(directory, project, tag, page, rows[end - PAGE_SIZE:end],
-                                          len(rows) > end), html=True)
+                                          len(rows) > end, workspace=workspace), html=True)
+
+        def _get_workbench(self, route, query):
+            from web_workbench import download
+            views = {"/workbench": ("构建与打包", workspace.builds), "/jobs": ("本次会话的任务", workspace.tasks),
+                     "/images": ("本地镜像库", workspace.images), "/config": ("配置概览", workspace.configuration)}
+            if route == "/download" and len(query) <= 200:
+                try:
+                    params = parse_qs(query)
+                    identity, = params.get("id", [""])
+                    index, = params.get("file", ["-1"])
+                    index = int(index)
+                except ValueError:
+                    return self._reply(400, "Invalid artifact selector")
+                return download(self, workspace.jobs.snapshot(identity), index)
+            try:
+                if route in views:
+                    title, view = views[route]
+                    return self._reply(200, _workbench_page(workspace, title, view()), html=True)
+                if route == "/job" and len(query) <= 200:
+                    params = parse_qs(query)
+                    identity, = params.get("id", [""])
+                    job = workspace.jobs.snapshot(identity)
+                    if job is None:
+                        return self._reply(404, "Job not found")
+                    body, refresh = workspace.job_page(job)
+                    return self._reply(200, _workbench_page(workspace, "任务详情", body, refresh), html=True)
+            except (BuildError, OSError, ValueError) as exc:
+                return self._reply(400, _workbench_page(workspace, "无法完成请求", '<p class="empty">{}</p>'.format(
+                    escape(str(exc))), False), html=True)
+            return self._reply(404, "Not found")
+
+        def do_POST(self):
+            if workspace is None:
+                return self._reply(501, "Read-only ledger")
+            from web_workbench import form_data, session_route
+            host = self._host()
+            if host is None or self.headers.get_all("Origin") != ["http://" + host]:
+                return self._reply(403, "Invalid request origin")
+            path, _, query = self.path.partition("?")
+            route = session_route(path, workspace.prefix)
+            try:
+                if route is not None and route.startswith("/submit/") and not query:
+                    identity = workspace.submit(route[len("/submit/"):], form_data(self))
+                elif route == "/cancel" and len(query) <= 100:
+                    identity, = parse_qs(query).get("id", [""])
+                    workspace.jobs.cancel(identity)
+                else:
+                    return self._reply(404, "Not found")
+            except (BuildError, OSError, ValueError) as exc:
+                return self._reply(400, _workbench_page(workspace, "任务未提交", '<p class="empty">{}</p>'.format(
+                    escape(str(exc)))), html=True)
+            return self._redirect(workspace.prefix + "/job?" + urlencode({"id": identity}))
 
     return ThreadingHTTPServer(("127.0.0.1", port), LedgerHandler)
 
 
-def serve(directory, port=8765, project=None, tag=None, limit=None):
+def serve(directory, port=8765, project=None, tag=None, limit=None, *, settings=None, config=None):
     """前台运行，终端退出时关闭监听；不依赖桌面浏览器存在。"""
+    from web_workbench import Workbench
+    if settings is None or config is None:
+        from settings import load_settings
+        settings, config = load_settings(config)
+    workspace = Workbench(settings, config, directory)
     try:
-        server = make_server(directory, port, limit)
-    except OSError as exc:
-        raise BuildError("Cannot start web view on 127.0.0.1:{}: {} (try --port 0)".format(port, exc)) from exc
-    with server:
-        print("Open in your browser: http://127.0.0.1:{}{}".format(
-            server.server_port, _url(project, tag)), flush=True)
-        print("Press Ctrl+C to stop.", flush=True)
         try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            pass
+            server = make_server(directory, port, limit, workspace)
+        except OSError as exc:
+            raise BuildError("Cannot start web view on 127.0.0.1:{}: {} (try --port 0)".format(port, exc)) from exc
+        with server:
+            path = (_url(project, tag, root=workspace.prefix + "/history") if project or tag
+                    else workspace.prefix + "/workbench")
+            print("Open in your browser: http://127.0.0.1:{}{}".format(server.server_port, path), flush=True)
+            print("Press Ctrl+C to stop.", flush=True)
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                pass
+    finally:
+        workspace.close()
     return 0

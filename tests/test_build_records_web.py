@@ -1,11 +1,13 @@
 """用回环 HTTP 验证网页读取同一台账及浏览器访问边界。"""
 
 import http.client
+import json
 import os
 import socket
 import struct
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from urllib.parse import urlencode
@@ -13,6 +15,9 @@ from unittest.mock import patch
 
 import build_records
 import build_records_web
+from web_workbench import Workbench
+from settings import load_settings
+from test_phase1 import make_base
 
 
 class BuildRecordsWebTests(unittest.TestCase):
@@ -82,7 +87,8 @@ class BuildRecordsWebTests(unittest.TestCase):
         with patch.object(build_records, "records_directory", return_value=self.directory), \
                 patch.object(build_records_web, "serve", return_value=0) as serve:
             self.assertEqual(build_records.main(["--web", "--port", "0", "--project", "hisq", "--limit", "8"]), 0)
-        serve.assert_called_once_with(self.directory, 0, "hisq", None, 8)
+        self.assertEqual(serve.call_args[0], (self.directory, 0, "hisq", None, 8))
+        self.assertIn("settings", serve.call_args[1])
 
     def test_browser_reset_before_request_line_does_not_report_server_error(self):
         finished = threading.Event()
@@ -101,3 +107,99 @@ class BuildRecordsWebTests(unittest.TestCase):
             self.assertTrue(finished.wait(5))
             errors.assert_not_called()
         self.assertEqual(self.request()[0], 200)
+
+
+class WorkbenchTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        config = self.root / "config.json"
+        config.write_text(json.dumps({
+            "schemaVersion": 2, "cache": {"imageStore": "store", "layerCache": "cache"},
+            "repositories": {"harbor.example": {"username": "not-for-browser", "passwordEnv": "NO_EXPOSE"}},
+            "fast": {"defaultProfile": "tomcat", "profiles": {"tomcat": {
+                "baseImage": "example/base:1", "baseTar": str(make_base(self.root)),
+                "flavor": "tomcat", "owner": "0:0"}}},
+        }), encoding="utf-8")
+        settings, _ = load_settings(config)
+        self.workspace = Workbench(settings, config, self.root / "records")
+        self.addCleanup(self.workspace.close)
+        self.server = build_records_web.make_server(self.workspace.directory, 0, workspace=self.workspace)
+        self.addCleanup(self.server.server_close)
+        self.worker = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01})
+        self.worker.start()
+        self.addCleanup(self.worker.join, 2)
+        self.addCleanup(self.server.shutdown)
+
+    def http(self, route, data=None, origin=True, authenticated=True):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        headers = {}
+        if data is not None:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            headers["Origin"] = "http://127.0.0.1:{}".format(self.server.server_port) if origin else "http://external.example"
+        try:
+            path = (self.workspace.prefix if authenticated else "") + route
+            connection.request("POST" if data is not None else "GET", path,
+                               None if data is None else urlencode(data), headers)
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            connection.close()
+
+    def run_job(self, action, data):
+        status, headers, body = self.http("/submit/" + action, data)
+        self.assertEqual(status, 303, body)
+        route = headers["Location"][len(self.workspace.prefix):]
+        identity = route.split("=", 1)[1]
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            job = self.workspace.jobs.snapshot(identity)
+            if job["state"] not in ("queued", "running"):
+                break
+            time.sleep(0.02)
+        self.assertEqual(job["state"], "success", job["logs"])
+        return route, identity
+
+    def test_workbench_runs_build_and_serves_only_registered_unchanged_output(self):
+        context = self.root / "ctx"
+        context.mkdir()
+        (context / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+        output = self.root / "web.tar"
+        route, identity = self.run_job("build", {"context": str(context), "tag": "web/test:1",
+                                                "output": str(output), "offline": "1", "no-cache": "1"})
+        self.assertEqual(self.http(route)[0], 200)
+        self.assertIn(b"web/test:1", self.http("/history")[2])
+        download = "/download?id=" + identity + "&file=0"
+        self.assertEqual(self.http(download)[2], output.read_bytes())
+        output.write_bytes(b"not the registered file")
+        self.assertEqual(self.http(download)[0], 409)
+
+    def test_fast_then_manage_local_image(self):
+        war = self.root / "app.war"
+        war.write_bytes(b"war")
+        output = self.root / "fast.tar"
+        self.run_job("fast", {"package": str(war), "project": "hisq", "version": "1",
+                              "profile": "tomcat", "output": str(output)})
+        self.run_job("load", {"archive": str(output)})
+        self.assertIn(b"hisq_back:1", self.http("/images")[2])
+        target = self.root / "saved.tar"
+        _, identity = self.run_job("save", {"reference": "hisq_back:1", "output": str(target), "source": "local"})
+        self.assertEqual(self.http("/download?id=" + identity + "&file=0")[2], target.read_bytes())
+        self.run_job("verify", {"archive": str(target)})
+        self.run_job("remove", {"reference": "hisq_back:1", "source": "local", "confirm": "hisq_back:1"})
+        self.assertNotIn(b"hisq_back:1", self.http("/images")[2])
+        self.assertIn(b"hisq_back:1", self.http("/history")[2])
+
+    def test_config_redaction_session_and_origin_checks(self):
+        self.assertEqual(self.http("/workbench", authenticated=False)[0], 404)
+        self.assertEqual(self.http("/submit/df", {}, origin=False)[0], 403)
+        self.assertEqual(self.http("/submit/df", {}, authenticated=False)[0], 404)
+        self.assertEqual(self.http("/submit/unknown", {})[0], 400)
+        self.assertEqual(self.http("/submit/remove", {"reference": "example/app:1", "confirm": "wrong"})[0], 400)
+        self.assertEqual(self.workspace.jobs.snapshot(), [])
+        config = self.http("/config")[2]
+        self.assertIn(b"harbor.example", config)
+        self.assertNotIn(b"not-for-browser", config)
+        self.assertNotIn(b"NO_EXPOSE", config)
+        self.assertEqual(self.http("/images")[0], 200)

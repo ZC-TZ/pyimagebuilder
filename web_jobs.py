@@ -1,0 +1,292 @@
+"""网页任务使用固定参数调用 CLI；在同一工作台串行操作镜像库。"""
+
+import json
+import os
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import uuid
+from collections import OrderedDict, deque
+from pathlib import Path
+
+from errors import BuildError
+from fast import PROJECT, VERSION
+from file_resources import fdopen_owned
+from path_policy import output_path
+
+
+LABELS = {"fast": "快速打包", "build": "Dockerfile 构建", "check": "检查 Dockerfile",
+          "pull": "拉取镜像", "load": "导入归档", "save": "导出镜像",
+          "inspect": "查看归档", "verify": "验证归档", "df": "查看磁盘占用",
+          "remove": "删除镜像引用"}
+PLATFORMS = ("linux/amd64", "linux/arm64")
+FORMATS = ("docker", "oci", "both")
+
+
+def _text(data, name, default=""):
+    value = data.get(name, default).strip()
+    if len(value) > 4096 or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise BuildError("Invalid field: " + name)
+    return value
+
+
+def _required(data, name):
+    value = _text(data, name)
+    if not value:
+        raise BuildError("Required field: " + name)
+    return value
+
+
+def _choice(data, name, choices, default):
+    value = _text(data, name, default)
+    if value not in choices:
+        raise BuildError("Invalid option: " + name)
+    return value
+
+
+def _path(value):
+    try:
+        return Path(value).expanduser().absolute()
+    except RuntimeError as exc:
+        raise BuildError("Cannot resolve local path: " + str(exc)) from exc
+
+
+def _target(data):
+    target = output_path(_path(_required(data, "output")))
+    if target.suffix.lower() != ".tar" or target.exists():
+        raise BuildError("Output must be a new .tar file: " + str(target))
+    return target
+
+
+def command_for(action, data, config, profiles):
+    """只拼装已知子命令的参数；路径不是选项，仓库凭据由原 CLI 读取。"""
+    platform = _choice(data, "platform", PLATFORMS, PLATFORMS[0])
+    common = ["--platform=" + platform]
+    shared = ["--config=" + str(config)] if config is not None else []
+    progress = ["--progress=json"]
+    outputs = []
+    if action == "fast":
+        package = _path(_required(data, "package"))
+        project = _required(data, "project")
+        version = _required(data, "version")
+        profile = _choice(data, "profile", profiles, "")
+        if any(not pattern.fullmatch(value) or value in (".", "..")
+               for pattern, value in ((PROJECT, project), (VERSION, version))):
+            raise BuildError("Invalid project or version")
+        if not package.is_file() or (package.suffix.lower() != ".war" and package.name.lower() != "dist.zip"):
+            raise BuildError("Select an existing WAR or dist.zip on the server")
+        target = _target(data)
+        kind = _choice(data, "format", FORMATS, "docker")
+        args = [action, str(package), project, version, "--profile=" + profile,
+                "--format=" + kind, "--output=" + str(target)] + shared + common + progress
+        outputs = [target]
+        if kind == "both":
+            outputs.append(target.with_name(target.stem + ".oci.tar"))
+    elif action in ("build", "check"):
+        context = _path(_required(data, "context"))
+        if not context.is_dir():
+            raise BuildError("Build context must be a directory")
+        args = ["build", str(context)] + shared + common
+        for key in ("dockerfile", "base-tar"):
+            value = _text(data, key)
+            if value and (key != "base-tar" or action == "build"):
+                args.append("--" + key + "=" + str(_path(value)))
+        if action == "check":
+            args.append("--check")
+        else:
+            target = _target(data)
+            kind = _choice(data, "format", FORMATS, "docker")
+            args += ["--tag=" + _required(data, "tag"), "--format=" + kind,
+                     "--output=" + str(target)] + progress
+            if _text(data, "target"):
+                args.append("--target=" + _text(data, "target"))
+            for key in ("pull", "no-cache"):
+                if _text(data, key):
+                    args.append("--" + key)
+            if _text(data, "offline"):
+                args.append("--offline")
+            if _text(data, "run"):
+                if sys.platform != "linux":
+                    raise BuildError("RUN is available only on a Linux host")
+                args.append("--run")
+            outputs = [target]
+            if kind == "both":
+                outputs.append(target.with_name(target.stem + ".oci.tar"))
+    elif action in ("pull", "save", "remove"):
+        reference = _required(data, "reference")
+        if reference.startswith("-") or any(char.isspace() for char in reference):
+            raise BuildError("Invalid image reference")
+        sources = ("", "registry", "artifactory") + (("local",) if action != "pull" else ())
+        source = _choice(data, "source", sources, "")
+        args = ["rmi" if action == "remove" else action, reference] + shared + common
+        if source:
+            args.append("--source=" + source)
+        if action == "pull":
+            args += progress
+        elif action == "save":
+            target = _target(data)
+            args.append("--output=" + str(target))
+            outputs = [target]
+        elif _required(data, "confirm") != reference:
+            raise BuildError("Confirm removal by entering the exact image reference again")
+    elif action in ("load", "inspect", "verify"):
+        archive = _path(_required(data, "archive"))
+        if not archive.is_file():
+            raise BuildError("Archive must be an existing local file")
+        args = [action, "--input=" + str(archive)] + shared + common if action == "load" else [action, str(archive)]
+        tag = _text(data, "tag")
+        if tag:
+            args.append("--tag=" + tag)
+    elif action == "df":
+        args = ["system", "df"] + shared
+    else:
+        raise BuildError("Unknown web action")
+    return args, outputs
+
+
+def file_stamp(value):
+    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+
+
+def open_artifact(path):
+    """先拒绝明显的链接与特殊文件，再由调用方按已打开的句柄核对身份。"""
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise OSError("Artifact is not a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    return fdopen_owned(os.open(str(path), flags), "rb")
+
+
+class Jobs:
+    """保留有限数量的内存日志；交付历史仍由原有 CLI 持久化。"""
+
+    def __init__(self, directory):
+        self.directory = directory
+        self.condition = threading.Condition()
+        self.jobs = OrderedDict()
+        self.queue = deque()
+        self.closed = False
+        self.worker = threading.Thread(target=self._run, name="web-build-worker")
+        self.worker.start()
+
+    def submit(self, action, args, outputs, label):
+        with self.condition:
+            if self.closed or len(self.queue) >= 20:
+                raise BuildError("Web job queue is full or closing")
+            while len(self.jobs) >= 60:
+                oldest = next((key for key, job in self.jobs.items()
+                               if job["state"] in ("success", "failed", "cancelled")), None)
+                if oldest is None:
+                    raise BuildError("Web job queue is full")
+                del self.jobs[oldest]
+            identity = uuid.uuid4().hex
+            self.jobs[identity] = {"id": identity, "action": action, "args": args, "outputs": outputs,
+                                   "state": "queued", "logs": deque(maxlen=250), "files": [],
+                                   "status": "", "process": None, "label": label}
+            self.queue.append(identity)
+            self.condition.notify()
+            return identity
+
+    def snapshot(self, identity=None):
+        with self.condition:
+            def view(job):
+                return {key: list(value) if key in ("logs", "files") else value
+                        for key, value in job.items() if key not in ("args", "process", "outputs")}
+            if identity is None:
+                return [view(job) for job in reversed(self.jobs.values())]
+            job = self.jobs.get(identity)
+            return view(job) if job is not None else None
+
+    def cancel(self, identity):
+        with self.condition:
+            job = self.jobs.get(identity)
+            if job is None:
+                raise BuildError("Unknown job")
+            if job["state"] == "queued":
+                self.queue.remove(identity)
+                job["state"] = "cancelled"
+            elif job["state"] == "running" and os.name == "posix" and not job.get("interrupt"):
+                process = job["process"]
+                if process is not None and process.poll() is None:
+                    try:
+                        process.send_signal(signal.SIGINT)
+                    except ProcessLookupError:
+                        pass
+                    else:
+                        job["interrupt"] = True
+                        job["status"] = "正在取消"
+
+    def close(self):
+        with self.condition:
+            self.closed = True
+            for identity in list(self.queue):
+                self.cancel(identity)
+            # POSIX 允许 CLI 执行自己的中断清理；Windows 等待任务收尾，避免硬杀留下半成品。
+            for identity, job in self.jobs.items():
+                if job["state"] == "running" and not job.get("interrupt"):
+                    self.cancel(identity)
+            self.condition.notify_all()
+        self.worker.join()
+
+    def _run(self):
+        while True:
+            with self.condition:
+                self.condition.wait_for(lambda: self.closed or self.queue)
+                if self.closed:
+                    return
+                job = self.jobs[self.queue.popleft()]
+                job["state"] = "running"
+                options = {"start_new_session": True} if os.name == "posix" else {
+                    "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+                try:
+                    command = [sys.executable, "-u", str(Path(__file__).with_name("main.py"))] + job["args"]
+                    env = dict(os.environ, PYTHONIOENCODING="utf-8",
+                               PYIMAGEBUILDER_BUILD_RECORDS_DIR=str(self.directory))
+                    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                               env=env, **options)
+                    job["process"] = process
+                except (OSError, ValueError) as exc:
+                    job["logs"].append(str(exc))
+                    job["state"] = "failed"
+                    continue
+            self._collect(job, process)
+
+    def _collect(self, job, process):
+        try:
+            with process.stdout as stream:
+                for raw in iter(lambda: stream.readline(65536), b""):
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    try:
+                        event = json.loads(line)
+                    except (ValueError, RecursionError):
+                        event = None
+                    with self.condition:
+                        if isinstance(event, dict) and "type" in event and "elapsed" in event:
+                            current, total = event.get("current"), event.get("amount")
+                            message = event.get("message") or event.get("phase") or event["type"]
+                            if type(current) is int and type(total) is int and total > 0:
+                                message = "{} · {:.0%}".format(message, min(max(current, 0), total) / total)
+                            job["status"] = str(message)[:4000]
+                            if event["type"] in ("heartbeat", "step_progress", "layer_progress"):
+                                continue
+                            line = "{}: {}".format(event["type"], message)
+                        job["logs"].append(line[:4000])
+        except OSError as exc:
+            with self.condition:
+                job["logs"].append(str(exc))
+        code = process.wait()
+        with self.condition:
+            job["state"] = "success" if code == 0 else ("cancelled" if job.get("interrupt") else "failed")
+            job["code"] = code
+            if code == 0:
+                for path in job["outputs"]:
+                    try:
+                        # Windows 的路径和句柄统计可能使用不同文件 ID 表示。
+                        with open_artifact(path) as stream:
+                            status = os.fstat(stream.fileno())
+                            if stat.S_ISREG(status.st_mode):
+                                job["files"].append((path, file_stamp(status)))
+                    except OSError:
+                        pass
+            job["process"] = None
