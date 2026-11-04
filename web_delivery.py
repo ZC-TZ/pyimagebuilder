@@ -12,6 +12,7 @@ from pathlib import Path
 from build_records import get_build
 from errors import BuildError
 from image_cli import _check_tag, list_images
+from image_store import _archive_path
 from settings import cache_directory
 from web_artifacts import artifact_state
 from web_delivery_worker import push_destination
@@ -19,7 +20,9 @@ from web_jobs import PLATFORMS, _required, _target, file_stamp, open_artifact
 
 
 DELIVERY_ACTIONS = {"verify": "校验", "load": "导入镜像库", "tag": "改标签并另存",
-                    "push": "推送到 Registry / Harbor", "save": "导出 Docker tar"}
+                    "push": "推送到 Registry / Harbor", "save": "导出 Docker tar",
+                    "history": "镜像层历史", "analyze": "大层与重复文件分析",
+                    "optimize": "优化并另存", "flatten": "扁平化并另存"}
 
 
 def _key(parts):
@@ -36,6 +39,15 @@ def library_items(settings):
             for tag in row.get("tags", []):
                 if not isinstance(tag, str) or not tag or len(tag) > 4096:
                     continue
+                if archive and source is None:
+                    for kind in ("local", "registry", "artifactory"):
+                        try:
+                            if Path(archive) == _archive_path(result["image_store"], tag, platform, kind):
+                                source = kind
+                                row["source"] = kind
+                                break
+                        except BuildError:
+                            continue
                 identity = _key([tag, platform, archive, source])
                 items.append({"id": identity, "tag": tag, "platform": platform, "archive": archive,
                               "source": source, "format": "docker" if archive else "cas"})
@@ -74,10 +86,10 @@ class Delivery:
     @staticmethod
     def actions(selected):
         if selected["format"] == "cas":
-            return ("verify", "save")
+            return ("verify", "save", "history", "analyze", "optimize", "flatten")
         if selected["format"] == "oci":
-            return ("verify", "load", "push")
-        return ("verify", "load", "tag", "push")
+            return ("verify", "load", "push", "history", "analyze", "optimize", "flatten")
+        return ("verify", "load", "tag", "push", "history", "analyze", "optimize", "flatten")
 
     def plan(self, data):
         selected = self.select(data)
@@ -93,7 +105,7 @@ class Delivery:
                 result["stamp"] = file_stamp(os.fstat(stream.fileno()))
         else:
             result["source"] = selected["source"]
-        if action in ("tag", "save"):
+        if action in ("tag", "save", "optimize", "flatten"):
             result["output"] = str(_target(data))
         if action == "tag":
             new_tag = _required(data, "new-tag")
@@ -115,9 +127,10 @@ class Delivery:
             self.pending[token] = (now + 600, plan)
             return token
 
-    def confirm(self, token):
+    def confirm(self, token, action="push"):
         with self.lock:
-            entry = self.pending.pop(token, None)
-        if entry is None or entry[0] <= time.monotonic():
-            raise BuildError("推送确认已过期或已使用，请重新预览")
-        return entry[1]
+            entry = self.pending.get(token)
+            if entry is None or entry[0] <= time.monotonic() or entry[1]["action"] != action:
+                raise BuildError("确认已过期、已使用或操作不匹配，请重新预览")
+            del self.pending[token]
+            return entry[1]

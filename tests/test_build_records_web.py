@@ -356,6 +356,155 @@ class WorkbenchTests(unittest.TestCase):
             self.run_request("/delivery/confirm", {"token": prepare()})
         self.assertEqual(set(LocalRegistry.manifests), {"delivery", "delivery-oci"})
 
+    def confirmation_token(self, result):
+        status, _, page = result
+        self.assertEqual(status, 200, page)
+        return re.search(rb'name="token" value="([^"]+)"', page).group(1).decode("ascii")
+
+    def test_cache_cleanup_rechecks_candidates_and_refuses_active_builds(self):
+        from cache import LayerCache
+        from cache_activity import cache_activity
+        root = self.workspace.settings["cache"]["layerCache"]
+        cache = LayerCache(root)
+        cache.store("a" * 64, None, None)
+        entry = cache.entries / ("a" * 64 + ".json")
+        os.utime(entry, (1000, 1000))
+        preview = "/space?kind=cache&days=30"
+        old = self.confirmation_token(self.http(preview))
+        self.assertTrue(entry.is_file())
+        entry.write_bytes(entry.read_bytes() + b" ")
+        os.utime(entry, (1000, 1000))
+        self.run_request("/cache/confirm", {"token": old}, expected="failed")
+        self.assertTrue(entry.is_file())
+        token = self.confirmation_token(self.http(preview))
+        with cache_activity(root):
+            self.run_request("/cache/confirm", {"token": token}, expected="failed")
+        self.assertTrue(entry.is_file())
+        token = self.confirmation_token(self.http(preview))
+        self.run_request("/cache/confirm", {"token": token})
+        self.assertFalse(entry.exists())
+        self.assertEqual(self.http("/cache/confirm", {"token": token})[0], 400)
+
+    def test_template_test_preview_and_confirm_reject_stale_configuration(self):
+        original = self.workspace.config.read_bytes()
+        base = self.workspace.profiles["tomcat"]["baseTar"]
+        fields = {"mode": "new", "name": "tomcat-local", "flavor": "tomcat",
+                  "baseImage": "example/base:1", "baseTar": base, "owner": "0:0",
+                  "outputDir": "another-output", "default": "1"}
+        self.assertEqual(self.http("/profile")[0], 200)
+        self.run_request("/profile/test", fields)
+        self.assertEqual(self.workspace.config.read_bytes(), original)
+        token = self.confirmation_token(self.http("/profile/preview", fields))
+        self.workspace.config.write_bytes(original + b"\n")
+        self.assertEqual(self.http("/profile/confirm", {"token": token})[0], 400)
+        token = self.confirmation_token(self.http("/profile/preview", fields))
+        self.assertEqual(self.http("/profile/confirm", {"token": token})[0], 303)
+        value = json.loads(self.workspace.config.read_text(encoding="utf-8"))
+        self.assertEqual(value["fast"]["defaultProfile"], "tomcat-local")
+        self.assertEqual(value["repositories"], json.loads(original)["repositories"])
+        self.assertIn(b"tomcat-local", self.http("/workbench")[2])
+        token = self.confirmation_token(self.http("/profile/preview", dict(fields, mode="edit", owner="1:1")))
+        self.assertEqual(self.http("/profile/confirm", {"token": token})[0], 303)
+        self.assertEqual(self.workspace.profiles["tomcat-local"]["owner"], "1:1")
+
+    def test_remote_template_probes_only_verified_manifest_and_config(self):
+        import base64
+        import hashlib
+        from http.server import BaseHTTPRequestHandler
+        data = json.dumps({"os": "linux", "architecture": "amd64",
+                           "rootfs": {"type": "layers", "diff_ids": []}}).encode()
+        digest = hashlib.sha256(data).hexdigest()
+        manifest = json.dumps({"config": {"digest": "sha256:" + digest, "size": len(data)}, "layers": []}).encode()
+        requests = []
+
+        class Artifactory(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                requests.append(self.path)
+                body = {"/artifactory/repo/image/1/manifest.json": manifest,
+                        "/artifactory/repo/image/1/sha256__" + digest: data}.get(self.path)
+                expected = "Basic " + base64.b64encode(b"test:secret").decode("ascii")
+                self.send_response(401 if self.headers.get("Authorization") != expected else (200 if body else 404))
+                self.end_headers()
+                if body:
+                    self.wfile.write(body)
+
+        remote = ThreadingHTTPServer(("127.0.0.1", 0), Artifactory)
+        self.addCleanup(remote.server_close)
+        thread = threading.Thread(target=remote.serve_forever, kwargs={"poll_interval": 0.01})
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(remote.shutdown)
+        host = "127.0.0.1:{}".format(remote.server_port)
+        config = json.loads(self.workspace.config.read_text(encoding="utf-8"))
+        config["repositories"][host] = {"source": "artifactory", "username": "test", "passwordEnv": "PIB_PROFILE_TEST"}
+        original = json.dumps(config).encode()
+        self.workspace.config.write_bytes(original)
+        fields = {"mode": "new", "name": "remote", "flavor": "tomcat", "baseImage": host + "/repo/image:1",
+                  "baseUrl": "http://" + host + "/artifactory/repo/image/1/"}
+        with patch.dict(os.environ, {"PIB_PROFILE_TEST": "secret"}):
+            self.run_request("/profile/test", fields)
+        self.assertEqual(requests, ["/artifactory/repo/image/1/manifest.json",
+                                    "/artifactory/repo/image/1/sha256__" + digest])
+        self.assertEqual(self.workspace.config.read_bytes(), original)
+
+    def test_archive_analysis_history_optimization_flatten_and_logs(self):
+        original, source = self.built_delivery()
+        self.run_request("/delivery/prepare", dict(source, action="load"))
+        self.assertIn(b"release", self.http("/delivery?" + urlencode(source))[2])
+        match = self.http("/images?search=hisq&platform=linux%2Famd64&source=local")[2]
+        self.assertIn(b"hisq_front:1.0.0", match)
+        self.assertNotIn(b"hisq_front:1.0.0", self.http("/images?source=artifactory")[2])
+        _, history = self.run_request("/delivery/prepare", dict(source, action="history"))
+        status, headers, raw = self.http("/job-log?id=" + history)
+        self.assertEqual(status, 200)
+        self.assertIn("attachment;", headers["Content-Disposition"])
+        self.assertIn(b'"history"', raw)
+        _, analysis = self.run_request("/delivery/prepare", dict(source, action="analyze"))
+        self.assertIn("archive_bytes", self.workspace.jobs.snapshot(analysis)["metrics"])
+        for action in ("optimize", "flatten"):
+            output = self.root / (action + ".tar")
+            route, identity = self.run_request("/delivery/prepare", dict(source, action=action, output=str(output)))
+            metrics = self.workspace.jobs.snapshot(identity)["metrics"]
+            self.assertEqual(metrics["before_bytes"], original.stat().st_size)
+            self.assertEqual(metrics["after_bytes"], output.stat().st_size)
+            self.assertIn("体积差", self.http(route)[2].decode("utf-8"))
+
+    def test_advanced_build_attest_and_multiarch_outputs(self):
+        from attest import keygen
+        context = self.root / "advanced-context"
+        context.mkdir()
+        (context / "Dockerfile").write_text("FROM example/base:1\nARG NOTE\nLABEL test=$NOTE\n", encoding="utf-8")
+        base_map = self.root / "map.json"
+        base_map.write_text(json.dumps({"example/base:1": self.workspace.profiles["tomcat"]["baseTar"]}), encoding="utf-8")
+        private = self.root / "signing.key"
+        keygen(private, self.root / "signing.pub")
+        archive = self.root / "signed.tar"
+        _, identity = self.run_job("build", {"context": str(context), "output": str(archive), "tag": "advanced:1",
+            "base-map": str(base_map), "epoch": "100", "build-args": "NOTE=web-build", "sign-key": str(private),
+            "offline": "1", "no-cache": "1"})
+        from image_cli import inspect_archive
+        self.assertEqual(inspect_archive(archive)["config"]["Labels"]["test"], "web-build")
+        job = self.workspace.jobs.snapshot(identity)
+        self.assertEqual(len(job["files"]), 4)
+        self.assertNotIn("sign-key", job["form"])
+        self.assertNotIn("build-args", job["form"])
+        (context / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+        archives = {}
+        for arch in ("amd64", "arm64"):
+            output = self.root / (arch + ".oci.tar")
+            self.run_job("build", {"context": str(context), "output": str(output), "tag": "multi:1",
+                                  "platform": "linux/" + arch, "format": "oci", "offline": "1", "no-cache": "1"})
+            archives[arch] = str(output)
+        output = self.root / "combined.oci.tar"
+        self.run_job("multiarch", dict(archives, tag="multi:1", output=str(output), epoch="100"))
+        import tarfile
+        with tarfile.open(output, "r:") as bundle:
+            index = json.load(bundle.extractfile("index.json"))
+        self.assertEqual({item["platform"]["architecture"] for item in index["manifests"]}, {"amd64", "arm64"})
+
     def test_config_redaction_session_and_origin_checks(self):
         self.assertEqual(self.http("/workbench", authenticated=False)[0], 404)
         self.assertEqual(self.http("/submit/df", {}, origin=False)[0], 403)

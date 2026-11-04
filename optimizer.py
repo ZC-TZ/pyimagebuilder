@@ -15,6 +15,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from cache import CACHE_VERSION
+from cache_activity import cache_activity
 from compat import is_linked_directory, unlink_missing
 from path_policy import output_path
 from errors import ArchiveError, BuildError
@@ -375,6 +376,11 @@ def audit_cache(directory, excluding=()):
 
 def prune_cache(directory):
     """删除审计认定无效的条目和孤儿层；dry_run 只报告计划。"""
+    with cache_activity(directory, maintenance=True):
+        return _prune_cache(directory)
+
+
+def _prune_cache(directory):
     report = audit_cache(directory)
     for item in report["invalid_entries"] + report["orphan_layers"]:
         path = Path(item["path"])

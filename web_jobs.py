@@ -12,6 +12,7 @@ from collections import OrderedDict, deque
 from pathlib import Path
 
 from errors import BuildError
+from build_args import arguments
 from fast import fast_target, load_profile
 from file_resources import fdopen_owned
 from path_policy import output_path
@@ -21,7 +22,10 @@ from web_job_journal import JobJournal, form_snapshot
 LABELS = {"fast": "快速打包", "build": "Dockerfile 构建", "check": "检查 Dockerfile",
           "pull": "拉取镜像", "load": "导入归档", "save": "导出镜像",
           "inspect": "查看归档", "verify": "验证归档", "df": "查看磁盘占用",
-          "remove": "删除镜像引用", "tag": "改标签并另存", "push": "推送镜像"}
+          "remove": "删除镜像引用", "tag": "改标签并另存", "push": "推送镜像",
+          "history": "镜像层历史", "analyze": "分析镜像层", "optimize": "优化镜像",
+          "flatten": "扁平化镜像", "multiarch": "合并多架构归档",
+          "cache-clean": "清理过期构建缓存", "profile-test": "测试 Fast 基础镜像"}
 PLATFORMS = ("linux/amd64", "linux/arm64")
 FORMATS = ("docker", "oci", "both")
 
@@ -109,10 +113,18 @@ def command_for(action, data, config, profiles):
         if not context.is_dir():
             raise BuildError("Build context must be a directory")
         args = ["build", str(context)] + shared + common
-        for key in ("dockerfile", "base-tar"):
+        if _text(data, "base-tar") and _text(data, "base-map"):
+            raise BuildError("基础 tar 与基础镜像映射只能选一项")
+        for key in ("dockerfile", "base-tar", "base-map"):
             value = _text(data, key)
-            if value and (key != "base-tar" or action == "build"):
+            if value and (key == "dockerfile" or action == "build"):
                 args.append("--" + key + "=" + str(_path(value)))
+        raw_args = data.get("build-args", "")
+        if len(raw_args) > 8192:
+            raise BuildError("构建参数太长")
+        build_args = [line.strip() for line in raw_args.splitlines() if line.strip()]
+        arguments(build_args)
+        args += ["--build-arg=" + item for item in build_args]
         if action == "check":
             args.append("--check")
         else:
@@ -134,6 +146,31 @@ def command_for(action, data, config, profiles):
             outputs = [target]
             if kind == "both":
                 outputs.append(target.with_name(target.stem + ".oci.tar"))
+            epoch = _text(data, "epoch")
+            if epoch:
+                args.append("--source-date-epoch=" + epoch)
+            lock = _text(data, "input-lock")
+            if lock:
+                args += ["--hermetic", "--input-lock=" + str(_path(lock))]
+                outputs.append(Path(str(target) + ".hermetic.json"))
+            sign = _text(data, "sign-key")
+            if _text(data, "attest") or sign:
+                args.append("--attest")
+                outputs.extend(Path(str(target) + suffix) for suffix in (".spdx.json", ".provenance.json"))
+            if sign:
+                args.append("--sign-key=" + str(_path(sign)))
+                outputs.append(Path(str(target) + ".dsse.json"))
+    elif action == "multiarch":
+        amd64, arm64 = (_path(_required(data, key)) for key in ("amd64", "arm64"))
+        if not amd64.is_file() or not arm64.is_file():
+            raise BuildError("请选择两个已有的 OCI 归档")
+        target = _target(data)
+        args = ["manifest", "create", "--amd64=" + str(amd64), "--arm64=" + str(arm64),
+                "--tag=" + _required(data, "tag"), "--output=" + str(target)]
+        epoch = _text(data, "epoch")
+        if epoch:
+            args.append("--source-date-epoch=" + epoch)
+        outputs = [target]
     elif action in ("pull", "save", "remove"):
         reference = _required(data, "reference")
         if reference.startswith("-") or any(char.isspace() for char in reference):
@@ -298,6 +335,9 @@ class Jobs:
                     except (ValueError, RecursionError):
                         event = None
                     with self.condition:
+                        if job["delivery"] and isinstance(event, dict) and isinstance(event.get("web_metrics"), dict):
+                            job["metrics"] = event["web_metrics"]
+                            continue
                         if isinstance(event, dict) and "type" in event and "elapsed" in event:
                             current, total = event.get("current"), event.get("amount")
                             message = event.get("message") or event.get("phase") or event["type"]

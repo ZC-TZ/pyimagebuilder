@@ -10,7 +10,7 @@ from pathlib import Path
 
 from cas_store import CASStore
 from errors import BuildError
-from image_cli import (_select_tag, load_archive, tag_archive,
+from image_cli import (_select_tag, history_archive, load_archive, tag_archive,
                        verify_archive)
 from image_reader import ImageArchiveReader
 from oci_writer import OCIImageWriter
@@ -63,10 +63,19 @@ def _verify_oci(path, tag, platform):
 
 
 def execute(plan):
+    action = plan["action"]
+    if action == "profile-test":
+        from web_maintenance import test_profile
+        return test_profile(Path(plan["config"]), plan["form"], plan["platform"])
     settings, _ = load_settings(plan.get("config"))
+    if action == "cache-clean":
+        from web_maintenance import cache_root, clean_cache
+        root = cache_root(settings)
+        if str(root) != plan["cache"]:
+            raise BuildError("缓存目录已变化，请重新预览")
+        return clean_cache(root, plan["days"], plan["fingerprint"])
     store = cache_directory(settings, "imageStore", None)
     tag, platform = plan["tag"], plan["platform"]
-    action = plan["action"]
     if plan["format"] == "cas":
         from image_store import default_store
         cas = CASStore(store or default_store())
@@ -77,12 +86,52 @@ def execute(plan):
         if action == "save":
             output = cas.export_docker(tag, plan["output"], platform, plan["source"])
             return {"tag": tag, "platform": platform, "source": plan["source"], "output": str(output)}
+        if action == "flatten":
+            from rootfs_archive import flatten_image
+            return flatten_image(tag, plan["output"], platform=platform, store=store, kind=plan["source"])
+        if action in ("history", "analyze", "optimize"):
+            with tempfile.TemporaryDirectory(prefix="pyimagebuilder-delivery-cas-") as temporary:
+                archive = cas.export_docker(tag, Path(temporary) / "source.tar", platform, plan["source"])
+                from image_store import docker_archive_tag
+                return execute(dict(plan, archive=str(archive), format="docker", tag=docker_archive_tag(tag),
+                                    stamp=_stamp(archive)))
         raise BuildError("仅有 CAS 数据的镜像请先导出归档")
     path = Path(plan["archive"])
     stamp = _check_source(plan, path)
     is_oci = plan["format"] == "oci"
     if action == "verify":
         return _verify_oci(path, tag, platform) if is_oci else verify_archive(path, tag, platform)
+    if action == "history" and not is_oci:
+        return history_archive(path, tag, platform)
+    if action == "history":
+        from image_reader import image_history
+        snapshot = OCIImageWriter().verify(path, tag)
+        index = json.loads(snapshot["index.json"])
+        descriptor = index["manifests"][0]
+        if descriptor["platform"]["os"] + "/" + descriptor["platform"]["architecture"] != platform:
+            raise BuildError("OCI 归档平台与记录不符")
+        manifest = json.loads(snapshot["blobs/sha256/" + descriptor["digest"].split(":", 1)[1]])
+        config = json.loads(snapshot["blobs/sha256/" + manifest["config"]["digest"].split(":", 1)[1]])
+        history = image_history(config, len(manifest["layers"]))
+        return {"tag": tag, "format": "oci", "history": list(reversed(history or []))}
+    if action in ("analyze", "optimize"):
+        from optimizer import analyze_image, optimize_image
+        if is_oci:
+            _verify_oci(path, tag, platform)
+        else:
+            verify_archive(path, tag, platform)
+        if _stamp(path) != stamp:
+            raise BuildError("源归档已变更")
+        if action == "analyze":
+            return analyze_image(path, tag)
+        return optimize_image(path, plan["output"], tag)
+    if action == "flatten":
+        from rootfs_archive import flatten_image
+        result = flatten_image(path, plan["output"], tag=tag, platform=platform,
+                               format="oci" if is_oci else "docker")
+        result.update(before_bytes=stamp[2], after_bytes=Path(plan["output"]).stat().st_size)
+        result["saved_bytes"] = result["before_bytes"] - result["after_bytes"]
+        return result
     if action == "load":
         if is_oci:
             from image_store import default_store
@@ -128,9 +177,16 @@ def execute(plan):
 def main():
     try:
         result = execute(json.loads(sys.argv[1]))
+        metrics = {key: result[key] for key in ("before_bytes", "after_bytes", "saved_bytes",
+                   "archive_bytes", "hidden_file_bytes", "duplicate_groups", "deleted", "bytes")
+                   if type(result.get(key)) is int}
+        if isinstance(result.get("large_layers"), list):
+            metrics["large_layers"] = result["large_layers"][:50]
+        if metrics:
+            print(json.dumps({"web_metrics": metrics}))
         print(json.dumps(result, ensure_ascii=True, indent=2))
         return 0
-    except (BuildError, OSError, ValueError, KeyError, TypeError, tarfile.TarError) as exc:
+    except (BuildError, OSError, ValueError, KeyError, TypeError, RuntimeError, tarfile.TarError) as exc:
         print("交付任务失败：{}".format(exc), file=sys.stderr)
         return 1
 

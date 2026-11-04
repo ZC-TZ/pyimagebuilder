@@ -12,6 +12,7 @@ from pathlib import Path
 from dataclasses import asdict, dataclass, replace
 
 from cache import CACHE_VERSION, LayerCache, cache_key
+from cache_activity import cache_activity
 from dockerfile_parser import parse, valid_stop_signal
 from errors import BaseImageNotFound, BuildError, UnsupportedInstruction
 from image_config import ImageConfig
@@ -198,12 +199,12 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
     cache_root = Path(cache_dir).resolve() if cache_dir is not None else None
     if cache_root is not None and (cache_root == context or context in cache_root.parents):
         raise BuildError("Layer cache must be outside the build context: " + str(cache_root))
-    cache = LayerCache(cache_root, verify=verify_cache) if cache_root is not None else None
     if cache_stats is not None:
         cache_stats.update(hits=0, misses=0, stored=0)
     workspace_parent.mkdir(parents=True, exist_ok=True)
-    with publication_transaction() as published, \
+    with publication_transaction() as published, cache_activity(cache_root), \
             tempfile.TemporaryDirectory(prefix="pyimagebuilder-", dir=workspace_parent) as temp:
+        cache = LayerCache(cache_root, verify=verify_cache) if cache_root is not None else None
         workspace = Path(temp)
         if reporter is not None and reporter.debug:
             reporter.log("Workspace: " + str(workspace))

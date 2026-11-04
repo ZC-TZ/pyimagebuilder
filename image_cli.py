@@ -11,11 +11,13 @@ import sys
 import tarfile
 import tempfile
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 from path_policy import output_path
 from errors import ArchiveError, BuildError
 from cas_store import CASStore, docker_archive_tag
+from cache_activity import cache_activity
 from compat import is_linked_directory, remove_suffix, unlink_missing
 from image_reader import (MAX_JSON, ImageArchiveReader, archive_members, docker_manifest,
                           image_history, outer_name, sha256_file)
@@ -341,6 +343,11 @@ def disk_usage(store=None, cache_dir=None):
 
 def prune_old_cache(directory, older_than_days, dry_run=False):
     """删除过期指令条目，再清理已无有效引用的层；预览按删除后的引用计算。"""
+    with nullcontext() if dry_run else cache_activity(directory, maintenance=True):
+        return _prune_old_cache(directory, older_than_days, dry_run)
+
+
+def _prune_old_cache(directory, older_than_days, dry_run):
     if older_than_days < 0:
         raise BuildError("--older-than must be nonnegative")
     root = Path(directory).resolve()

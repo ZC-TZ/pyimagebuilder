@@ -15,7 +15,7 @@ IDENTITY = re.compile(r"[0-9a-f]{32}\Z")
 FORM_FIELDS = {
     "fast": ("package", "project", "version", "profile", "output", "platform", "format"),
     "build": ("context", "dockerfile", "base-tar", "tag", "output", "platform", "format",
-              "target", "offline", "pull", "no-cache", "run"),
+              "target", "offline", "pull", "no-cache", "run", "base-map", "epoch", "input-lock", "attest"),
 }
 STATES = ("queued", "running", "success", "failed", "cancelled")
 

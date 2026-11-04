@@ -15,6 +15,7 @@ from web_artifacts import space_report
 from web_job_journal import form_snapshot
 from web_delivery import DELIVERY_ACTIONS, Delivery, library_items
 from web_jobs import FORMATS, LABELS, PLATFORMS, Jobs, command_for, fast_plan, file_stamp, open_artifact
+from web_maintenance import PROFILE_FIELDS, _revision, cache_fingerprint, cache_plan, cache_root, candidate_profile, save_profile
 
 
 STATES = {"queued": "排队中", "running": "运行中", "success": "成功", "failed": "失败",
@@ -140,18 +141,35 @@ class Workbench:
             _check("pull", "刷新基础镜像", draft.get("pull")) + _check("no-cache", "禁用构建缓存", draft.get("no-cache"))
         if sys.platform == "linux":
             ordinary += _check("run", "允许执行可信 Dockerfile 的 RUN", draft.get("run"))
+        ordinary += ('<details class="advanced"><summary>高级构建选项</summary>' +
+                     field("base-map", "基础镜像映射 JSON") +
+                     field("epoch", "可复现时间戳（Unix 秒）") +
+                     field("input-lock", "封闭构建输入锁 JSON") +
+                     '<label>构建参数（每行 NAME=VALUE，不填凭据）<textarea name="build-args" rows="3"></textarea></label>' +
+                     _check("attest", "生成 SBOM 和 provenance", draft.get("attest")) +
+                     field("sign-key", "本机签名私钥路径（可选）") + "</details>")
         if action == "fast":
             return _section("复用快速打包参数", fast)
         if action == "build":
             return _section("复用 Dockerfile 构建参数", self.form("build", ordinary))
+        multiarch = self.form("multiarch", _input("amd64", "amd64 OCI tar", "", True) +
+                              _input("arm64", "arm64 OCI tar", "", True) +
+                              _input("tag", "多平台镜像标签", "", True) + destination +
+                              _input("epoch", "可复现时间戳（可选）"))
         return "".join((_section("快速打包", fast), _section("普通 Dockerfile 构建", self.form("build", ordinary)),
-                        _section("静态检查 Dockerfile", self.form("check", context + dockerfile + platform))))
+                        _section("静态检查 Dockerfile", self.form("check", context + dockerfile + platform)),
+                        _section("多架构 OCI 合并", multiarch)))
 
-    def images(self):
+    def images(self, search="", platform_filter="", source_filter=""):
         result = library_items(self.settings)
         items = []
         for item in result["images"]:
             tags = "、".join(str(tag) for tag in item.get("tags", []))
+            source_kind = item.get("source", "archive")
+            if ((search and search.casefold() not in tags.casefold()) or
+                    (platform_filter and platform_filter != item.get("platform")) or
+                    (source_filter and source_filter != source_kind)):
+                continue
             items.append(_section(_e(tags or "镜像条目"), _pairs((
                 ("平台", item.get("platform", "—")), ("来源", item.get("source", item.get("storage", "归档"))),
                 ("归档", item.get("archive") or "—"))) +
@@ -164,8 +182,14 @@ class Workbench:
         archive = _input("archive", "现有 tar 路径", "/data/images/app.tar", True)
         tag = _input("tag", "镜像标签（可选）")
         source = ("", "registry", "artifactory")
+        filters = '<form method="get" action="{}/images">{}{}{}<button>筛选</button></form>'.format(
+            self.prefix, _input("search", "标签包含", "", value=search),
+            _select("platform", "筛选平台", ("",) + PLATFORMS, platform_filter, {"": "全部"}),
+            _select("source", "筛选来源", ("", "local", "registry", "artifactory", "archive"), source_filter,
+                    {"": "全部", "archive": "未标注来源的归档"}))
         return "".join((
-            _section("镜像库位置", '<p><code>{}</code></p><p>{} 条</p>'.format(_e(result["image_store"]), len(items))),
+            _section("镜像库位置", '<p><code>{}</code></p><p>显示 {} / {} 条</p>'.format(
+                _e(result["image_store"]), len(items), len(result["images"])) + filters),
             _section("拉取基础镜像", self.form("pull", reference + platform + _select("source", "来源", source))),
             _section("导入 Docker tar", self.form("load", archive + tag + platform)),
             _section("从镜像库导出 tar", self.form("save", reference + platform +
@@ -194,7 +218,7 @@ class Workbench:
         buttons = []
         for action in self.delivery.actions(item):
             content = hidden + '<input type="hidden" name="action" value="{}">'.format(action)
-            if action in ("tag", "save"):
+            if action in ("tag", "save", "optimize", "flatten"):
                 content += _input("output", "新 tar 输出路径", "/data/images/release.tar", True)
             if action == "tag":
                 content += _input("new-tag", "新镜像标签", "hisq_front:1.0.1", True)
@@ -217,7 +241,7 @@ class Workbench:
     def submit_delivery(self, plan):
         outputs = [Path(plan["output"])] if "output" in plan else []
         return self.jobs.submit(plan["action"], [json.dumps(plan, ensure_ascii=True)], outputs,
-                                plan.get("destination", plan["tag"])[:300], delivery=True)
+                                (plan.get("destination") or plan.get("tag") or plan.get("label", ""))[:300], delivery=True)
 
     def preview_fast(self, data):
         plan = fast_plan(data, self.config_arg, self.profiles)
@@ -226,7 +250,22 @@ class Workbench:
             "outputs": list(map(str, plan["outputs"])), "conflicts": list(map(str, plan["conflicts"]))}
 
     def space(self, kind=None, days=30):
-        usage, candidates, estimate, summary = space_report(self.settings, self.directory, kind, days)
+        usage, candidates, estimate, summary = space_report(
+            self.settings, self.directory, None if kind == "cache" else kind, days)
+        confirmation = ""
+        if kind == "cache":
+            from cache_activity import cache_activity
+            root = cache_root(self.settings)
+            if root.is_dir() and ((root / "entries").exists() or (root / "layers").exists()):
+                with cache_activity(root, maintenance=True):
+                    plan = cache_plan(root, days)
+                candidates = [{"path": path, "reason": reason, "bytes": size} for path, reason, size, _ in plan]
+                estimate = sum(row[2] for row in plan)
+                if plan:
+                    token = self.delivery.offer({"action": "cache-clean", "cache": str(root),
+                                "config": str(self.config_arg) if self.config_arg is not None else None,
+                                "label": str(root), "days": days, "fingerprint": cache_fingerprint(plan)})
+                    confirmation = '<form method="post" action="{}/cache/confirm"><input type="hidden" name="token" value="{}"><button>确认清理以上构建缓存</button></form>'.format(self.prefix, token)
         forms = '<form method="get" action="{}/space"><label>文件年龄（天）<input name="days" type="number" min="0" max="36500" value="{}" required></label>{}<button>预览</button></form>'.format(
             self.prefix, days, _select("kind", "检查范围", tuple(SPACE_KINDS), kind or "images", SPACE_KINDS))
         for key, title in (("image_store", "镜像库"), ("layer_cache", "构建缓存"), ("deliveries", "已登记的交付 tar")):
@@ -237,13 +276,15 @@ class Workbench:
             details = '<p>候选文件估算：<strong>{:,} B（{:.1f} MiB）</strong></p><p>{}</p>'.format(
                 estimate, estimate / (1024 * 1024), _e(summary))
             if candidates:
-                details += "<ul>" + "".join("<li><code>{}</code> · {}</li>".format(
-                    _e(item["path"]), _e(item.get("reason", item.get("storage", "")))) for item in candidates[:200]) + "</ul>"
-                if len(candidates) > 200:
+                shown = candidates if kind == "cache" else candidates[:200]
+                details += "<ul>" + "".join("<li><code>{}</code> · {} · {} B</li>".format(
+                    _e(item["path"]), _e(item.get("reason", item.get("storage", ""))),
+                    _e(item.get("bytes", "—"))) for item in shown) + "</ul>"
+                if len(candidates) > len(shown):
                     details += "<p>只显示前 200 项，总计 {} 项。</p>".format(len(candidates))
             elif not summary:
                 details += "<p>没有符合条件的文件。</p>"
-            forms += _section(SPACE_KINDS[kind], details + "<p>这是预览。实际释放量受共享层和硬链接影响。</p>")
+            forms += _section(SPACE_KINDS[kind], details + "<p>实际释放量受共享层和硬链接影响。</p>" + confirmation)
         return forms
 
     def configuration(self):
@@ -253,16 +294,73 @@ class Workbench:
             ("打包台账", self.directory), ("镜像库", cache.get("imageStore", "系统默认")),
             ("层缓存", cache.get("layerCache", "系统临时目录")),
             ("默认 Fast 模板", self.settings.get("fast", {}).get("defaultProfile", "—")))))]
+        sections.append(_section("Fast 模板管理", '<p><a href="{}/profile">新增模板</a></p>'.format(self.prefix)))
         for name, data in sorted(self.profiles.items()):
             sections.append(_section("Fast · " + _e(name), _pairs((
                 ("类型", data.get("flavor", "—")), ("基础镜像", data.get("baseImage", "—")),
-                ("容器部署目录", data.get("deployDir", "默认")), ("输出目录", data.get("outputDir", "应用包所在目录"))))))
+                ("容器部署目录", data.get("deployDir", "默认")), ("输出目录", data.get("outputDir", "应用包所在目录")))) +
+                '<p><a href="{}/profile?{}">编辑或测试模板</a></p>'.format(self.prefix, _e(urlencode({"name": name})))))
         sources = self.settings.get("repositories", {})
         if sources:
             sections.append(_section("已配置仓库", _pairs(
                 (_e(host if "@" not in host else "隐藏的仓库地址"), data.get("source", "registry"))
                 for host, data in sorted(sources.items()))))
         return "".join(sections)
+
+    def profile_page(self, name=None):
+        if name is not None and name not in self.profiles:
+            raise BuildError("模板不存在，请刷新配置页")
+        previous = self.profiles.get(name, {})
+        labels = {"baseImage": "基础镜像引用", "baseTar": "本地基础 tar", "baseUrl": "Artifactory 地址",
+                  "owner": "属主", "deployDir": "镜像内部署目录", "serverConfig": "TongWeb 配置文件",
+                  "outputDir": "默认输出目录"}
+        form = '<input type="hidden" name="mode" value="{}">'.format("edit" if name is not None else "new")
+        if name is not None:
+            form += '<input type="hidden" name="name" value="{}"><p>模板：<code>{}</code></p>'.format(_e(name), _e(name))
+        else:
+            form += _input("name", "新模板名称", "tomcat-local", True)
+        form += _select("flavor", "模板类型", ("tomcat", "tongweb"), previous.get("flavor", "tomcat"))
+        for field, label in labels.items():
+            value = previous.get(field) or ""
+            if field == "baseUrl" and ("?" in value or "@" in value):
+                value = ""
+            form += _input(field, label, "", field == "baseImage", value)
+        form += _check("default", "设为默认 Fast 模板")
+        form += _select("platform", "基础镜像测试平台", PLATFORMS, PLATFORMS[0])
+        return _section("Fast 模板", '<p>本地 tar 和 Artifactory 地址二选一。测试不保存配置。</p>' +
+            '<form method="post" action="{}/profile/preview">{}<button>预览配置差异</button><button formaction="{}/profile/test">测试基础镜像</button></form>'.format(
+                self.prefix, form, self.prefix))
+
+    def profile_preview(self, data):
+        with candidate_profile(self.config, data) as (name, old, new, old_default, new_default, raw, _, _):
+            fields = [(key, old.get(key), new.get(key)) for key in PROFILE_FIELDS if old.get(key) != new.get(key)]
+            if old_default != new_default:
+                fields.append(("默认模板", old_default, new_default))
+            def safe(key, value):
+                if key == "baseUrl" and value and ("?" in value or "@" in value):
+                    return "（隐藏的旧地址）"
+                return value if value is not None else "—"
+            diff = _pairs((key, "{} → {}".format(safe(key, previous), safe(key, current)))
+                          for key, previous, current in fields)
+            if not fields:
+                return _section("模板 " + _e(name), "<p>没有字段变化。</p>")
+            token = self.delivery.offer({"action": "profile-save", "form": data, "revision": _revision(raw)})
+            return _section("模板差异 · " + _e(name), diff +
+                '<form method="post" action="{}/profile/confirm"><input type="hidden" name="token" value="{}"><button>保存配置</button></form>'.format(
+                    self.prefix, token))
+
+    def save_profile(self, plan):
+        settings = save_profile(self.config, plan["form"], plan["revision"])
+        self.settings, self.config_arg = settings, self.config
+        self.profiles = settings["fast"].get("profiles", {})
+        self.delivery.settings, self.delivery.config = settings, self.config
+
+    def test_profile(self, data):
+        platform = data.get("platform", PLATFORMS[0])
+        if platform not in PLATFORMS:
+            raise BuildError("无效的测试平台")
+        return self.submit_delivery({"action": "profile-test", "config": str(self.config),
+                                     "form": data, "platform": platform, "label": data.get("name", "")})
 
     def tasks(self):
         jobs = self.jobs.snapshot()
@@ -295,23 +393,35 @@ class Workbench:
                 self.prefix, urlencode({"id": identity}))
         if "code" in job:
             content += "<p>退出码：{}</p>".format(_e(job["code"]))
+        metrics = job.get("metrics", {})
+        if metrics:
+            names = {"before_bytes": "处理前", "after_bytes": "处理后", "saved_bytes": "体积差（节省）",
+                     "archive_bytes": "归档大小", "hidden_file_bytes": "被覆盖文件字节",
+                     "duplicate_groups": "重复内容组", "large_layers": "大层编号",
+                     "deleted": "已删除文件数", "bytes": "已删除文件字节"}
+            content += _pairs((names[key], "{:,} B".format(value) if key.endswith("bytes") else value)
+                              for key, value in metrics.items() if key in names)
         if job.get("form") and not running:
             content += '<p><a href="{}/reuse?{}">复用参数</a>，提交前可修改版本或输出。</p>'.format(
                 self.prefix, urlencode({"id": identity}))
         for index, (path, _) in enumerate(job["files"]):
-            content += '<p><a href="{}/download?{}">下载归档</a>　<code>{}</code></p>'.format(
-                self.prefix, _e(urlencode({"id": identity, "file": index})), _e(path))
+            content += '<p><a href="{}/download?{}">{}</a>　<code>{}</code></p>'.format(
+                self.prefix, _e(urlencode({"id": identity, "file": index})),
+                "下载归档" if path.suffix.lower() == ".tar" else "下载附属文件", _e(path))
         if job.get("archived"):
             content += "<p>这里只保存任务结果；成功的归档请到打包台账查看。</p>"
         else:
             content += '<h2>任务日志</h2><pre>{}</pre>'.format(_e("\n".join(job["logs"]) or "等待输出…"))
+            if job["logs"]:
+                content += '<p><a href="{}/job-log?{}">导出当前日志</a>　<small>分享前请检查命令输出。</small></p>'.format(
+                    self.prefix, urlencode({"id": identity}))
         return _section(LABELS[job["action"]], content), running
 
     def submit(self, action, data):
         args, outputs = command_for(action, data, self.config_arg, self.profiles)
         label = next((data[key] for key in ("project", "tag", "reference", "archive", "context") if data.get(key)), "")
         draft = form_snapshot(action, data)
-        for key in ("package", "context", "dockerfile", "base-tar", "output"):
+        for key in ("package", "context", "dockerfile", "base-tar", "base-map", "input-lock", "output"):
             if draft.get(key, "").strip():
                 draft[key] = str(Path(draft[key].strip()).expanduser().absolute())
         return self.jobs.submit(action, args, outputs, label[:300], draft)

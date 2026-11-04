@@ -25,8 +25,10 @@ p{margin:0 0 8px}
 code{font:inherit;overflow-wrap:anywhere}
 form{display:flex;flex-wrap:wrap;gap:12px;align-items:end;margin-bottom:24px}
 label{display:grid;gap:4px;flex:1 1 210px;font-weight:600}
-input,select,button,.button{border:1px solid var(--line);border-radius:8px;font:inherit;padding:9px 12px}
-input,select{width:100%;color:var(--ink);background:#fff}
+input,select,textarea,button,.button{border:1px solid var(--line);border-radius:8px;font:inherit;padding:9px 12px}
+input,select,textarea{width:100%;color:var(--ink);background:#fff}
+.advanced{flex:1 0 100%;padding:8px;border:1px solid var(--line);border-radius:8px}
+.advanced label{margin-top:8px}
 button{color:#fff;background:var(--accent);border-color:var(--accent);cursor:pointer}
 a{color:var(--accent)}
 .button{display:inline-block;background:#fff;text-decoration:none;white-space:nowrap}
@@ -231,7 +233,7 @@ def make_server(directory, port=8765, limit=None, workspace=None):
         def _get_workbench(self, route, query):
             from web_workbench import FAST_SCRIPT, SPACE_KINDS, download, send_artifact
             views = {"/workbench": ("构建与打包", workspace.builds), "/jobs": ("最近任务", workspace.tasks),
-                     "/images": ("本地镜像库", workspace.images), "/config": ("配置概览", workspace.configuration)}
+                     "/config": ("配置概览", workspace.configuration)}
             if route == "/download" and len(query) <= 200:
                 try:
                     params = parse_qs(query)
@@ -260,8 +262,33 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                 with stream:
                     return send_artifact(self, stream, Path(item["path"]).name, item["bytes"])
             try:
+                if route == "/job-log" and len(query) <= 100:
+                    identity, = parse_qs(query).get("id", [""])
+                    job = workspace.jobs.snapshot(identity)
+                    if job is None or not job["logs"]:
+                        return self._reply(404, "No live job log")
+                    body = ("\n".join(job["logs"]) + "\n").encode("utf-8", errors="replace")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Disposition", 'attachment; filename="pyimagebuilder-job-{}.log"'.format(job["id"]))
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.end_headers()
+                    return self.wfile.write(body)
                 if route == "/fast.js" and not query:
                     return self._reply(200, FAST_SCRIPT, content_type="application/javascript")
+                if route == "/profile" and len(query) <= 256:
+                    name, = parse_qs(query).get("name", [None])
+                    return self._reply(200, _workbench_page(workspace, "Fast 模板管理",
+                                       workspace.profile_page(name)), html=True)
+                if route == "/images" and len(query) <= 512:
+                    fields = parse_qs(query)
+                    search, = fields.get("search", [""])
+                    platform, = fields.get("platform", [""])
+                    source, = fields.get("source", [""])
+                    return self._reply(200, _workbench_page(workspace, "本地镜像库",
+                                       workspace.images(search, platform, source)), html=True)
                 if route == "/delivery" and len(query) <= 256:
                     fields = parse_qs(query, keep_blank_values=True)
                     if any(len(values) != 1 for values in fields.values()):
@@ -316,7 +343,22 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                 except (BuildError, OSError, ValueError) as exc:
                     return self._json(400, {"error": str(exc)})
             try:
-                if route == "/delivery/prepare" and not query:
+                if route == "/profile/preview" and not query:
+                    return self._reply(200, _workbench_page(workspace, "配置变更预览",
+                                       workspace.profile_preview(form_data(self))), html=True)
+                if route == "/profile/test" and not query:
+                    identity = workspace.test_profile(form_data(self))
+                elif route in ("/profile/confirm", "/cache/confirm") and not query:
+                    fields = form_data(self)
+                    if set(fields) != {"token"}:
+                        raise ValueError("Invalid confirmation")
+                    action = "profile-save" if route == "/profile/confirm" else "cache-clean"
+                    plan = workspace.delivery.confirm(fields["token"], action)
+                    if action == "profile-save":
+                        workspace.save_profile(plan)
+                        return self._redirect(workspace.prefix + "/config")
+                    identity = workspace.submit_delivery(plan)
+                elif route == "/delivery/prepare" and not query:
                     plan = workspace.delivery.plan(form_data(self))
                     if plan["action"] == "push":
                         return self._reply(200, _workbench_page(workspace, "推送确认",
