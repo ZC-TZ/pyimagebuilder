@@ -15,7 +15,7 @@ from errors import BuildError
 from web_artifacts import space_report
 from web_job_journal import form_snapshot
 from web_delivery import DELIVERY_ACTIONS, Delivery, library_items
-from web_jobs import FORMATS, LABELS, PLATFORMS, Jobs, command_for, fast_plan, file_stamp, open_artifact
+from web_jobs import FORMATS, LABELS, PLATFORMS, Jobs, command_for, fast_plan, file_stamp, open_artifact, path_value
 from web_maintenance import PROFILE_FIELDS, _revision, cache_fingerprint, cache_plan, cache_root, candidate_profile, save_profile
 from web_ui import HERO, icon
 from web_uploads import FastUploads
@@ -298,7 +298,10 @@ class Workbench:
                           {"docker": "Docker tar", "oci": "OCI tar", "both": "Docker + OCI"})
         destination = field("output", "输出 tar 路径", "/data/images/hisq_front-1.0.0.tar", True)
         context = field("context", "构建上下文目录", "/data/project", True)
-        dockerfile = field("dockerfile", "Dockerfile（可选）", "默认使用上下文中的 Dockerfile")
+        needs_dockerfile = action == "build" and "dockerfile" not in draft
+        dockerfile = field("dockerfile", "Dockerfile" if needs_dockerfile else "Dockerfile（可选）",
+                           "请重新选择文件" if needs_dockerfile else "默认使用上下文中的 Dockerfile",
+                           needs_dockerfile)
         if self.profiles:
             default = draft.get("profile", self.settings["fast"].get("defaultProfile", ""))
             package = _path_field("package", "WAR／dist.zip 路径", "/data/packages/dist.zip", True,
@@ -329,9 +332,11 @@ class Workbench:
         if action == "fast":
             return _section("复用快速打包参数", fast)
         if action == "build":
-            return _section("复用 Dockerfile 构建参数",
-                            '<p class="muted">如果上次选择或拖入了 Dockerfile，请重新选择该文件。</p>'
-                            + self.form("build", ordinary))
+            note = ""
+            if needs_dockerfile:
+                note = '<p class="muted">上次的 Dockerfile 路径未保存。请先重新选择文件，再提交构建。</p>'
+                ordinary += '<input type="hidden" name="require-dockerfile" value="1">'
+            return _section("复用 Dockerfile 构建参数", note + self.form("build", ordinary))
         multiarch = self.form("multiarch", _path_field("amd64", "amd64 OCI tar", required=True, upload="amd64") +
                               _path_field("arm64", "arm64 OCI tar", required=True, upload="arm64") +
                               _input("tag", "多平台镜像标签", "", True) + destination +
@@ -670,19 +675,25 @@ class Workbench:
 
     def _submit(self, action, data, paths, cleanup):
         effective = dict(data, **{field: str(path) for field, path in paths.items() if field != "package"})
+        if action == "build" and data.get("require-dockerfile") == "1":
+            path_value(effective, "dockerfile", required=True)
         args, outputs = command_for(action, effective, self.config_arg, self.profiles, paths.get("package"))
         if any(path.parent in output.parents for path in paths.values() for output in outputs):
             raise BuildError("输出路径不能位于文件暂存目录内")
         if action == "multiarch":
             for architecture in ("amd64", "arm64"):
-                check_oci_platform(Path(effective[architecture].strip()).expanduser().absolute(), architecture)
+                check_oci_platform(Path(path_value(effective, architecture, required=True)).expanduser().absolute(),
+                                   architecture)
         label = next((data[key] for key in ("project", "tag", "reference", "archive", "context") if data.get(key)), "")
         draft = form_snapshot(action, data)
+        if action == "build":
+            draft.setdefault("dockerfile", "")
         for field in paths:
             draft.pop(field, None)
         for key in ("package", "context", "dockerfile", "base-tar", "base-map", "input-lock", "output"):
-            if draft.get(key, "").strip():
-                draft[key] = str(Path(draft[key].strip()).expanduser().absolute())
+            value = path_value(draft, key)
+            if value:
+                draft[key] = str(Path(value).expanduser().absolute())
         return self.jobs.submit(action, args, outputs, label[:300], draft, cleanup=cleanup)
 
     def close(self):

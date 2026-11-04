@@ -10,10 +10,13 @@ from path_policy import host_components, output_path, resolve_host_path
 
 
 def browse(data):
-    if set(data) - {"path", "filter", "mode", "base"} or data.get("mode") not in ("directory", "file", "output"):
+    mode = data.get("mode")
+    initial = data.get("initial", "")
+    if (set(data) - {"path", "filter", "mode", "base", "initial"} or mode not in ("directory", "file", "output")
+            or initial not in ("", "1")):
         raise BuildError("无效的路径浏览请求")
-    raw = data.get("path", "").strip()
-    base = data.get("base", "").strip()
+    raw = data.get("path", "")
+    base = data.get("base", "")
     search = data.get("filter", "").casefold()
     if len(raw) > 4096 or len(base) > 4096 or len(search) > 255 or "\0" in raw or "\0" in base:
         raise BuildError("路径或筛选词不合法")
@@ -22,19 +25,22 @@ def browse(data):
         start = resolve_host_path(root / Path(raw).expanduser()) if raw else resolve_host_path(root)
     except RuntimeError as exc:
         raise BuildError("无法展开所填路径") from exc
-    directory = start if start.is_dir() else start.parent
+    directory = start
+    if initial and mode in ("file", "output") and not start.is_dir():
+        directory = start.parent
     if not directory.is_dir():
         raise BuildError("目录不存在：" + str(directory))
 
     def matching():
         with os.scandir(directory) as entries:
             for entry in entries:
-                if search not in entry.name.casefold() or any(ord(char) < 32 for char in entry.name):
+                if search not in entry.name.casefold() or any(
+                        ord(char) < 32 or ord(char) == 127 or 0xD800 <= ord(char) <= 0xDFFF for char in entry.name):
                     continue
                 try:
                     if entry.is_dir(follow_symlinks=False):
                         yield (0, entry.name.casefold(), entry.name, entry.path)
-                    elif data["mode"] == "file" and entry.is_file(follow_symlinks=False):
+                    elif mode == "file" and entry.is_file(follow_symlinks=False):
                         yield (1, entry.name.casefold(), entry.name, entry.path)
                 except FileNotFoundError:
                     continue
@@ -110,7 +116,7 @@ PATH_SCRIPT = r"""
     current = null;
     browseStatus.textContent = '正在读取目录…';
     try {
-      const result = await post('browse-path', {path, filter: search, mode: active.dataset.pathMode,
+      const result = await post('browse-path', {path, filter: search, mode: active.dataset.pathMode, initial: initial ? '1' : '',
         base: active.dataset.pathBase || ''});
       if (id !== revision || !dialog.open) return;
       current = result;
@@ -148,6 +154,13 @@ PATH_SCRIPT = r"""
     dialog.close();
   }
   el('close').addEventListener('click', () => dialog.close());
+  locationField.addEventListener('input', () => {
+    revision++;
+    current = null;
+    entries.textContent = '';
+    apply.disabled = parent.disabled = true;
+    browseStatus.textContent = '请先打开所填目录。';
+  });
   el('open').addEventListener('click', () => { filter.value = ''; browse(locationField.value); });
   el('search').addEventListener('click', () => browse(locationField.value, false, filter.value));
   for (const [input, trigger] of [[locationField, el('open')], [filter, el('search')], [filename, apply]]) {
@@ -165,12 +178,13 @@ PATH_SCRIPT = r"""
       return;
     }
     const id = revision;
+    const requestedName = filename.value;
     apply.disabled = true;
     try {
-      const result = await post('choose-output', {path: current.path, filename: filename.value.trim()});
-      if (id === revision && dialog.open) usePath(result.path);
+      const result = await post('choose-output', {path: current.path, filename: requestedName});
+      if (id === revision && dialog.open && filename.value === requestedName) usePath(result.path);
     } catch (error) {
-      if (id === revision && dialog.open) browseStatus.textContent = error.message;
+      if (id === revision && dialog.open && filename.value === requestedName) browseStatus.textContent = error.message;
     } finally {
       if (id === revision && dialog.open) apply.disabled = false;
     }

@@ -32,10 +32,21 @@ LOG_LINE_CHARS = 4000
 LOG_RECORD_BYTES = 512 * 1024
 
 
-def _text(data, name, default=""):
-    value = data.get(name, default).strip()
+def _text(data, name, default="", strip=True):
+    value = data.get(name, default)
+    if strip:
+        value = value.strip()
     if len(value) > 4096 or any(ord(char) < 32 or ord(char) == 127 for char in value):
         raise BuildError("Invalid field: " + name)
+    return value
+
+
+def path_value(data, name, required=False):
+    value = _text(data, name, strip=False)
+    if not value.strip():
+        if required:
+            raise BuildError("Required field: " + name)
+        return ""
     return value
 
 
@@ -61,7 +72,7 @@ def _path(value):
 
 
 def _target(data):
-    target = output_path(_path(_required(data, "output")))
+    target = output_path(_path(path_value(data, "output", required=True)))
     if target.suffix.lower() != ".tar" or target.exists():
         raise BuildError("Output must be a new .tar file: " + str(target))
     return target
@@ -69,7 +80,7 @@ def _target(data):
 
 def fast_plan(data, config, profiles, uploaded_package=None):
     """验证 Fast 表单并预览实际标签、部署位置和两个可能的输出。"""
-    package = uploaded_package or resolve_host_path(_path(_required(data, "package")))
+    package = uploaded_package or resolve_host_path(_path(path_value(data, "package", required=True)))
     project = _required(data, "project")
     version = _required(data, "version")
     profile_name = _choice(data, "profile", profiles, "")
@@ -80,7 +91,7 @@ def fast_plan(data, config, profiles, uploaded_package=None):
     profile = load_profile(config, profile_name)
     kind = _choice(data, "format", FORMATS, "docker")
     platform = _choice(data, "platform", PLATFORMS, PLATFORMS[0])
-    explicit = _text(data, "output")
+    explicit = path_value(data, "output")
     if uploaded_package is not None and not explicit and not profile.get("outputDir"):
         raise BuildError("此模板未设置输出目录，请填写输出 tar 路径")
     front, tag, target = fast_target(package, project, version, profile, _path(explicit) if explicit else None)
@@ -115,14 +126,14 @@ def command_for(action, data, config, profiles, uploaded_package=None):
         args = [action, str(plan["package"]), plan["project"], plan["version"], "--profile=" + plan["profile"],
                 "--format=" + plan["format"], "--output=" + str(outputs[0])] + shared + common + progress
     elif action in ("build", "check"):
-        context = _path(_required(data, "context"))
+        context = _path(path_value(data, "context", required=True))
         if not context.is_dir():
             raise BuildError("Build context must be a directory")
         args = ["build", str(context)] + shared + common
-        if _text(data, "base-tar") and _text(data, "base-map"):
+        if path_value(data, "base-tar") and path_value(data, "base-map"):
             raise BuildError("基础 tar 与基础镜像映射只能选一项")
         for key in ("dockerfile", "base-tar", "base-map"):
-            value = _text(data, key)
+            value = path_value(data, key)
             if value and (key == "dockerfile" or action == "build"):
                 args.append("--" + key + "=" + str(_path(value)))
         raw_args = data.get("build-args", "")
@@ -155,11 +166,11 @@ def command_for(action, data, config, profiles, uploaded_package=None):
             epoch = _text(data, "epoch")
             if epoch:
                 args.append("--source-date-epoch=" + epoch)
-            lock = _text(data, "input-lock")
+            lock = path_value(data, "input-lock")
             if lock:
                 args += ["--hermetic", "--input-lock=" + str(_path(lock))]
                 outputs.append(Path(str(target) + ".hermetic.json"))
-            sign = _text(data, "sign-key")
+            sign = path_value(data, "sign-key")
             if _text(data, "attest") or sign:
                 args.append("--attest")
                 outputs.extend(Path(str(target) + suffix) for suffix in (".spdx.json", ".provenance.json"))
@@ -167,7 +178,7 @@ def command_for(action, data, config, profiles, uploaded_package=None):
                 args.append("--sign-key=" + str(_path(sign)))
                 outputs.append(Path(str(target) + ".dsse.json"))
     elif action == "multiarch":
-        amd64, arm64 = (_path(_required(data, key)) for key in ("amd64", "arm64"))
+        amd64, arm64 = (_path(path_value(data, key, required=True)) for key in ("amd64", "arm64"))
         if not amd64.is_file() or not arm64.is_file():
             raise BuildError("请选择两个已有的 OCI 归档")
         target = _target(data)
@@ -195,7 +206,7 @@ def command_for(action, data, config, profiles, uploaded_package=None):
         elif _required(data, "confirm") != reference:
             raise BuildError("Confirm removal by entering the exact image reference again")
     elif action in ("load", "inspect", "verify"):
-        archive = _path(_required(data, "archive"))
+        archive = _path(path_value(data, "archive", required=True))
         if not archive.is_file():
             raise BuildError("Archive must be an existing local file")
         args = [action, "--input=" + str(archive)] + shared + common if action == "load" else [action, str(archive)]

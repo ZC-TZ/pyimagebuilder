@@ -370,6 +370,21 @@ class WorkbenchTests(unittest.TestCase):
         status, _, raw = self.http("/choose-output", {"path": str(folder), "filename": "new.tar"})
         self.assertEqual(status, 200, raw)
         self.assertEqual(json.loads(raw)["path"], str(folder / "new.tar"))
+        self.assertEqual(self.http("/browse-path", dict(fields, path="不存在", mode="directory"))[0], 400)
+        status, _, raw = self.http("/browse-path", dict(fields, path=str(sample), initial="1"))
+        self.assertEqual(status, 200, raw)
+        self.assertEqual(json.loads(raw)["filename"], "sample.tar")
+
+    def test_build_path_preserves_spaces_from_browsed_filename(self):
+        from web_jobs import command_for
+        context = self.root / "context"
+        context.mkdir()
+        selected = " recipe"
+        (context / selected).write_text("FROM scratch\n", encoding="utf-8")
+        with patch("web_jobs.Path.absolute", autospec=True, side_effect=lambda path: context / path):
+            args, _ = command_for("check", {"context": str(context), "dockerfile": selected},
+                                  self.workspace.config, self.workspace.profiles)
+        self.assertIn("--dockerfile=" + str(context / selected), args)
 
     def test_uploaded_dockerfile_build_and_archive_tools(self):
         context = self.root / "context"
@@ -385,6 +400,11 @@ class WorkbenchTests(unittest.TestCase):
                                               "tag": "picker:1", "output": str(output), "offline": "1"})
         self.assertFalse(staged.parent.exists())
         self.assertNotIn("dockerfile", self.workspace.jobs.journal.read(identity)["form"])
+        (context / "Dockerfile").write_text("FROM scratch\nLABEL selected=no\n", encoding="utf-8")
+        reuse = self.http("/reuse?id=" + identity)[2]
+        self.assertIn(b'name="require-dockerfile" value="1"', reuse)
+        self.assertEqual(self.http("/submit/build", {"context": str(context), "require-dockerfile": "1",
+            "tag": "picker:2", "output": str(self.root / "reuse.tar"), "offline": "1"})[0], 400)
         from image_cli import inspect_archive
         self.assertEqual(inspect_archive(output)["config"]["Labels"]["selected"], "yes")
         for action in ("inspect", "verify", "load"):
@@ -776,6 +796,19 @@ class WorkbenchTests(unittest.TestCase):
         output = self.root / "combined.oci.tar"
         wrong = Path(archives["amd64"]).read_bytes()
         self.assertEqual(self.upload_package("wrong.tar", wrong, kind="arm64")[0], 400)
+        import tarfile
+        mislabeled = io.BytesIO()
+        with tarfile.open(fileobj=io.BytesIO(wrong), mode="r:") as source, \
+                tarfile.open(fileobj=mislabeled, mode="w:") as target:
+            for member in source:
+                with source.extractfile(member) as stream:
+                    raw = stream.read()
+                if member.name == "index.json":
+                    raw = raw.replace(b'"amd64"', b'"arm64"')
+                target.addfile(member, io.BytesIO(raw))
+        status, raw = self.upload_package("mislabeled.tar", mislabeled.getvalue(), kind="arm64")
+        self.assertEqual(status, 400)
+        self.assertIn(b"index and image config platforms differ", raw)
         self.assertFalse(self.workspace.uploads.entries)
         tokens = {}
         for arch, path in archives.items():

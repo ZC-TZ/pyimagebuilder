@@ -54,7 +54,8 @@ def candidate_profile(path, data):
         raise BuildError("模板已存在或已移除，请刷新配置页")
     if mode not in ("new", "edit"):
         raise BuildError("无效的模板操作")
-    profile = {key: data.get(key, "").strip() for key in PROFILE_FIELDS if data.get(key, "").strip()}
+    profile = {key: (data[key] if key in ("baseTar", "serverConfig", "outputDir") else data[key].strip())
+               for key in PROFILE_FIELDS if data.get(key, "").strip()}
     if any(len(value) > 4096 or any(ord(char) < 32 for char in value) for value in profile.values()):
         raise BuildError("模板字段太长或含控制字符")
     if profile.get("flavor") not in DEFAULTS:

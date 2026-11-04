@@ -14,7 +14,7 @@ from pathlib import Path
 from path_policy import output_path
 from errors import ArchiveError, BuildError
 from file_publish import publication_transaction, publish_new_file
-from image_reader import archive_members, digest_hex
+from image_reader import MAX_JSON, archive_members, digest_hex
 from oci_writer import (CONFIG_TYPE, INDEX_TYPE, LAYER_TYPE, MANIFEST_TYPE,
                         OCIImageWriter, _json_bytes)
 from reproducible import parse_epoch
@@ -23,20 +23,24 @@ from reproducible import parse_epoch
 BUFFER = 4 * 1024 * 1024
 
 
-def _json_member(archive, name, members=None):
+def _json_member(archive, name, members=None, descriptor=None):
     """使用规范化索引读取 JSON，避免校验与消费对 ./ 路径别名解释不一致。"""
     try:
         member = (archive_members(archive) if members is None else members)[name]
     except KeyError as exc:
         raise ArchiveError("Missing OCI member: " + name) from exc
-    if not member.isfile() or member.size > 16 * 1024 * 1024:
+    if not member.isfile() or not 0 <= member.size <= MAX_JSON:
         raise ArchiveError("Invalid or oversized OCI JSON: " + name)
     stream = archive.extractfile(member)
     if stream is None:
         raise ArchiveError("Unreadable OCI JSON: " + name)
     with stream:
         try:
-            return json.load(stream)
+            raw = stream.read()
+            if descriptor is not None and (len(raw) != descriptor["size"] or
+                    hashlib.sha256(raw).hexdigest() != digest_hex(descriptor["digest"])):
+                raise ArchiveError("OCI metadata digest or size mismatch: " + name)
+            return json.loads(raw)
         except (ValueError, UnicodeError, RecursionError) as exc:
             raise ArchiveError("Invalid OCI JSON: " + name) from exc
 
@@ -51,8 +55,13 @@ def _add_bytes(archive, name, raw, epoch):
 
 def probe_input(path, expected_architecture):
     with tarfile.open(path, "r:") as archive:
-        index = _json_member(archive, "index.json")
-        entries = index.get("manifests") if isinstance(index, dict) else None
+        members = archive_members(archive)
+        if _json_member(archive, "oci-layout", members) != {"imageLayoutVersion": "1.0.0"}:
+            raise ArchiveError("Invalid OCI layout marker")
+        index = _json_member(archive, "index.json", members)
+        if not isinstance(index, dict) or index.get("schemaVersion") != 2 or index.get("mediaType") != INDEX_TYPE:
+            raise ArchiveError("Invalid OCI index")
+        entries = index.get("manifests")
         if not isinstance(entries, list) or len(entries) != 1:
             raise ArchiveError("Input OCI archive must contain one platform")
         entry = entries[0]
@@ -63,6 +72,19 @@ def probe_input(path, expected_architecture):
         tag = entry.get("annotations", {}).get("org.opencontainers.image.ref.name")
         if not isinstance(tag, str):
             raise ArchiveError("Input OCI archive has no tag")
+
+        def metadata(descriptor, media_type):
+            if (not isinstance(descriptor, dict) or descriptor.get("mediaType") != media_type or
+                    type(descriptor.get("size")) is not int or not 0 <= descriptor["size"] <= MAX_JSON):
+                raise ArchiveError("Invalid OCI metadata descriptor")
+            name = "blobs/sha256/" + digest_hex(descriptor.get("digest"))
+            return _json_member(archive, name, members, descriptor)
+
+        manifest = metadata(entry, MANIFEST_TYPE)
+        config = metadata(manifest.get("config") if isinstance(manifest, dict) else None, CONFIG_TYPE)
+        if (not isinstance(config, dict) or config.get("os") != "linux" or
+                config.get("architecture") != expected_architecture):
+            raise ArchiveError("OCI index and image config platforms differ")
     return entry
 
 
