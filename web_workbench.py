@@ -1,6 +1,7 @@
 """工作台表单和展示层：配置仅展示白名单字段。"""
 
 import hmac
+import json
 import os
 import secrets
 import stat
@@ -10,10 +11,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode
 
 from errors import BuildError
-from image_cli import list_images
-from settings import cache_directory
 from web_artifacts import space_report
 from web_job_journal import form_snapshot
+from web_delivery import DELIVERY_ACTIONS, Delivery, library_items
 from web_jobs import FORMATS, LABELS, PLATFORMS, Jobs, command_for, fast_plan, file_stamp, open_artifact
 
 
@@ -100,6 +100,7 @@ class Workbench:
         self.prefix = "/session/" + secrets.token_urlsafe(24)
         self.config_arg = config if config.is_file() else None
         self.profiles = settings.get("fast", {}).get("profiles", {})
+        self.delivery = Delivery(settings, self.config_arg, directory)
         self.jobs = Jobs(directory)
 
     def nav(self):
@@ -147,14 +148,17 @@ class Workbench:
                         _section("静态检查 Dockerfile", self.form("check", context + dockerfile + platform))))
 
     def images(self):
-        result = list_images(cache_directory(self.settings, "imageStore", None))
+        result = library_items(self.settings)
         items = []
         for item in result["images"]:
             tags = "、".join(str(tag) for tag in item.get("tags", []))
             items.append(_section(_e(tags or "镜像条目"), _pairs((
                 ("平台", item.get("platform", "—")), ("来源", item.get("source", item.get("storage", "归档"))),
                 ("归档", item.get("archive") or "—"))) +
-                ('<p>{}</p>'.format(_e(item["error"])) if item.get("error") else "")))
+                ('<p>{}</p>'.format(_e(item["error"])) if item.get("error") else "") +
+                "".join('<p>{} <code>{}</code></p>'.format(
+                    self.delivery_link("library", selected["id"]), _e(selected["tag"]))
+                    for selected in item["delivery_items"])))
         platform = _select("platform", "平台", PLATFORMS, PLATFORMS[0])
         reference = _input("reference", "镜像引用", "harbor.example/project/image:1", True)
         archive = _input("archive", "现有 tar 路径", "/data/images/app.tar", True)
@@ -172,6 +176,48 @@ class Workbench:
                      _select("source", "来源", source + ("local",)) +
                      _input("confirm", "再次输入完整镜像引用", "", True))),
             "".join(items)))
+
+    def delivery_link(self, scope, identity, index=None):
+        params = {"scope": scope, "id": identity}
+        if index is not None:
+            params["file"] = index
+        return '<a href="{}/delivery?{}">产物操作</a>'.format(self.prefix, _e(urlencode(params)))
+
+    def delivery_page(self, data):
+        item = self.delivery.select(data)
+        fields = (("标签", item["tag"]), ("平台", item["platform"]), ("格式", item["format"].upper()),
+                  ("源归档", item["archive"] or "镜像库 CAS 引用"))
+        if item.get("source"):
+            fields += (("来源", item["source"]),)
+        hidden = "".join('<input type="hidden" name="{}" value="{}">'.format(key, _e(data[key]))
+                         for key in ("scope", "id", "file") if key in data)
+        buttons = []
+        for action in self.delivery.actions(item):
+            content = hidden + '<input type="hidden" name="action" value="{}">'.format(action)
+            if action in ("tag", "save"):
+                content += _input("output", "新 tar 输出路径", "/data/images/release.tar", True)
+            if action == "tag":
+                content += _input("new-tag", "新镜像标签", "hisq_front:1.0.1", True)
+            if action == "push":
+                content += _input("destination", "目标 Registry / Harbor 标签", "harbor.example/project/image:1", True)
+            buttons.append(_section(DELIVERY_ACTIONS[action],
+                '<form class="job-form" action="{}/delivery/prepare" method="post">{}<button>{}</button></form>'.format(
+                    self.prefix, content, "预览推送" if action == "push" else DELIVERY_ACTIONS[action])))
+        return _section("所选产物", _pairs(fields)) + "".join(buttons)
+
+    def push_confirmation(self, plan):
+        token = self.delivery.offer(plan)
+        fields = (("源归档", plan["archive"]), ("源镜像", plan["tag"]),
+                  ("平台", plan["platform"]), ("目标镜像", plan["destination"]))
+        content = _pairs(fields) + "<p>仅向上述仓库推送。检测到远端标签已存在时会拒绝推送。</p>"
+        content += '<form action="{}/delivery/confirm" method="post"><input type="hidden" name="token" value="{}"><button>确认推送</button></form>'.format(
+            self.prefix, token)
+        return _section("确认推送", content)
+
+    def submit_delivery(self, plan):
+        outputs = [Path(plan["output"])] if "output" in plan else []
+        return self.jobs.submit(plan["action"], [json.dumps(plan, ensure_ascii=True)], outputs,
+                                plan.get("destination", plan["tag"])[:300], delivery=True)
 
     def preview_fast(self, data):
         plan = fast_plan(data, self.config_arg, self.profiles)

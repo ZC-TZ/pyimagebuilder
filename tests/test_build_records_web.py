@@ -3,6 +3,7 @@
 import http.client
 import json
 import os
+import re
 import socket
 import struct
 import tempfile
@@ -10,6 +11,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from http.server import ThreadingHTTPServer
 from urllib.parse import urlencode
 from unittest.mock import patch
 
@@ -18,6 +20,8 @@ import build_records_web
 from web_workbench import Workbench
 from settings import load_settings
 from test_phase1 import make_base
+from test_phase11 import RegistryHandler
+from web_delivery import library_items
 
 
 class BuildRecordsWebTests(unittest.TestCase):
@@ -148,7 +152,10 @@ class WorkbenchTests(unittest.TestCase):
             connection.close()
 
     def run_job(self, action, data):
-        status, headers, body = self.http("/submit/" + action, data)
+        return self.run_request("/submit/" + action, data)
+
+    def run_request(self, endpoint, data, expected="success"):
+        status, headers, body = self.http(endpoint, data)
         self.assertEqual(status, 303, body)
         route = headers["Location"][len(self.workspace.prefix):]
         identity = route.split("=", 1)[1]
@@ -158,7 +165,7 @@ class WorkbenchTests(unittest.TestCase):
             if job["state"] not in ("queued", "running"):
                 break
             time.sleep(0.02)
-        self.assertEqual(job["state"], "success", job["logs"])
+        self.assertEqual(job["state"], expected, job["logs"])
         return route, identity
 
     def test_workbench_runs_build_and_serves_only_registered_unchanged_output(self):
@@ -256,6 +263,98 @@ class WorkbenchTests(unittest.TestCase):
         self.assertIn(b"release.tar", self.http("/space?kind=deliveries&days=30")[2])
         self.assertTrue(cached.is_file())
         self.assertTrue(delivery.is_file())
+
+    def built_delivery(self, kind="docker", suffix=""):
+        context = self.root / ("delivery-context" + suffix)
+        context.mkdir()
+        (context / "Dockerfile").write_text("FROM scratch\nCOPY contents /contents\n", encoding="utf-8")
+        (context / "contents").write_bytes(b"contents for registry")
+        output = self.root / ("release" + suffix + ".tar")
+        self.run_job("build", {"context": str(context), "tag": "hisq_front:1.0.0", "output": str(output),
+                               "offline": "1", "no-cache": "1", "format": kind})
+        row, = [row for row in build_records.list_builds(self.workspace.directory)
+                if row["artifacts"][0]["path"] == str(output)]
+        return output, {"scope": "history", "id": row["id"], "file": "0"}
+
+    def test_history_actions_select_archive_and_library_row_without_path_input(self):
+        output, source = self.built_delivery()
+        menu = self.http("/delivery?" + urlencode(source))[2]
+        self.assertIn(b"release.tar", menu)
+        self.assertIn(b"hisq_front:1.0.0", menu)
+        self.assertIn("产物操作", self.http("/history")[2].decode())
+        self.run_request("/delivery/prepare", dict(source, action="verify"))
+        self.run_request("/delivery/prepare", dict(source, action="load", archive=str(self.root / "unrelated.tar")))
+        row, = library_items(self.workspace.settings)["images"]
+        item, = row["delivery_items"]
+        selector = {"scope": "library", "id": item["id"]}
+        self.assertIn(item["id"].encode(), self.http("/images")[2])
+        changed = self.root / "retagged.tar"
+        _, job = self.run_request("/delivery/prepare", dict(selector, action="tag", output=str(changed),
+                                    **{"new-tag": "hisq_front:1.0.1"}))
+        self.assertEqual(self.http("/download?id=" + job + "&file=0")[2], changed.read_bytes())
+        from image_cli import verify_archive
+        self.assertEqual(verify_archive(changed, "hisq_front:1.0.1")["tag"], "hisq_front:1.0.1")
+        data = output.read_bytes()
+        output.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+        _, failed = self.run_request("/delivery/prepare", dict(source, action="verify"), expected="failed")
+        self.assertIn("SHA-256", "\n".join(self.workspace.jobs.snapshot(failed)["logs"]))
+
+    def test_oci_actions_verify_import_and_export_cas(self):
+        _, source = self.built_delivery("oci")
+        self.run_request("/delivery/prepare", dict(source, action="verify"))
+        self.assertEqual(self.http("/delivery/prepare", dict(source, action="tag"))[0], 400)
+        self.run_request("/delivery/prepare", dict(source, action="load"))
+        row, = library_items(self.workspace.settings)["images"]
+        item, = row["delivery_items"]
+        self.assertEqual(item["format"], "cas")
+        target = self.root / "from-cas.tar"
+        _, job = self.run_request("/delivery/prepare", {
+            "scope": "library", "id": item["id"], "action": "save", "output": str(target)})
+        self.assertEqual(self.http("/download?id=" + job + "&file=0")[2], target.read_bytes())
+
+    def test_push_requires_fixed_single_use_confirmation_and_does_not_overwrite(self):
+        class LocalRegistry(RegistryHandler):
+            blobs, manifests, token_requests = {}, {}, 0
+
+        registry = ThreadingHTTPServer(("127.0.0.1", 0), LocalRegistry)
+        self.addCleanup(registry.server_close)
+        thread = threading.Thread(target=registry.serve_forever, kwargs={"poll_interval": 0.01})
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(registry.shutdown)
+        host = "127.0.0.1:{}".format(registry.server_port)
+        entry = {"username": "robot$test", "passwordEnv": "PIB_WEB_TEST_PASSWORD", "insecureHttp": True}
+        config = json.loads(self.workspace.config.read_text(encoding="utf-8"))
+        config["repositories"][host] = entry
+        self.workspace.config.write_text(json.dumps(config), encoding="utf-8")
+        self.workspace.settings["repositories"][host] = entry
+        _, source = self.built_delivery()
+        destination = host + "/p/app:delivery"
+        fields = dict(source, action="push", destination=destination)
+        self.assertEqual(self.http("/delivery/prepare", dict(fields, destination="unknown.test/p/app:1"))[0], 400)
+
+        def prepare():
+            status, _, page = self.http("/delivery/prepare", fields)
+            self.assertEqual(status, 200, page)
+            self.assertIn(destination.encode(), page)
+            self.assertIn(b"hisq_front:1.0.0", page)
+            return re.search(rb'name="token" value="([^"]+)"', page).group(1).decode("ascii")
+
+        token = prepare()
+        self.assertEqual(LocalRegistry.token_requests, 0)
+        self.assertEqual(self.http("/delivery/confirm", {"token": token, "destination": host + "/p/app:other"})[0], 400)
+        with patch.dict(os.environ, {"PIB_WEB_TEST_PASSWORD": "secret"}):
+            self.run_request("/delivery/confirm", {"token": token})
+            self.assertEqual(self.http("/delivery/confirm", {"token": token})[0], 400)
+            pushed = LocalRegistry.manifests["delivery"]
+            self.run_request("/delivery/confirm", {"token": prepare()}, expected="failed")
+        self.assertEqual(LocalRegistry.manifests, {"delivery": pushed})
+        _, source = self.built_delivery("oci", "-oci")
+        destination = host + "/p/app:delivery-oci"
+        fields = dict(source, action="push", destination=destination)
+        with patch.dict(os.environ, {"PIB_WEB_TEST_PASSWORD": "secret"}):
+            self.run_request("/delivery/confirm", {"token": prepare()})
+        self.assertEqual(set(LocalRegistry.manifests), {"delivery", "delivery-oci"})
 
     def test_config_redaction_session_and_origin_checks(self):
         self.assertEqual(self.http("/workbench", authenticated=False)[0], 404)

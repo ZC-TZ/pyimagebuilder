@@ -81,6 +81,7 @@ def _artifact(item, workspace=None, identity=None, index=None):
         if state == "available":
             query = urlencode({"id": identity, "file": index})
             actions += '　<a href="{}/history-download?{}">校验并下载</a>'.format(workspace.prefix, escape(query))
+            actions += "　" + workspace.delivery_link("history", identity, index)
     return '<li><span class="badge">{}</span><code>{}</code>{}{}</li>'.format(kind, path, size, actions)
 
 
@@ -261,6 +262,13 @@ def make_server(directory, port=8765, limit=None, workspace=None):
             try:
                 if route == "/fast.js" and not query:
                     return self._reply(200, FAST_SCRIPT, content_type="application/javascript")
+                if route == "/delivery" and len(query) <= 256:
+                    fields = parse_qs(query, keep_blank_values=True)
+                    if any(len(values) != 1 for values in fields.values()):
+                        raise ValueError("Invalid delivery selector")
+                    data = {key: values[0] for key, values in fields.items()}
+                    return self._reply(200, _workbench_page(workspace, "产物操作",
+                                       workspace.delivery_page(data)), html=True)
                 if route == "/space" and len(query) <= 100:
                     fields = parse_qs(query)
                     kind, = fields.get("kind", [None])
@@ -308,7 +316,18 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                 except (BuildError, OSError, ValueError) as exc:
                     return self._json(400, {"error": str(exc)})
             try:
-                if route is not None and route.startswith("/submit/") and not query:
+                if route == "/delivery/prepare" and not query:
+                    plan = workspace.delivery.plan(form_data(self))
+                    if plan["action"] == "push":
+                        return self._reply(200, _workbench_page(workspace, "推送确认",
+                                           workspace.push_confirmation(plan)), html=True)
+                    identity = workspace.submit_delivery(plan)
+                elif route == "/delivery/confirm" and not query:
+                    fields = form_data(self)
+                    if set(fields) != {"token"}:
+                        raise ValueError("Invalid push confirmation")
+                    identity = workspace.submit_delivery(workspace.delivery.confirm(fields["token"]))
+                elif route is not None and route.startswith("/submit/") and not query:
                     identity = workspace.submit(route[len("/submit/"):], form_data(self))
                 elif route == "/cancel" and len(query) <= 100:
                     identity, = parse_qs(query).get("id", [""])

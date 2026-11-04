@@ -21,7 +21,7 @@ from web_job_journal import JobJournal, form_snapshot
 LABELS = {"fast": "快速打包", "build": "Dockerfile 构建", "check": "检查 Dockerfile",
           "pull": "拉取镜像", "load": "导入归档", "save": "导出镜像",
           "inspect": "查看归档", "verify": "验证归档", "df": "查看磁盘占用",
-          "remove": "删除镜像引用"}
+          "remove": "删除镜像引用", "tag": "改标签并另存", "push": "推送镜像"}
 PLATFORMS = ("linux/amd64", "linux/arm64")
 FORMATS = ("docker", "oci", "both")
 
@@ -191,7 +191,7 @@ class Jobs:
         self.worker = threading.Thread(target=self._run, name="web-build-worker")
         self.worker.start()
 
-    def submit(self, action, args, outputs, label, form=None):
+    def submit(self, action, args, outputs, label, form=None, delivery=False):
         with self.condition:
             if self.closed or len(self.queue) >= 20:
                 raise BuildError("Web job queue is full or closing")
@@ -205,7 +205,7 @@ class Jobs:
             self.jobs[identity] = {"id": identity, "action": action, "args": args, "outputs": outputs,
                                    "state": "queued", "logs": deque(maxlen=250), "files": [],
                                    "status": "", "process": None, "label": label,
-                                   "form": form_snapshot(action, form or {})}
+                                   "form": form_snapshot(action, form or {}), "delivery": delivery}
             self.queue.append(identity)
             self._save(self.jobs[identity])
             self.condition.notify()
@@ -274,7 +274,8 @@ class Jobs:
                 options = {"start_new_session": True} if os.name == "posix" else {
                     "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
                 try:
-                    command = [sys.executable, "-u", str(Path(__file__).with_name("main.py"))] + job["args"]
+                    entry = "web_delivery_worker.py" if job["delivery"] else "main.py"
+                    command = [sys.executable, "-u", str(Path(__file__).with_name(entry))] + job["args"]
                     env = dict(os.environ, PYTHONIOENCODING="utf-8",
                                PYIMAGEBUILDER_BUILD_RECORDS_DIR=str(self.directory))
                     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
