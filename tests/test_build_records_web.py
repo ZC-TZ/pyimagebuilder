@@ -283,12 +283,13 @@ class WorkbenchTests(unittest.TestCase):
         self.assertNotIn(b"hisq_back:1", self.http("/images")[2])
         self.assertIn(b"hisq_back:1", self.http("/history")[2])
 
-    def upload_package(self, name, body, same_origin=True, authenticated=True):
+    def upload_package(self, name, body, same_origin=True, authenticated=True, kind=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
         try:
             prefix = self.workspace.prefix if authenticated else ""
             origin = "http://127.0.0.1:{}".format(self.server.server_port) if same_origin else "http://external.example"
-            conn.request("POST", prefix + "/upload-fast?" + urlencode({"name": name}), body,
+            route, fields = ("/upload-fast", {"name": name}) if kind is None else ("/upload-path", {"name": name, "kind": kind})
+            conn.request("POST", prefix + route + "?" + urlencode(fields), body,
                          {"Content-Type": "application/octet-stream", "Origin": origin})
             result = conn.getresponse()
             return result.status, result.read()
@@ -351,6 +352,49 @@ class WorkbenchTests(unittest.TestCase):
         while staged.parent.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         self.assertFalse(staged.parent.exists())
+
+    def test_browse_retains_original_paths_and_prevents_output_conflicts(self):
+        folder = self.root / "项目"
+        folder.mkdir()
+        sample = folder / "sample.tar"
+        sample.write_bytes(b"content must not be returned")
+        fields = {"mode": "file", "base": str(self.root), "path": "项目", "filter": "sample"}
+        self.assertEqual(self.http("/browse-path", fields, origin=False)[0], 403)
+        status, _, raw = self.http("/browse-path", fields)
+        self.assertEqual(status, 200, raw)
+        result = json.loads(raw)
+        self.assertEqual(result["entries"], [{"name": "sample.tar", "path": str(sample), "directory": False}])
+        self.assertNotIn(b"content must not be returned", raw)
+        self.assertEqual(self.http("/choose-output", {"path": str(folder), "filename": "sample.tar"})[0], 400)
+        self.assertEqual(self.http("/choose-output", {"path": str(folder), "filename": "../else.tar"})[0], 400)
+        status, _, raw = self.http("/choose-output", {"path": str(folder), "filename": "new.tar"})
+        self.assertEqual(status, 200, raw)
+        self.assertEqual(json.loads(raw)["path"], str(folder / "new.tar"))
+
+    def test_uploaded_dockerfile_build_and_archive_tools(self):
+        context = self.root / "context"
+        context.mkdir()
+        content = b"FROM scratch\nLABEL selected=yes\n"
+        status, raw = self.upload_package("custom.recipe", content, kind="dockerfile")
+        self.assertEqual(status, 200, raw)
+        token = json.loads(raw)["token"]
+        staged = self.workspace.uploads.path(token, kind="dockerfile")
+        output = self.root / "from-picker.tar"
+        self.assertEqual(self.http("/submit/inspect", {"archive-upload": token})[0], 400)
+        _, identity = self.run_job("build", {"context": str(context), "dockerfile-upload": token,
+                                              "tag": "picker:1", "output": str(output), "offline": "1"})
+        self.assertFalse(staged.parent.exists())
+        self.assertNotIn("dockerfile", self.workspace.jobs.journal.read(identity)["form"])
+        from image_cli import inspect_archive
+        self.assertEqual(inspect_archive(output)["config"]["Labels"]["selected"], "yes")
+        for action in ("inspect", "verify", "load"):
+            status, raw = self.upload_package("from-picker.tar", output.read_bytes(), kind="archive")
+            self.assertEqual(status, 200, raw)
+            token = json.loads(raw)["token"]
+            staged = self.workspace.uploads.path(token, kind="archive")
+            self.run_job(action, {"archive-upload": token})
+            self.assertFalse(staged.parent.exists())
+        self.assertIn(b"picker:1", self.http("/images")[2])
 
     def test_upload_cleanup_retry_preserves_quota_and_invalidates_token(self):
         import shutil
@@ -730,7 +774,16 @@ class WorkbenchTests(unittest.TestCase):
                                   "platform": "linux/" + arch, "format": "oci", "offline": "1", "no-cache": "1"})
             archives[arch] = str(output)
         output = self.root / "combined.oci.tar"
-        self.run_job("multiarch", dict(archives, tag="multi:1", output=str(output), epoch="100"))
+        wrong = Path(archives["amd64"]).read_bytes()
+        self.assertEqual(self.upload_package("wrong.tar", wrong, kind="arm64")[0], 400)
+        self.assertFalse(self.workspace.uploads.entries)
+        tokens = {}
+        for arch, path in archives.items():
+            status, raw = self.upload_package(Path(path).name, Path(path).read_bytes(), kind=arch)
+            self.assertEqual(status, 200, raw)
+            tokens[arch + "-upload"] = json.loads(raw)["token"]
+        self.run_job("multiarch", dict(tokens, tag="multi:1", output=str(output), epoch="100"))
+        self.assertFalse(self.workspace.uploads.entries)
         import tarfile
         with tarfile.open(output, "r:") as bundle:
             index = json.load(bundle.extractfile("index.json"))

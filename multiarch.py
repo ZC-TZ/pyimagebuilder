@@ -37,7 +37,7 @@ def _json_member(archive, name, members=None):
     with stream:
         try:
             return json.load(stream)
-        except (ValueError, UnicodeError) as exc:
+        except (ValueError, UnicodeError, RecursionError) as exc:
             raise ArchiveError("Invalid OCI JSON: " + name) from exc
 
 
@@ -49,7 +49,7 @@ def _add_bytes(archive, name, raw, epoch):
     archive.addfile(info, io.BytesIO(raw))
 
 
-def _source(path, expected_architecture):
+def probe_input(path, expected_architecture):
     with tarfile.open(path, "r:") as archive:
         index = _json_member(archive, "index.json")
         entries = index.get("manifests") if isinstance(index, dict) else None
@@ -63,7 +63,12 @@ def _source(path, expected_architecture):
         tag = entry.get("annotations", {}).get("org.opencontainers.image.ref.name")
         if not isinstance(tag, str):
             raise ArchiveError("Input OCI archive has no tag")
-    OCIImageWriter().verify(path, tag)
+    return entry
+
+
+def _source(path, expected_architecture):
+    entry = probe_input(path, expected_architecture)
+    OCIImageWriter().verify(path, entry["annotations"]["org.opencontainers.image.ref.name"])
     return entry
 
 

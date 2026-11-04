@@ -1,4 +1,4 @@
-"""为工作台暂存浏览器选中的 Fast 应用包。"""
+"""为工作台暂存浏览器选中的构建文件。"""
 
 import secrets
 import shutil
@@ -24,6 +24,7 @@ class Upload:
     directory: tempfile.TemporaryDirectory
     path: Path
     size: int
+    kind: str
     expires: float = 0
     discarded: bool = False
 
@@ -51,11 +52,13 @@ class FastUploads:
             shutil.rmtree(directory)
         del self.entries[token]
 
-    def _ready(self, token):
+    def _ready(self, token, kind):
         entry = self.entries.get(token)
         if (self.closed or entry is None or entry.discarded or
                 not entry.expires or entry.expires <= time.monotonic()):
             raise BuildError("暂存文件已过期或已提交，请重新选择应用包")
+        if entry.kind != kind:
+            raise BuildError("暂存文件类型与当前输入不匹配")
         return entry
 
     def _reap(self, force=False):
@@ -71,15 +74,21 @@ class FastUploads:
         with self.lock:
             self._reap()
 
-    def receive(self, source, size, filename):
+    def receive(self, source, size, filename, kind="package"):
         if not 0 < size <= MAX_UPLOAD:
-            raise BuildError("应用包大小必须大于 0，且不超过 2 GiB")
+            raise BuildError("文件大小必须大于 0，且不超过 2 GiB")
         if (not filename or len(filename) > 255 or "/" in filename or "\\" in filename or
                 any(ord(char) < 32 or ord(char) == 127 for char in filename)):
             raise BuildError("无效的应用包文件名")
         name = filename.lower()
-        if name != "dist.zip" and not name.endswith(".war"):
-            raise BuildError("请选择 WAR 或名为 dist.zip 的文件")
+        if kind == "package" and (name == "dist.zip" or name.endswith(".war")):
+            stored_name = "dist.zip" if name == "dist.zip" else "package.war"
+        elif kind == "archive" and name.endswith(".tar"):
+            stored_name = "image.tar"
+        elif kind == "dockerfile" and size <= 1024 ** 2:
+            stored_name = "Dockerfile"
+        else:
+            raise BuildError("请选择符合要求的文件（WAR、dist.zip、tar 或不超过 1 MiB 的 Dockerfile）")
         with self.lock:
             if self.closed:
                 raise BuildError("工作台正在关闭")
@@ -89,8 +98,8 @@ class FastUploads:
             token = secrets.token_urlsafe(24)
             root = resolve_host_path(tempfile.gettempdir())
             directory = tempfile.TemporaryDirectory(prefix="pyib-fast-upload-", dir=str(root))
-            path = Path(directory.name) / ("dist.zip" if name == "dist.zip" else "package.war")
-            self.entries[token] = Upload(directory, path, size)
+            path = Path(directory.name) / stored_name
+            self.entries[token] = Upload(directory, path, size, kind)
         try:
             with path.open("xb") as output:
                 remaining = size
@@ -112,12 +121,34 @@ class FastUploads:
             raise
         return token
 
-    def path(self, token, claim=False):
+    def path(self, token, claim=False, kind="package"):
         with self.lock:
-            entry = self._ready(token)
+            entry = self._ready(token, kind)
             if claim:
                 entry.expires = 0
             return entry.path
+
+    def claim(self, requested):
+        with self.lock:
+            if len({token for token, _ in requested.values()}) != len(requested):
+                raise BuildError("同一个暂存文件不能填入多个位置")
+            entries = {field: self._ready(token, kind) for field, (token, kind) in requested.items()}
+            for entry in entries.values():
+                entry.expires = 0
+            return {field: entry.path for field, entry in entries.items()}
+
+    def release(self, tokens, retry=False):
+        failure = None
+        for token in tokens:
+            try:
+                if retry:
+                    self.unclaim(token)
+                else:
+                    self.finish(token)
+            except OSError as exc:
+                failure = exc
+        if failure is not None and not retry:
+            raise failure
 
     def unclaim(self, token):
         with self.lock:

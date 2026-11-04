@@ -19,12 +19,17 @@ from web_jobs import FORMATS, LABELS, PLATFORMS, Jobs, command_for, fast_plan, f
 from web_maintenance import PROFILE_FIELDS, _revision, cache_fingerprint, cache_plan, cache_root, candidate_profile, save_profile
 from web_ui import HERO, icon
 from web_uploads import FastUploads
+from web_paths import check_oci_platform
 
 
 STATES = {"queued": "排队中", "running": "运行中", "success": "成功", "failed": "失败",
           "cancelled": "已取消", "unknown": "之前会话未记录最终结果"}
 SPACE_KINDS = {"images": "旧镜像", "cache": "过期构建缓存", "orphans": "无引用镜像层",
                "deliveries": "旧交付 tar（仅列出）"}
+UPLOAD_FIELDS = {"fast": {"package": "package"}, "build": {"dockerfile": "dockerfile"},
+                 "check": {"dockerfile": "dockerfile"}, "load": {"archive": "archive"},
+                 "inspect": {"archive": "archive"}, "verify": {"archive": "archive"},
+                 "multiarch": {"amd64": "archive", "arm64": "archive"}}
 
 FAST_SCRIPT = r"""
 (() => {
@@ -35,78 +40,8 @@ FAST_SCRIPT = r"""
   const path = form.elements.package;
   const token = form.elements['package-upload'];
   const packageField = form.querySelector('[data-field="package"]');
-  const picker = document.getElementById('fast-file-picker');
-  const choose = document.getElementById('fast-choose-file');
-  const fileStatus = document.getElementById('fast-file-status');
-  const submit = form.querySelector('button[type="submit"], button:not([type])');
   const original = output.placeholder;
-  const originalPath = path.placeholder;
-  let timer, request, upload, generation = 0;
-  let release = Promise.resolve();
-  let submitting = false;
-
-  function endpoint(name) {
-    return form.action.replace(/\/submit\/fast$/, '/' + name);
-  }
-  function discard(value) {
-    if (value) {
-      release = release.then(() => fetch(endpoint('discard-fast-upload'), {
-        method: 'POST', body: new URLSearchParams({token: value})
-      })).catch(() => {});
-    }
-  }
-  function clearUpload() {
-    if (upload) upload.abort();
-    upload = null;
-    discard(token.value);
-    token.value = '';
-    path.placeholder = originalPath;
-    path.required = true;
-    submit.disabled = false;
-    fileStatus.textContent = '';
-  }
-  async function stage(files) {
-    if (!files.length) return;
-    const file = files[0];
-    clearUpload();
-    path.value = '';
-    if (files.length !== 1 || !(/\.war$/i.test(file.name) || file.name.toLowerCase() === 'dist.zip')) {
-      fileStatus.textContent = '请选择一个 WAR 或名为 dist.zip 的文件。';
-      update();
-      return;
-    }
-    const current = new AbortController();
-    upload = current;
-    path.placeholder = file.name;
-    path.required = false;
-    submit.disabled = true;
-    fileStatus.textContent = '正在暂存 ' + file.name + '…';
-    update();
-    try {
-      await release;
-      if (upload !== current) return;
-      const response = await fetch(endpoint('upload-fast') + '?' + new URLSearchParams({name: file.name}), {
-        method: 'POST', headers: {'Content-Type': 'application/octet-stream'},
-        body: file, signal: current.signal
-      });
-      const result = await response.json();
-      if (upload !== current) {
-        discard(result.token);
-        return;
-      }
-      if (!response.ok) throw new Error(result.error || '文件暂存失败');
-      upload = null;
-      token.value = result.token;
-      submit.disabled = false;
-      fileStatus.textContent = '已选择 ' + file.name + '。输入新路径可改用其他文件。';
-      update();
-    } catch (error) {
-      if (upload !== current) return;
-      clearUpload();
-      fileStatus.textContent = '暂存失败：' + error.message;
-      update();
-    }
-  }
+  let timer, request, generation = 0;
 
   function update() {
     const current = ++generation;
@@ -114,7 +49,7 @@ FAST_SCRIPT = r"""
     if (request) request.abort();
     output.placeholder = original;
     preview.dataset.tone = '';
-    if (upload) {
+    if (packageField.hasAttribute('data-staging')) {
       preview.textContent = '应用包暂存完成后继续预览。';
       return;
     }
@@ -127,7 +62,7 @@ FAST_SCRIPT = r"""
     timer = setTimeout(async () => {
       request = new AbortController();
       try {
-        const response = await fetch(endpoint('preview-fast'), {
+        const response = await fetch(form.action.replace(/\/submit\/fast$/, '/preview-fast'), {
           method: 'POST', body: new URLSearchParams(new FormData(form)), signal: request.signal
         });
         const plan = await response.json();
@@ -147,40 +82,7 @@ FAST_SCRIPT = r"""
       }
     }, 350);
   }
-  choose.hidden = false;
-  choose.addEventListener('click', () => picker.click());
-  picker.addEventListener('change', () => {
-    stage(picker.files);
-    picker.value = '';
-  });
-  path.addEventListener('input', clearUpload);
-  packageField.addEventListener('dragover', event => {
-    if (!Array.from(event.dataTransfer.types).includes('Files')) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = 'copy';
-    packageField.dataset.drag = 'active';
-  });
-  packageField.addEventListener('dragleave', event => {
-    if (!packageField.contains(event.relatedTarget)) delete packageField.dataset.drag;
-  });
-  packageField.addEventListener('drop', event => {
-    delete packageField.dataset.drag;
-    if (!event.dataTransfer.files.length) return;
-    event.preventDefault();
-    stage(event.dataTransfer.files);
-  });
-  form.addEventListener('submit', event => {
-    if (upload || submitting) {
-      event.preventDefault();
-      return;
-    }
-    submitting = true;
-    submit.disabled = true;
-  });
-  window.addEventListener('pageshow', () => {
-    submitting = false;
-    submit.disabled = Boolean(upload);
-  });
+  form.addEventListener('path-input-change', update);
   form.addEventListener('input', update);
   form.addEventListener('change', update);
   update();
@@ -305,6 +207,21 @@ def _input(name, label, placeholder="", required=False, value=""):
         "required" if required else "")
 
 
+def _path_field(name, label, placeholder="", required=False, value="", mode="file", upload=None, base=""):
+    chooser = '<button type="button" class="secondary" data-browse hidden>浏览{}</button>'.format(
+        "目录" if mode != "file" else "本机")
+    if upload:
+        accept = {"package": ".war,.zip", "dockerfile": ""}.get(upload, ".tar")
+        chooser += ('<button type="button" class="secondary" data-pick hidden>选择文件</button>'
+                    '<button type="button" class="secondary" data-reset-pick hidden>清除</button>'
+                    '<input type="file" data-picker{} hidden><input type="hidden" name="{}-upload">'
+                    ).format(' accept="{}"'.format(accept) if accept else "", name)
+    return ('<div class="path-field" data-field="{}" data-path-mode="{}" data-upload-kind="{}" data-path-base="{}">'
+            '<div class="package-controls">{}{}</div><small data-path-status role="status"></small>{}</div>').format(
+                name, mode, upload or "", _e(base), _input(name, label, placeholder, required, value), chooser,
+                '<small>可输入路径，也可把文件拖到这里。</small>' if upload else "")
+
+
 def _select(name, label, options, selected="", labels=None):
     choices = "".join('<option value="{}"{}>{}</option>'.format(
         _e(value), " selected" if value == selected else "", _e((labels or {}).get(value, value or "自动"))) for value in options)
@@ -369,6 +286,11 @@ class Workbench:
         draft = draft or {}
 
         def field(name, label, placeholder="", required=False):
+            modes = {"output": "output", "context": "directory", "dockerfile": "file",
+                     "base-tar": "file", "base-map": "file", "input-lock": "file", "sign-key": "file"}
+            if name in modes:
+                return _path_field(name, label, placeholder, required, draft.get(name, ""),
+                                   modes[name], "dockerfile" if name == "dockerfile" else None)
             return _input(name, label, placeholder, required, draft.get(name, ""))
 
         platform = _select("platform", "平台", PLATFORMS, draft.get("platform", PLATFORMS[0]))
@@ -379,13 +301,8 @@ class Workbench:
         dockerfile = field("dockerfile", "Dockerfile（可选）", "默认使用上下文中的 Dockerfile")
         if self.profiles:
             default = draft.get("profile", self.settings["fast"].get("defaultProfile", ""))
-            package = ('<div class="package-field" data-field="package"><div class="package-controls">{}'
-                       '<button type="button" class="secondary" id="fast-choose-file" hidden>选择文件</button>'
-                       '<input type="file" id="fast-file-picker" accept=".war,.zip" hidden>'
-                       '<input type="hidden" name="package-upload"></div>'
-                       '<small class="muted" id="fast-file-status" role="status"></small>'
-                       '<small class="muted">可输入路径，也可把 WAR 或 dist.zip 拖到这里。</small></div>').format(
-                           field("package", "WAR／dist.zip 路径", "/data/packages/dist.zip", True))
+            package = _path_field("package", "WAR／dist.zip 路径", "/data/packages/dist.zip", True,
+                                  draft.get("package", ""), upload="package")
             fast = self.form("fast", package
                              + field("project", "项目", "hisq", True) + field("version", "版本", "1.0.0", True)
                              + _select("profile", "模板", sorted(self.profiles), default)
@@ -412,9 +329,11 @@ class Workbench:
         if action == "fast":
             return _section("复用快速打包参数", fast)
         if action == "build":
-            return _section("复用 Dockerfile 构建参数", self.form("build", ordinary))
-        multiarch = self.form("multiarch", _input("amd64", "amd64 OCI tar", "", True) +
-                              _input("arm64", "arm64 OCI tar", "", True) +
+            return _section("复用 Dockerfile 构建参数",
+                            '<p class="muted">如果上次选择或拖入了 Dockerfile，请重新选择该文件。</p>'
+                            + self.form("build", ordinary))
+        multiarch = self.form("multiarch", _path_field("amd64", "amd64 OCI tar", required=True, upload="amd64") +
+                              _path_field("arm64", "arm64 OCI tar", required=True, upload="arm64") +
                               _input("tag", "多平台镜像标签", "", True) + destination +
                               _input("epoch", "可复现时间戳（可选）"))
         hero = ('<div class="hero"><div><h2>准备交付镜像</h2>'
@@ -449,7 +368,7 @@ class Workbench:
                     for selected in item["delivery_items"]) + "</div>"))
         platform = _select("platform", "平台", PLATFORMS, PLATFORMS[0])
         reference = _input("reference", "镜像引用", "harbor.example/project/image:1", True)
-        archive = _input("archive", "现有 tar 路径", "/data/images/app.tar", True)
+        archive = _path_field("archive", "现有 tar 路径", "/data/images/app.tar", True, upload="archive")
         tag = _input("tag", "镜像标签（可选）")
         source = ("", "registry", "artifactory")
         filters = '<form method="get" action="{}/images">{}{}{}<button>筛选</button></form>'.format(
@@ -461,7 +380,7 @@ class Workbench:
             _section("拉取基础镜像", self.form("pull", reference + platform + _select("source", "来源", source))),
             _section("导入 Docker tar", self.form("load", archive + tag + platform)),
             _section("从镜像库导出 tar", self.form("save", reference + platform +
-                     _select("source", "来源", source + ("local",)) + _input("output", "输出 tar 路径", "", True))),
+                     _select("source", "来源", source + ("local",)) + _path_field("output", "输出 tar 路径", required=True, mode="output"))),
             _section("检查现有 Docker tar", self.form("inspect", archive + tag) + self.form("verify", archive + tag)),
             _section("磁盘占用", self.form("df", "")),
             _section("删除本地镜像引用", self.form("remove", reference + platform +
@@ -490,7 +409,7 @@ class Workbench:
         for action in self.delivery.actions(item):
             content = hidden + '<input type="hidden" name="action" value="{}">'.format(action)
             if action in ("tag", "save", "optimize", "flatten"):
-                content += _input("output", "新 tar 输出路径", "/data/images/release.tar", True)
+                content += _path_field("output", "新 tar 输出路径", "/data/images/release.tar", True, mode="output")
             if action == "tag":
                 content += _input("new-tag", "新镜像标签", "hisq_front:1.0.1", True)
             if action == "push":
@@ -601,7 +520,11 @@ class Workbench:
             value = previous.get(field) or ""
             if field == "baseUrl" and ("?" in value or "@" in value):
                 value = ""
-            form += _input(field, label, "", field == "baseImage", value)
+            if field in ("baseTar", "serverConfig", "outputDir"):
+                form += _path_field(field, label, value=value, mode="directory" if field == "outputDir" else "file",
+                                    base=self.config.parent)
+            else:
+                form += _input(field, label, "", field == "baseImage", value)
         form += _check("default", "设为默认 Fast 模板")
         form += _select("platform", "基础镜像测试平台", PLATFORMS, PLATFORMS[0])
         return _section("Fast 模板", '<p>本地 tar 和 Artifactory 地址二选一。测试不保存配置。</p>' +
@@ -729,21 +652,34 @@ class Workbench:
         return token
 
     def submit(self, action, data):
-        token = self._upload_token(data) if action == "fast" else ""
-        package = self.uploads.path(token, claim=True) if token else None
+        allowed = UPLOAD_FIELDS.get(action, {})
+        requested = {}
+        for key, token in data.items():
+            if key.endswith("-upload") and token:
+                field = key[:-7]
+                if field not in allowed or data.get(field, "").strip():
+                    raise BuildError("请选择文件或填写该输入的本机路径")
+                requested[field] = (token, allowed[field])
+        paths = self.uploads.claim(requested) if requested else {}
+        tokens = [token for token, _ in requested.values()]
         try:
-            return self._submit(action, data, package, partial(self.uploads.finish, token) if token else None)
+            return self._submit(action, data, paths, partial(self.uploads.release, tokens) if tokens else None)
         except BaseException:
-            if token:
-                self.uploads.unclaim(token)
+            self.uploads.release(tokens, retry=True)
             raise
 
-    def _submit(self, action, data, package, cleanup):
-        args, outputs = command_for(action, data, self.config_arg, self.profiles, package)
+    def _submit(self, action, data, paths, cleanup):
+        effective = dict(data, **{field: str(path) for field, path in paths.items() if field != "package"})
+        args, outputs = command_for(action, effective, self.config_arg, self.profiles, paths.get("package"))
+        if any(path.parent in output.parents for path in paths.values() for output in outputs):
+            raise BuildError("输出路径不能位于文件暂存目录内")
+        if action == "multiarch":
+            for architecture in ("amd64", "arm64"):
+                check_oci_platform(Path(effective[architecture].strip()).expanduser().absolute(), architecture)
         label = next((data[key] for key in ("project", "tag", "reference", "archive", "context") if data.get(key)), "")
         draft = form_snapshot(action, data)
-        if package is not None:
-            draft.pop("package", None)
+        for field in paths:
+            draft.pop(field, None)
         for key in ("package", "context", "dockerfile", "base-tar", "base-map", "input-lock", "output"):
             if draft.get(key, "").strip():
                 draft[key] = str(Path(draft[key].strip()).expanduser().absolute())

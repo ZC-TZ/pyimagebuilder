@@ -108,6 +108,8 @@ def _workbench_page(workspace, title, body, fast_script=False, active=None, job_
     default_active, description = PAGES.get(title, ("", ""))
     script = "fast.js" if fast_script else "job.js" if job_script else None
     head = '<script defer src="{}/{}"></script>'.format(workspace.prefix, script) if script else ""
+    if "data-path-mode=" in body:
+        head += '<script defer src="{}/paths.js"></script>'.format(workspace.prefix)
     return document(title, '<section class="records">{}</section>'.format(body),
                     workspace.nav(default_active if active is None else active), description, head)
 
@@ -263,6 +265,9 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                     return self._reply(200, FAST_SCRIPT, content_type="application/javascript")
                 if route == "/job.js" and not query:
                     return self._reply(200, JOB_SCRIPT, content_type="application/javascript")
+                if route == "/paths.js" and not query:
+                    from web_paths import PATH_SCRIPT
+                    return self._reply(200, PATH_SCRIPT, content_type="application/javascript")
                 if route == "/profile" and len(query) <= 256:
                     name, = parse_qs(query).get("name", [None])
                     return self._reply(200, _workbench_page(workspace, "Fast 模板管理",
@@ -323,17 +328,47 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                 return self._reply(403, "Invalid request origin")
             path, _, query = self.path.partition("?")
             route = session_route(path, workspace.prefix)
-            if route == "/upload-fast":
+            if route in ("/browse-path", "/choose-output") and not query:
+                from web_paths import browse, selected_output
+                try:
+                    fields = form_data(self)
+                    if route == "/browse-path":
+                        result = browse(fields)
+                    else:
+                        if set(fields) != {"path", "filename"}:
+                            raise ValueError("无效的输出路径")
+                        result = {"path": selected_output(fields["path"], fields["filename"])}
+                    return self._json(200, result)
+                except (BuildError, OSError, ValueError) as exc:
+                    return self._json(400, {"error": str(exc)})
+            if route in ("/upload-fast", "/upload-path"):
                 try:
                     if len(query) > 4096 or self.headers.get_content_type() != "application/octet-stream":
                         raise ValueError("无效的应用包上传请求")
                     fields = parse_qs(query, keep_blank_values=True)
                     filename, = fields.get("name", [])
+                    kind = "package"
+                    if route == "/upload-path":
+                        kind, = fields.get("kind", [])
+                        if kind not in ("package", "archive", "dockerfile", "amd64", "arm64"):
+                            raise ValueError("不支持的文件用途")
                     lengths = self.headers.get_all("Content-Length") or []
                     if (len(lengths) != 1 or not lengths[0].isascii() or not lengths[0].isdecimal() or
                             len(lengths[0]) > 10 or self.headers.get("Transfer-Encoding") is not None):
                         raise ValueError("无效的应用包长度")
-                    token = workspace.uploads.receive(self.rfile, int(lengths[0]), filename)
+                    architecture = kind if kind in ("amd64", "arm64") else None
+                    token = workspace.uploads.receive(self.rfile, int(lengths[0]), filename,
+                                                      "archive" if architecture else kind)
+                    if architecture:
+                        from web_paths import check_oci_platform
+                        try:
+                            check_oci_platform(workspace.uploads.path(token, kind="archive"), architecture)
+                        except BuildError:
+                            try:
+                                workspace.uploads.discard(token)
+                            except OSError:
+                                pass
+                            raise
                     return self._json(200, {"token": token})
                 except (BuildError, OSError, ValueError) as exc:
                     return self._json(400, {"error": str(exc)})

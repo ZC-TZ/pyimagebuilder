@@ -101,12 +101,22 @@ button.danger:hover{background:#fce6eb}
 .job-form[data-action=fast]>.form-footer{grid-column:1 / -1}
 .job-form[data-action=fast]>[data-field=platform],.job-form[data-action=fast]>[data-field=format]{grid-column:span 3}
 .job-form[data-action=fast]>[data-field=output]{grid-column:span 6}
-.package-field{padding:10px;border:1px dashed #c7d4e7;border-radius:8px;min-width:0}
-.package-field[data-drag=active]{border-color:var(--accent);background:var(--tint)}
 .package-controls{display:flex;align-items:end;gap:8px;flex-wrap:wrap}
-.package-field>small{display:block;margin-top:4px;overflow-wrap:anywhere}
-#fast-file-status:empty,#fast-choose-file[hidden]{display:none}
-.job-form[data-action=fast] button:disabled{opacity:.6;cursor:wait}
+.path-field{flex:1 1 260px;min-width:0}
+.path-field[data-field=context]{flex-basis:100%}
+.job-form[data-action=fast]>.path-field[data-field=output]{grid-column:span 6}
+.path-field[data-upload-kind]:not([data-upload-kind=""]){padding:8px;border:1px dashed var(--line);border-radius:8px}
+.path-field[data-drag=active]{border-color:var(--accent);background:var(--tint)}
+.path-field small{display:block;overflow-wrap:anywhere;margin-top:4px}
+.path-field small:empty,.path-field button[hidden],.path-dialog [hidden]{display:none}
+.path-dialog{width:min(680px,calc(100% - 24px));max-height:calc(100% - 24px);border:1px solid var(--line);
+  border-radius:12px;padding:18px;color:var(--ink);overflow:auto}
+.path-dialog::backdrop{background:#15223880}
+.path-dialog h2{margin:0 0 12px;font-size:18px}
+.path-dialog .actions{margin:8px 0;align-items:end}
+.path-dialog ul{max-height:34vh;overflow:auto;margin:8px 0}
+.path-dialog li>button{width:100%;justify-content:start;text-align:left;overflow-wrap:anywhere}
+.path-dialog button:disabled{opacity:.5;cursor:default}
 .form-footer{flex:1 0 100%;padding-top:12px;margin-top:3px;border-top:1px solid #edf1f7;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .field-wide{flex-basis:100%}
 .advanced,.toolbox{flex:1 0 100%;min-width:0;border:1px solid var(--line);border-radius:10px;background:#f8faff}
@@ -165,6 +175,7 @@ pre{font:12px/1.6 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere;backgr
   .job-form[data-action=fast]>label,.job-form[data-action=fast]>[data-field=platform],
   .job-form[data-action=fast]>[data-field=format]{grid-column:span 1}
   .job-form[data-action=fast]>[data-field=output],.job-form[data-action=fast]>[data-field=profile]{grid-column:1 / -1}
+  .job-form[data-action=fast]>.path-field[data-field=output]{grid-column:1 / -1}
 }
 @media(max-width:390px){.local{display:none}.tabs a{font-size:12px}.tiles{grid-template-columns:1fr}}
 """
