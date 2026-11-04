@@ -85,6 +85,16 @@ python3 ./main.py builds --config ./config.json --tag hisq_front:1.0.0 --limit 5
 
 删除或移动 tar 不会删除台账条目。台账从启用此功能后开始积累，旧 tar 不会被自动登记；失败、`--check` 和 `--no-build-records` 不留记录。见[台账保存位置](CONFIGURATION.md#5-缓存与运行数据)。
 
+### 在浏览器里查看台账
+
+```bash
+python3 ./main.py builds --web
+```
+
+在同一台机器的浏览器打开终端显示的网址，默认是 `http://127.0.0.1:8765/`。可按项目或镜像标签筛选，点「刷新」读取新记录。留空筛选条件即可浏览全部记录，每页 25 条。网页只读取同一份台账，不提供 tar 下载或删除操作。终端按 `Ctrl+C` 停止。
+
+可以加 `--project hisq` 或 `--tag hisq_front:1.0.0` 生成带初始筛选的网址；`--limit 100` 限制可浏览的最近匹配记录数。端口占用时加 `--port 8766`，或用 `--port 0` 自动选择空闲端口。网页只监听本机回环地址，不向局域网开放。
+
 ## 3. 模板怎样影响 Dockerfile
 
 | 设置 | TongWeb 默认值 | Tomcat 默认值 |

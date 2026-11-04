@@ -99,12 +99,22 @@ def main(argv=None):
     parser.add_argument("--tag", help="Filter by exact image tag")
     parser.add_argument("--limit", type=int, help="Maximum number of matching builds, newest first")
     parser.add_argument("--json", action="store_true", help="Print machine-readable records")
+    parser.add_argument("--web", action="store_true", help="Serve a read-only browser view on 127.0.0.1")
+    parser.add_argument("--port", type=int, help="Local web port (default 8765; 0 picks a free port)")
     args = parser.parse_args(argv)
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be positive")
+    if args.web and args.json:
+        parser.error("--web and --json cannot be combined")
+    if args.port is not None and (not args.web or not 0 <= args.port <= 65535):
+        parser.error("--port requires --web and must be between 0 and 65535")
     try:
         settings, _ = load_settings(args.config)
         directory = records_directory(settings)
+        if args.web:
+            from build_records_web import serve
+            return serve(directory, 8765 if args.port is None else args.port,
+                         args.project, args.tag, args.limit)
         rows = list_builds(directory, args.project, args.tag, args.limit)
         if args.json:
             print(json.dumps({"directory": str(directory), "builds": rows}, ensure_ascii=True, indent=2))

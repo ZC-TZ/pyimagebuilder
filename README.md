@@ -67,7 +67,7 @@ python .\fast.py D:\packages\report-1.2.3.war sfcx 1.3.4 --profile tongweb
 
 前端默认标签为 `sfcx_front:1.3.4`。Fast 会生成临时 Dockerfile，并用 `COPY` 添加应用文件；不执行 `RUN`。模板差异、输出位置和完整流程见 [Fast 指南](docs/guides/FAST.md)。
 
-成功打包会自动写入本机台账。用 `python main.py builds --project sfcx` 查前后端版本、完成时间和原输出路径。详见[查询打包过的版本](docs/guides/FAST.md#查询打包过的版本)。
+成功打包会自动写入本机台账。用 `python main.py builds --project sfcx` 查前后端版本，或用 `python main.py builds --web` 在浏览器查看。详见[查询打包过的版本](docs/guides/FAST.md#查询打包过的版本)。
 
 ## 使用 Dockerfile
 
