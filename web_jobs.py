@@ -67,9 +67,9 @@ def _target(data):
     return target
 
 
-def fast_plan(data, config, profiles):
+def fast_plan(data, config, profiles, uploaded_package=None):
     """验证 Fast 表单并预览实际标签、部署位置和两个可能的输出。"""
-    package = resolve_host_path(_path(_required(data, "package")))
+    package = uploaded_package or resolve_host_path(_path(_required(data, "package")))
     project = _required(data, "project")
     version = _required(data, "version")
     profile_name = _choice(data, "profile", profiles, "")
@@ -81,12 +81,16 @@ def fast_plan(data, config, profiles):
     kind = _choice(data, "format", FORMATS, "docker")
     platform = _choice(data, "platform", PLATFORMS, PLATFORMS[0])
     explicit = _text(data, "output")
+    if uploaded_package is not None and not explicit and not profile.get("outputDir"):
+        raise BuildError("此模板未设置输出目录，请填写输出 tar 路径")
     front, tag, target = fast_target(package, project, version, profile, _path(explicit) if explicit else None)
     outputs = [target]
     if kind == "both":
         outputs.append(output_path(target.with_name(target.stem + ".oci.tar")))
     if any(path.suffix.lower() != ".tar" for path in outputs):
         raise BuildError("输出路径必须以 .tar 结尾")
+    if uploaded_package is not None and any(resolve_host_path(package.parent) in path.parents for path in outputs):
+        raise BuildError("输出路径不能位于应用包暂存目录内")
     if any(path in (package, config, profile.get("baseTar"), profile.get("serverConfig")) for path in outputs):
         raise BuildError("输出路径不能和输入文件相同")
     deploy = profile["deployDir"] + "/" + project + ("f/" if front else ".war")
@@ -96,7 +100,7 @@ def fast_plan(data, config, profiles):
             "conflicts": [path for path in outputs if path.exists()]}
 
 
-def command_for(action, data, config, profiles):
+def command_for(action, data, config, profiles, uploaded_package=None):
     """只拼装已知子命令的参数；路径不是选项，仓库凭据由原 CLI 读取。"""
     platform = _choice(data, "platform", PLATFORMS, PLATFORMS[0])
     common = ["--platform=" + platform]
@@ -104,7 +108,7 @@ def command_for(action, data, config, profiles):
     progress = ["--progress=json"]
     outputs = []
     if action == "fast":
-        plan = fast_plan(data, config, profiles)
+        plan = fast_plan(data, config, profiles, uploaded_package)
         outputs = plan["outputs"]
         if plan["conflicts"]:
             raise BuildError("输出文件已存在：" + "、".join(map(str, plan["conflicts"])))
@@ -230,7 +234,7 @@ class Jobs:
         self.worker = threading.Thread(target=self._run, name="web-build-worker")
         self.worker.start()
 
-    def submit(self, action, args, outputs, label, form=None, delivery=False):
+    def submit(self, action, args, outputs, label, form=None, delivery=False, cleanup=None):
         with self.condition:
             if self.closed or len(self.queue) >= 20:
                 raise BuildError("Web job queue is full or closing")
@@ -244,7 +248,8 @@ class Jobs:
             self.jobs[identity] = {"id": identity, "action": action, "args": args, "outputs": outputs,
                                    "state": "queued", "logs": deque(maxlen=250), "log_end": 0, "files": [],
                                    "status": "", "process": None, "label": label,
-                                   "form": form_snapshot(action, form or {}), "delivery": delivery}
+                                   "form": form_snapshot(action, form or {}), "delivery": delivery,
+                                   "cleanup": cleanup}
             self.queue.append(identity)
             self._save(self.jobs[identity])
             self.condition.notify()
@@ -270,7 +275,7 @@ class Jobs:
         with self.condition:
             def view(job):
                 snapshot = {key: list(value) if key in ("logs", "files") else value
-                            for key, value in job.items() if key not in ("args", "process", "outputs")}
+                            for key, value in job.items() if key not in ("args", "process", "outputs", "cleanup")}
                 if job["state"] == "running" and job.get("interrupt"):
                     snapshot["status"] = "正在取消"
                 return snapshot
@@ -287,7 +292,7 @@ class Jobs:
             if job["state"] == "queued":
                 self.queue.remove(identity)
                 job["state"] = "cancelled"
-                self._save(job)
+                self._finish(job)
             elif job["state"] == "running" and os.name == "posix" and not job.get("interrupt"):
                 process = job["process"]
                 if process is not None and process.poll() is None:
@@ -332,7 +337,7 @@ class Jobs:
                 except (OSError, ValueError) as exc:
                     self._append_log(job, str(exc))
                     job["state"] = "failed"
-                    self._save(job)
+                    self._finish(job)
                     continue
             self._collect(job, process)
 
@@ -384,4 +389,13 @@ class Jobs:
                     except OSError:
                         pass
             job["process"] = None
-            self._save(job)
+            self._finish(job)
+
+    def _finish(self, job):
+        cleanup = job.pop("cleanup", None)
+        if cleanup is not None:
+            try:
+                cleanup()
+            except OSError as exc:
+                self._append_log(job, "未能清理暂存文件：{}".format(exc))
+        self._save(job)

@@ -323,6 +323,29 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                 return self._reply(403, "Invalid request origin")
             path, _, query = self.path.partition("?")
             route = session_route(path, workspace.prefix)
+            if route == "/upload-fast":
+                try:
+                    if len(query) > 4096 or self.headers.get_content_type() != "application/octet-stream":
+                        raise ValueError("无效的应用包上传请求")
+                    fields = parse_qs(query, keep_blank_values=True)
+                    filename, = fields.get("name", [])
+                    lengths = self.headers.get_all("Content-Length") or []
+                    if (len(lengths) != 1 or not lengths[0].isascii() or not lengths[0].isdecimal() or
+                            len(lengths[0]) > 10 or self.headers.get("Transfer-Encoding") is not None):
+                        raise ValueError("无效的应用包长度")
+                    token = workspace.uploads.receive(self.rfile, int(lengths[0]), filename)
+                    return self._json(200, {"token": token})
+                except (BuildError, OSError, ValueError) as exc:
+                    return self._json(400, {"error": str(exc)})
+            if route == "/discard-fast-upload" and not query:
+                try:
+                    fields = form_data(self)
+                    if set(fields) != {"token"}:
+                        raise ValueError("无效的暂存文件请求")
+                    workspace.uploads.discard(fields["token"])
+                    return self._json(200, {})
+                except (OSError, ValueError) as exc:
+                    return self._json(400, {"error": str(exc)})
             if route == "/preview-fast" and not query:
                 try:
                     return self._json(200, workspace.preview_fast(form_data(self)))

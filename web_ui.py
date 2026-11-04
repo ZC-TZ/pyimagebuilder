@@ -101,6 +101,12 @@ button.danger:hover{background:#fce6eb}
 .job-form[data-action=fast]>.form-footer{grid-column:1 / -1}
 .job-form[data-action=fast]>[data-field=platform],.job-form[data-action=fast]>[data-field=format]{grid-column:span 3}
 .job-form[data-action=fast]>[data-field=output]{grid-column:span 6}
+.package-field{padding:10px;border:1px dashed #c7d4e7;border-radius:8px;min-width:0}
+.package-field[data-drag=active]{border-color:var(--accent);background:var(--tint)}
+.package-controls{display:flex;align-items:end;gap:8px;flex-wrap:wrap}
+.package-field>small{display:block;margin-top:4px;overflow-wrap:anywhere}
+#fast-file-status:empty,#fast-choose-file[hidden]{display:none}
+.job-form[data-action=fast] button:disabled{opacity:.6;cursor:wait}
 .form-footer{flex:1 0 100%;padding-top:12px;margin-top:3px;border-top:1px solid #edf1f7;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .field-wide{flex-basis:100%}
 .advanced,.toolbox{flex:1 0 100%;min-width:0;border:1px solid var(--line);border-radius:10px;background:#f8faff}

@@ -6,6 +6,7 @@ import os
 import secrets
 import stat
 import sys
+from functools import partial
 from html import escape
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode
@@ -17,6 +18,7 @@ from web_delivery import DELIVERY_ACTIONS, Delivery, library_items
 from web_jobs import FORMATS, LABELS, PLATFORMS, Jobs, command_for, fast_plan, file_stamp, open_artifact
 from web_maintenance import PROFILE_FIELDS, _revision, cache_fingerprint, cache_plan, cache_root, candidate_profile, save_profile
 from web_ui import HERO, icon
+from web_uploads import FastUploads
 
 
 STATES = {"queued": "排队中", "running": "运行中", "success": "成功", "failed": "失败",
@@ -30,15 +32,90 @@ FAST_SCRIPT = r"""
   if (!form) return;
   const preview = document.getElementById('fast-preview');
   const output = form.elements.output;
+  const path = form.elements.package;
+  const token = form.elements['package-upload'];
+  const packageField = form.querySelector('[data-field="package"]');
+  const picker = document.getElementById('fast-file-picker');
+  const choose = document.getElementById('fast-choose-file');
+  const fileStatus = document.getElementById('fast-file-status');
+  const submit = form.querySelector('button[type="submit"], button:not([type])');
   const original = output.placeholder;
-  let timer, request, generation = 0;
+  const originalPath = path.placeholder;
+  let timer, request, upload, generation = 0;
+
+  function endpoint(name) {
+    return form.action.replace(/\/submit\/fast$/, '/' + name);
+  }
+  function discard(value) {
+    if (value) {
+      fetch(endpoint('discard-fast-upload'), {
+        method: 'POST', body: new URLSearchParams({token: value})
+      }).catch(() => {});
+    }
+  }
+  function clearUpload() {
+    if (upload) upload.abort();
+    upload = null;
+    discard(token.value);
+    token.value = '';
+    path.placeholder = originalPath;
+    path.required = true;
+    submit.disabled = false;
+    fileStatus.textContent = '';
+  }
+  async function stage(files) {
+    if (!files.length) return;
+    const file = files[0];
+    clearUpload();
+    path.value = '';
+    if (files.length !== 1 || !(/\.war$/i.test(file.name) || file.name.toLowerCase() === 'dist.zip')) {
+      fileStatus.textContent = '请选择一个 WAR 或名为 dist.zip 的文件。';
+      update();
+      return;
+    }
+    const current = new AbortController();
+    upload = current;
+    path.placeholder = file.name;
+    path.required = false;
+    submit.disabled = true;
+    fileStatus.textContent = '正在暂存 ' + file.name + '…';
+    update();
+    try {
+      const response = await fetch(endpoint('upload-fast') + '?' + new URLSearchParams({name: file.name}), {
+        method: 'POST', headers: {'Content-Type': 'application/octet-stream'},
+        body: file, signal: current.signal
+      });
+      const result = await response.json();
+      if (upload !== current) {
+        discard(result.token);
+        return;
+      }
+      if (!response.ok) throw new Error(result.error || '文件暂存失败');
+      upload = null;
+      token.value = result.token;
+      submit.disabled = false;
+      fileStatus.textContent = '已选择 ' + file.name + '。输入新路径可改用其他文件。';
+      update();
+    } catch (error) {
+      if (upload !== current) return;
+      clearUpload();
+      fileStatus.textContent = '暂存失败：' + error.message;
+      update();
+    }
+  }
+
   function update() {
     const current = ++generation;
     clearTimeout(timer);
     if (request) request.abort();
     output.placeholder = original;
     preview.dataset.tone = '';
-    if (!['package', 'project', 'version'].every(key => form.elements[key].value.trim())) {
+    if (upload) {
+      preview.textContent = '应用包暂存完成后继续预览。';
+      return;
+    }
+    if ((!token.value && !path.value.trim()) ||
+        !['project', 'version'].every(key => form.elements[key].value.trim())) {
       preview.textContent = '填好应用包、项目和版本后显示预览。';
       return;
     }
@@ -46,7 +123,7 @@ FAST_SCRIPT = r"""
     timer = setTimeout(async () => {
       request = new AbortController();
       try {
-        const response = await fetch(form.action.replace(/\/submit\/fast$/, '/preview-fast'), {
+        const response = await fetch(endpoint('preview-fast'), {
           method: 'POST', body: new URLSearchParams(new FormData(form)), signal: request.signal
         });
         const plan = await response.json();
@@ -66,6 +143,31 @@ FAST_SCRIPT = r"""
       }
     }, 350);
   }
+  choose.hidden = false;
+  choose.addEventListener('click', () => picker.click());
+  picker.addEventListener('change', () => {
+    stage(picker.files);
+    picker.value = '';
+  });
+  path.addEventListener('input', clearUpload);
+  packageField.addEventListener('dragover', event => {
+    if (!Array.from(event.dataTransfer.types).includes('Files')) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    packageField.dataset.drag = 'active';
+  });
+  packageField.addEventListener('dragleave', event => {
+    if (!packageField.contains(event.relatedTarget)) delete packageField.dataset.drag;
+  });
+  packageField.addEventListener('drop', event => {
+    delete packageField.dataset.drag;
+    if (!event.dataTransfer.files.length) return;
+    event.preventDefault();
+    stage(event.dataTransfer.files);
+  });
+  form.addEventListener('submit', event => {
+    if (upload) event.preventDefault();
+  });
   form.addEventListener('input', update);
   form.addEventListener('change', update);
   update();
@@ -230,6 +332,7 @@ class Workbench:
         self.config_arg = config if config.is_file() else None
         self.profiles = settings.get("fast", {}).get("profiles", {})
         self.delivery = Delivery(settings, self.config_arg, directory)
+        self.uploads = FastUploads()
         self.jobs = Jobs(directory)
 
     def nav(self, active=""):
@@ -263,7 +366,14 @@ class Workbench:
         dockerfile = field("dockerfile", "Dockerfile（可选）", "默认使用上下文中的 Dockerfile")
         if self.profiles:
             default = draft.get("profile", self.settings["fast"].get("defaultProfile", ""))
-            fast = self.form("fast", field("package", "WAR／dist.zip 路径", "/data/packages/dist.zip", True)
+            package = ('<div class="package-field" data-field="package"><div class="package-controls">{}'
+                       '<button type="button" class="secondary" id="fast-choose-file" hidden>选择文件</button>'
+                       '<input type="file" id="fast-file-picker" accept=".war,.zip" hidden>'
+                       '<input type="hidden" name="package-upload"></div>'
+                       '<small class="muted" id="fast-file-status" role="status"></small>'
+                       '<small class="muted">可输入路径，也可把 WAR 或 dist.zip 拖到这里。</small></div>').format(
+                           field("package", "WAR／dist.zip 路径", "/data/packages/dist.zip", True))
+            fast = self.form("fast", package
                              + field("project", "项目", "hisq", True) + field("version", "版本", "1.0.0", True)
                              + _select("profile", "模板", sorted(self.profiles), default)
                              + platform + formats
@@ -392,7 +502,9 @@ class Workbench:
                                 (plan.get("destination") or plan.get("tag") or plan.get("label", ""))[:300], delivery=True)
 
     def preview_fast(self, data):
-        plan = fast_plan(data, self.config_arg, self.profiles)
+        token = self._upload_token(data)
+        package = self.uploads.path(token) if token else None
+        plan = fast_plan(data, self.config_arg, self.profiles, package)
         return {
             "tag": plan["tag"], "base": plan["base"], "deploy": plan["deploy"],
             "outputs": list(map(str, plan["outputs"])), "conflicts": list(map(str, plan["conflicts"]))}
@@ -597,21 +709,42 @@ class Workbench:
                 "running": job["state"] in ("queued", "running"), "archived": bool(job.get("archived")),
                 "start": start, "end": end, "lines": job["logs"][max(0, after - start):]}
 
+    def _upload_token(self, data):
+        token = data.get("package-upload", "")
+        if token and data.get("package", "").strip():
+            raise BuildError("请选择暂存文件或填写应用包路径")
+        return token
+
     def submit(self, action, data):
-        args, outputs = command_for(action, data, self.config_arg, self.profiles)
+        token = self._upload_token(data) if action == "fast" else ""
+        package = self.uploads.path(token, claim=True) if token else None
+        try:
+            return self._submit(action, data, package, partial(self.uploads.finish, token) if token else None)
+        except BaseException:
+            if token:
+                self.uploads.unclaim(token)
+            raise
+
+    def _submit(self, action, data, package, cleanup):
+        args, outputs = command_for(action, data, self.config_arg, self.profiles, package)
         label = next((data[key] for key in ("project", "tag", "reference", "archive", "context") if data.get(key)), "")
         draft = form_snapshot(action, data)
+        if package is not None:
+            draft.pop("package", None)
         for key in ("package", "context", "dockerfile", "base-tar", "base-map", "input-lock", "output"):
             if draft.get(key, "").strip():
                 draft[key] = str(Path(draft[key].strip()).expanduser().absolute())
-        return self.jobs.submit(action, args, outputs, label[:300], draft)
+        return self.jobs.submit(action, args, outputs, label[:300], draft, cleanup=cleanup)
 
     def close(self):
-        self.jobs.close()
+        try:
+            self.uploads.close()
+        finally:
+            self.jobs.close()
 
 
 def form_data(handler):
-    """只接受有界的浏览器表单，不提供上传或任意命令接口。"""
+    """只接受有界的 URL 编码表单。"""
     if handler.headers.get_content_type() != "application/x-www-form-urlencoded":
         raise ValueError("Invalid form content type")
     lengths = handler.headers.get_all("Content-Length") or []

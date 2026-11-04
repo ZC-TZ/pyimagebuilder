@@ -283,6 +283,65 @@ class WorkbenchTests(unittest.TestCase):
         self.assertNotIn(b"hisq_back:1", self.http("/images")[2])
         self.assertIn(b"hisq_back:1", self.http("/history")[2])
 
+    def upload_package(self, name, body, same_origin=True, authenticated=True):
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        try:
+            prefix = self.workspace.prefix if authenticated else ""
+            origin = "http://127.0.0.1:{}".format(self.server.server_port) if same_origin else "http://external.example"
+            conn.request("POST", prefix + "/upload-fast?" + urlencode({"name": name}), body,
+                         {"Content-Type": "application/octet-stream", "Origin": origin})
+            result = conn.getresponse()
+            return result.status, result.read()
+        finally:
+            conn.close()
+
+    def test_uploaded_war_and_dist_use_real_fast_build_and_are_released(self):
+        import zipfile
+        dist = io.BytesIO()
+        with zipfile.ZipFile(dist, "w") as archive:
+            archive.writestr("index.html", "<p>preview</p>")
+        for filename, content, suffix in (("中文.war", b"web archive", "back"), ("dist.zip", dist.getvalue(), "front")):
+            with self.subTest(filename=filename):
+                status, raw = self.upload_package(filename, content)
+                self.assertEqual(status, 200, raw)
+                token = json.loads(raw)["token"]
+                staged = self.workspace.uploads.path(token)
+                fields = {"package-upload": token, "project": "hisq", "version": "1", "profile": "tomcat"}
+                status, _, raw = self.http("/preview-fast", fields)
+                self.assertEqual(status, 200, raw)
+                plan = json.loads(raw)
+                self.assertEqual(plan["tag"], "hisq_{}:1".format(suffix))
+                self.assertEqual(Path(plan["outputs"][0]).parent, self.root / "deliveries")
+                self.assertEqual(self.http("/submit/fast", dict(fields, project="invalid/name"))[0], 400)
+                self.assertTrue(staged.is_file())
+                _, identity = self.run_job("fast", fields)
+                self.assertFalse(staged.parent.exists())
+                self.assertEqual(self.http("/submit/fast", fields)[0], 400)
+                self.assertNotIn("package", self.workspace.jobs.journal.read(identity)["form"])
+
+    def test_upload_origin_filenames_and_queued_cancel(self):
+        self.assertEqual(self.upload_package("app.war", b"war", same_origin=False)[0], 403)
+        self.assertEqual(self.upload_package("app.war", b"war", authenticated=False)[0], 404)
+        for invalid in ("other.zip", "../app.war", r"..\app.war"):
+            self.assertEqual(self.upload_package(invalid, b"war")[0], 400)
+        self.assertFalse(self.workspace.uploads.entries)
+        status, body = self.upload_package("app.war", b"war")
+        self.assertEqual(status, 200, body)
+        token = json.loads(body)["token"]
+        staged = self.workspace.uploads.path(token)
+        jobs = self.workspace.jobs
+        with jobs.condition:
+            identity = self.workspace.submit("fast", {"package-upload": token, "project": "app",
+                                                        "version": "1", "profile": "tomcat"})
+            jobs.cancel(identity)
+        self.assertFalse(staged.parent.exists())
+        status, body = self.upload_package("app.war", b"war")
+        self.assertEqual(status, 200, body)
+        token = json.loads(body)["token"]
+        staged = self.workspace.uploads.path(token)
+        self.assertEqual(self.http("/discard-fast-upload", {"token": token})[0], 200)
+        self.assertFalse(staged.parent.exists())
+
     def test_fast_preview_matches_default_and_reuse_survives_a_new_workbench(self):
         import zipfile
         package = self.root / "dist.zip"
