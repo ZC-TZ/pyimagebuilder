@@ -14,7 +14,7 @@ from pathlib import Path
 from errors import BuildError
 from build_args import arguments
 from fast import fast_target, load_profile
-from file_resources import fdopen_owned
+from file_resources import open_regular_file as open_artifact
 from path_policy import output_path, resolve_host_path
 from web_job_journal import JobJournal, form_snapshot
 
@@ -222,14 +222,6 @@ def command_for(action, data, config, profiles, uploaded_package=None):
 
 def file_stamp(value):
     return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
-
-
-def open_artifact(path):
-    """先拒绝明显的链接与特殊文件，再由调用方按已打开的句柄核对身份。"""
-    if not stat.S_ISREG(path.lstat().st_mode):
-        raise OSError("Artifact is not a regular file")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
-    return fdopen_owned(os.open(str(path), flags), "rb")
 
 
 class Jobs:

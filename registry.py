@@ -10,7 +10,6 @@ import http.client
 import json
 import os
 import re
-import shutil
 import ssl
 import sys
 import tarfile
@@ -661,16 +660,25 @@ def _prepare_remote_manifest(client, archive, manifest_descriptor, workspace, pr
     members = archive_members(archive) if members is None else members
     manifest_descriptor = _descriptor(manifest_descriptor, (MANIFEST_TYPE,))
     manifest_path = "blobs/sha256/" + digest_hex(manifest_descriptor["digest"])
-    with archive.extractfile(members[manifest_path]) as stream:
-        manifest_raw = stream.read()
+    member = members.get(manifest_path)
+    if member is None or not member.isfile() or member.size != manifest_descriptor["size"] or member.size > MAX_JSON:
+        raise ArchiveError("OCI manifest missing or size mismatch")
+    stream = archive.extractfile(member)
+    if stream is None:
+        raise ArchiveError("Unreadable OCI manifest")
+    with stream:
+        manifest_raw = stream.read(MAX_JSON + 1)
+    if (len(manifest_raw) != manifest_descriptor["size"] or
+            hashlib.sha256(manifest_raw).hexdigest() != digest_hex(manifest_descriptor["digest"])):
+        raise ArchiveError("OCI manifest digest or size mismatch")
     manifest = _json(manifest_raw, "OCI manifest")
     config = _descriptor(manifest.get("config"), (CONFIG_TYPE,))
     layers = [_descriptor(item, (LAYER_TYPE,)) for item in manifest.get("layers", [])]
     prepared = []
     for index, descriptor in enumerate([config] + layers):
         name = "blobs/sha256/" + digest_hex(descriptor["digest"])
-        member = members[name]
-        if member.size != descriptor["size"]:
+        member = members.get(name)
+        if member is None or not member.isfile() or member.size != descriptor["size"]:
             raise ArchiveError("OCI blob size mismatch")
         source = archive.extractfile(member)
         if source is None:
@@ -678,10 +686,10 @@ def _prepare_remote_manifest(client, archive, manifest_descriptor, workspace, pr
         destination = workspace / ("{}-{}.blob".format(prefix, index))
         with source, open(destination, "wb") as target:
             if index == 0:
-                shutil.copyfileobj(source, target, BUFFER)
+                _copy_oci_blob(source, target, descriptor, name)
             else:
                 with gzip.GzipFile(fileobj=target, mode="wb", filename="", mtime=0) as compressed:
-                    shutil.copyfileobj(source, compressed, BUFFER)
+                    _copy_oci_blob(source, compressed, descriptor, name)
         prepared_descriptor = copy.deepcopy(descriptor)
         if index != 0:
             prepared_descriptor.update(mediaType=OCI_GZIP_LAYER,
@@ -698,6 +706,17 @@ def _prepare_remote_manifest(client, archive, manifest_descriptor, workspace, pr
     for destination, descriptor in prepared:
         client.upload_file(destination, descriptor)
     return manifest_raw
+
+
+def _copy_oci_blob(source, target, descriptor, name):
+    hasher = hashlib.sha256()
+    size = 0
+    for block in iter(lambda: source.read(BUFFER), b""):
+        hasher.update(block)
+        size += len(block)
+        target.write(block)
+    if size != descriptor["size"] or hasher.hexdigest() != digest_hex(descriptor["digest"]):
+        raise ArchiveError("OCI blob digest or size mismatch: " + name)
 
 
 def _put_manifest(client, reference, raw, media_type):

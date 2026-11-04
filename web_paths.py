@@ -69,7 +69,7 @@ def selected_output(directory, filename):
 def check_oci_platform(path, expected):
     from multiarch import probe_input
     try:
-        probe_input(path, expected)
+        return probe_input(path, expected)["digest"]
     except (BuildError, OSError, tarfile.TarError) as exc:
         raise BuildError("请选择 linux/{} 的单平台 OCI tar：{}".format(expected, exc)) from exc
 

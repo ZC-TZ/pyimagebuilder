@@ -1,6 +1,7 @@
 """统一接管已取得所有权的文件描述符，避免接管失败时泄漏原始句柄。"""
 
 import os
+import stat
 
 
 def fdopen_owned(descriptor, *args, **kwargs):
@@ -16,4 +17,18 @@ def fdopen_owned(descriptor, *args, **kwargs):
             os.close(descriptor)
         except OSError:
             pass
+        raise
+
+
+def open_regular_file(path):
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise OSError("Artifact is not a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    stream = fdopen_owned(os.open(str(path), flags), "rb")
+    try:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise OSError("Artifact is not a regular file")
+        return stream
+    except BaseException:
+        stream.close()
         raise

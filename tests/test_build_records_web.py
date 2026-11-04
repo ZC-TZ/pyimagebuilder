@@ -821,6 +821,21 @@ class WorkbenchTests(unittest.TestCase):
         with tarfile.open(output, "r:") as bundle:
             index = json.load(bundle.extractfile("index.json"))
         self.assertEqual({item["platform"]["architecture"] for item in index["manifests"]}, {"amd64", "arm64"})
+        replacement = self.root / "replacement.oci.tar"
+        (context / "Dockerfile").write_text("FROM scratch\nLABEL replaced=yes\n", encoding="utf-8")
+        self.run_job("build", {"context": str(context), "output": str(replacement), "tag": "multi:1",
+                               "platform": "linux/amd64", "format": "oci", "offline": "1"})
+        queued_output = self.root / "queued.tar"
+        jobs = self.workspace.jobs
+        with jobs.condition:
+            identity = self.workspace.submit("multiarch", dict(archives, tag="multi:1", output=str(queued_output)))
+            os.replace(replacement, archives["amd64"])
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and jobs.snapshot(identity)["state"] in ("queued", "running"):
+            time.sleep(0.02)
+        job = jobs.snapshot(identity)
+        self.assertEqual(job["state"], "failed", job["logs"])
+        self.assertFalse(queued_output.exists())
 
     def test_config_redaction_session_and_origin_checks(self):
         self.assertEqual(self.http("/workbench", authenticated=False)[0], 404)

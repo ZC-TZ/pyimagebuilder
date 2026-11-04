@@ -64,6 +64,12 @@ def _verify_oci(path, tag, platform):
 
 def execute(plan):
     action = plan["action"]
+    if action == "multiarch":
+        from multiarch import combine
+        archives = plan["archives"]
+        output = combine(archives["amd64"], archives["arm64"], plan["output"], plan["tag"], plan["epoch"],
+                         expected_manifests=plan["manifests"])
+        return {"tag": plan["tag"], "output": str(output), "platforms": ["linux/amd64", "linux/arm64"]}
     if action == "profile-test":
         from web_maintenance import test_profile
         return test_profile(Path(plan["config"]), plan["form"], plan["platform"])

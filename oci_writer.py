@@ -136,14 +136,14 @@ class OCIImageWriter:
                     written_bytes += path.stat().st_size
                     seen.add(descriptor["digest"])
 
-    def verify(self, path, expected_tag):
+    def verify(self, path, expected_tag, *, fileobj=None):
         """检查 OCI 引用与 blob，返回四份元数据的原始字节快照。
 
         导入者重开归档时必须与快照比对，防止替换后的合法 descriptor 改写校验对象。
         快照只保留有大小上限的 JSON，不复制 layer，也不重新编码镜像身份。
         """
         try:
-            with tarfile.open(path, "r:") as archive:
+            with tarfile.open(path, "r:", fileobj=fileobj) as archive:
                 members = archive_members(archive)
                 for name, member in members.items():
                     if not member.isfile():

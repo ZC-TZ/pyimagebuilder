@@ -680,10 +680,16 @@ class Workbench:
         args, outputs = command_for(action, effective, self.config_arg, self.profiles, paths.get("package"))
         if any(path.parent in output.parents for path in paths.values() for output in outputs):
             raise BuildError("输出路径不能位于文件暂存目录内")
-        if action == "multiarch":
+        delivery = action == "multiarch"
+        if delivery:
+            archives, expected = {}, {}
             for architecture in ("amd64", "arm64"):
-                check_oci_platform(Path(path_value(effective, architecture, required=True)).expanduser().absolute(),
-                                   architecture)
+                archive = Path(path_value(effective, architecture, required=True)).expanduser().absolute()
+                archives[architecture] = str(archive)
+                expected[architecture] = check_oci_platform(archive, architecture)
+            args = [json.dumps({"action": action, "archives": archives, "manifests": expected,
+                                "tag": effective["tag"].strip(), "output": str(outputs[0]),
+                                "epoch": effective.get("epoch", "").strip() or "0"}, ensure_ascii=True)]
         label = next((data[key] for key in ("project", "tag", "reference", "archive", "context") if data.get(key)), "")
         draft = form_snapshot(action, data)
         if action == "build":
@@ -694,7 +700,7 @@ class Workbench:
             value = path_value(draft, key)
             if value:
                 draft[key] = str(Path(value).expanduser().absolute())
-        return self.jobs.submit(action, args, outputs, label[:300], draft, cleanup=cleanup)
+        return self.jobs.submit(action, args, outputs, label[:300], draft, delivery=delivery, cleanup=cleanup)
 
     def close(self):
         try:

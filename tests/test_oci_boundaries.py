@@ -11,6 +11,7 @@ import threading
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -96,6 +97,66 @@ class OCIBoundaryTests(unittest.TestCase):
         output = root / "multi.tar"
         combine(amd64, arm64, output, TAG)
         return output
+
+    def test_push_rejects_layer_modified_after_source_verification(self):
+        import registry
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = make_oci(root)
+            layer_digest = digest((root / "amd64-layer.tar").read_bytes()).split(":")[1]
+            with tarfile.open(source) as archive:
+                offset = archive.getmember("blobs/sha256/" + layer_digest).offset_data + 512
+            original = registry._oci_archive
+
+            def replace_layer(*args):
+                path = original(*args)
+                with path.open("r+b") as stream:
+                    stream.seek(offset)
+                    value = stream.read(1)
+                    stream.seek(offset)
+                    stream.write(bytes([value[0] ^ 1]))
+                return path
+
+            with patch.object(registry, "_oci_archive", side_effect=replace_layer), \
+                    patch.object(registry, "RegistryClient") as client, \
+                    patch.object(registry, "_check_push_tag"), patch.object(registry, "_put_manifest") as publish:
+                with self.assertRaisesRegex(ArchiveError, "OCI blob digest or size mismatch"):
+                    registry.push(source, "registry.example/p/app:1")
+                client.return_value.upload_file.assert_not_called()
+                publish.assert_not_called()
+
+    def test_multi_platform_verify_rejects_invalid_layer_with_matching_digests(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.paired_image(root)
+            with tarfile.open(source) as archive:
+                members = {member.name: archive.extractfile(member).read() for member in archive}
+
+            def blob_name(descriptor):
+                return "blobs/sha256/" + descriptor["digest"].split(":", 1)[1]
+
+            def replace_blob(descriptor, raw):
+                members.pop(blob_name(descriptor))
+                descriptor.update(digest=digest(raw), size=len(raw))
+                members[blob_name(descriptor)] = raw
+
+            index = json.loads(members["index.json"])
+            image = index["manifests"][0]
+            manifest = json.loads(members[blob_name(image)])
+            layer = manifest["layers"][0]
+            replace_blob(layer, b"!" * layer["size"])
+            config = json.loads(members[blob_name(manifest["config"])])
+            config["rootfs"]["diff_ids"][0] = layer["digest"]
+            replace_blob(manifest["config"], json.dumps(config).encode())
+            replace_blob(image, json.dumps(manifest).encode())
+            members["index.json"] = json.dumps(index).encode()
+            with tarfile.open(source, "w") as archive:
+                for name, raw in members.items():
+                    member = tarfile.TarInfo(name)
+                    member.size = len(raw)
+                    archive.addfile(member, io.BytesIO(raw))
+            with self.assertRaisesRegex(ArchiveError, "Invalid layer tar"):
+                verify_multiarch(source, TAG)
 
     def test_import_keeps_original_manifest_bytes_and_digest(self):
         with tempfile.TemporaryDirectory() as temporary:
