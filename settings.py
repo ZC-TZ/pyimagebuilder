@@ -76,10 +76,12 @@ def load_settings(candidate=None, required=False):
     if (not isinstance(data, dict) or type(data.get("schemaVersion")) is not int or
             data.get("schemaVersion") != 2):
         raise BuildError("config.json requires schemaVersion 2")
-    _known_fields(data, ("schemaVersion", "cache", "repositories", "fast"), "config")
+    _known_fields(data, ("schemaVersion", "cache", "repositories", "fast", "buildRecordsDir"), "config")
     if any(not isinstance(data.get(key, {}), dict) for key in ("cache", "repositories", "fast")):
         raise BuildError("cache, repositories, and fast must be objects")
     root = path.parent
+    if "buildRecordsDir" in data:
+        data["buildRecordsDir"] = _path(data["buildRecordsDir"], root, "buildRecordsDir")
     data.setdefault("cache", {})
     data.setdefault("repositories", {})
     data.setdefault("fast", {})

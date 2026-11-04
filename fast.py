@@ -132,6 +132,7 @@ def load_profile(config_path, profile_name=None):
             raise BuildError("serverConfig is supported only for tongweb profiles")
     if profile.get("outputDir") is not None:
         profile["outputDir"] = _resolved_config_path(profile["outputDir"], config_path)
+    profile["profileName"] = selected
     return profile
 
 
@@ -346,6 +347,10 @@ def quick_build(artifact, project, version, config_path=None, *,
         published.append(result)
         if info.get("oci_output") is not None:
             published.append(Path(info["oci_output"]))
+        info["profile"] = profile["profileName"]
+        # 台账与本次构建使用同一份配置，避免打包后重读时切换保存目录。
+        if "buildRecordsDir" in settings:
+            info["buildRecordsDir"] = settings["buildRecordsDir"]
     return result, tag
 
 
@@ -457,6 +462,7 @@ def main(argv=None):
         parser.add_argument("--source-date-epoch", default="0")
         parser.add_argument("--cache-dir", type=Path)
         parser.add_argument("--verify-cache", action="store_true")
+        parser.add_argument("--no-build-records", action="store_true", help="Do not write a local build record")
         parser.add_argument("--progress", choices=("auto", "plain", "json"), default="auto")
         parser.add_argument("--quiet", action="store_true")
         parser.add_argument("--verbose", action="store_true")
@@ -468,21 +474,33 @@ def main(argv=None):
         requested_tag = args.tag or "{}_{}:{}".format(
             args.project, "front" if args.artifact.name.lower() == "dist.zip" else "back", args.version)
         reporter.start(requested_tag, args.platform, mode="fast")
-        stats, info = {}, {}
-        result, tag = quick_build(args.artifact, args.project, args.version, args.config,
-                                  tag=args.tag, output=args.output,
-                                  image_format=args.format, platform=args.platform,
-                                  source_date_epoch=args.source_date_epoch,
-                                  cache_dir=args.cache_dir, profile_name=args.profile,
-                                  reporter=reporter, cache_stats=stats, build_info=info,
-                                  verify_cache=args.verify_cache)
+        from build_records import record_build, records_directory
         from main import _archive_digest
-        digest, size = _archive_digest(result, reporter)
-        reporter.success(image=tag, platform=args.platform, output=str(result),
-                         digest=digest, size=size, layers=info.get("layers"),
-                         cache="{} hit(s), {} miss(es), {} stored".format(
-                             stats["hits"], stats["misses"], stats["stored"]),
-                         oci_output=info.get("oci_output"))
+        stats, info = {}, {}
+        with publication_transaction() as published:
+            result, tag = quick_build(args.artifact, args.project, args.version, args.config,
+                                      tag=args.tag, output=args.output,
+                                      image_format=args.format, platform=args.platform,
+                                      source_date_epoch=args.source_date_epoch,
+                                      cache_dir=args.cache_dir, profile_name=args.profile,
+                                      reporter=reporter, cache_stats=stats, build_info=info,
+                                      verify_cache=args.verify_cache)
+            published.append(result)
+            secondary = info.get("oci_output")
+            if secondary is not None:
+                published.append(Path(secondary))
+            digest, size = _archive_digest(result, reporter)
+            if not args.no_build_records:
+                published.append(record_build(
+                    records_directory(info), tag, args.platform, args.format, result, mode="fast",
+                    oci_output=secondary, digest=digest, size=size, project=args.project,
+                    version=args.version, profile=info.get("profile"),
+                    package_type="dist" if args.artifact.name.lower() == "dist.zip" else "war"))
+            reporter.success(image=tag, platform=args.platform, output=str(result),
+                             digest=digest, size=size, layers=info.get("layers"),
+                             cache="{} hit(s), {} miss(es), {} stored".format(
+                                 stats["hits"], stats["misses"], stats["stored"]),
+                             oci_output=secondary)
         return 0
     except (BuildError, OSError, zipfile.BadZipFile, RuntimeError, ValueError) as exc:
         if reporter is not None:

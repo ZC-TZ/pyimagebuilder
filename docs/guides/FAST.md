@@ -72,6 +72,19 @@ python .\main.py fast D:\packages\report.war sfcx 1.3.4 `
 
 独立脚本保留相同能力：把 `python .\main.py fast` 替换成 `python .\fast.py`，其后的参数保持不变，包括 `init`。
 
+### 查询打包过的版本
+
+Fast 和普通构建成功后会写入本机台账。以下以 UOS 上的 `hisq` 为例：
+
+```bash
+python3 ./main.py builds --config ./config.json --project hisq
+python3 ./main.py builds --config ./config.json --tag hisq_front:1.0.0 --limit 5
+```
+
+列表从新到旧显示 UTC 完成时间、镜像标签、平台、构建方式和原输出路径。需要脚本处理时加 `--json`，可读取 Fast 项目名、版本、包类型、profile、归档大小和已计算的摘要。Docker 和 OCI 同时输出时只记一次打包，列出两个产物。
+
+删除或移动 tar 不会删除台账条目。台账从启用此功能后开始积累，旧 tar 不会被自动登记；失败、`--check` 和 `--no-build-records` 不留记录。见[台账保存位置](CONFIGURATION.md#5-缓存与运行数据)。
+
 ## 3. 模板怎样影响 Dockerfile
 
 | 设置 | TongWeb 默认值 | Tomcat 默认值 |

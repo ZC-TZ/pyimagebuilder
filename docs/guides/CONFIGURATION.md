@@ -136,7 +136,12 @@ Artifactory 地址也不能写成 `https://用户名:密码@主机/...`：这类
 | 基础镜像库 | `cache.imageStore` | `--image-store`（支持此参数的命令） | refs、CAS blob、按需 Docker tar |
 | 指令层缓存 | `cache.layerCache` | `--cache-dir` | 复用 COPY/ADD/RUN 等构建结果 |
 | Fast 输出 | profile 的 `outputDir` | `-o` | 最终交付镜像 |
+| 打包台账 | `buildRecordsDir`（顶层，可选） | 环境变量 `PYIMAGEBUILDER_BUILD_RECORDS_DIR` | 每次成功打包的一条记录 |
 
 有配置时，未设置 imageStore 默认使用配置目录下的 `data/image-store/`。没有配置时，独立命令使用系统临时目录中的默认镜像库。层缓存未配置时使用临时目录下的默认层缓存。建议长期使用时显式指定这两个缓存路径。
 
 程序升级时保留运行数据，程序分发包不包含下载镜像和构建缓存。旧 profile 的 `baseCacheDir` 应迁移到 `cache.imageStore`；内部缓存格式、迁移和清理边界见 [CAS 镜像库](../CAS_STORE.md)。
+
+台账默认保存在当前用户的 `~/.pyimagebuilder/build-records/`。可在配置顶层设置 `"buildRecordsDir": "./data/build-records"`，相对路径以配置文件所在目录为准；环境变量优先。建议放在 Dockerfile 构建上下文之外。每次成功打包保存一份小型 JSON，记录时间、标签、平台和产物信息，不保存应用包、鉴权参数或镜像层。换机器时可以单独备份、迁移此目录。
+
+构建和查询需使用同一台账路径。台账写入失败时，命令报告错误并撤销本次产物；如明确不需要登记，可在构建或 Fast 命令加 `--no-build-records`。通过 Windows 的 `--wsl` 启动时由 Windows 端登记本机路径。

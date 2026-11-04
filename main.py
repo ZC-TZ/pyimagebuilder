@@ -14,6 +14,7 @@ from pathlib import Path
 from contextlib import ExitStack
 
 from builder import build
+from build_records import record_build, records_directory
 from file_publish import publication_transaction
 from path_policy import output_path
 from errors import BuildError
@@ -90,7 +91,7 @@ def _run_wsl(args, trusted_base_cache=False):
                 "--source-date-epoch", str(getattr(args, "source_date_epoch", 0)),
                 "--progress", getattr(args, "progress", "auto"),
                 "--workspace", args.workspace or "/tmp",
-                "--run", "--run-network", args.run_network,
+                "--run", "--run-network", args.run_network, "--no-build-records",
                 "--run-sandbox", getattr(args, "run_sandbox", "hardened")]
     if getattr(args, "oci_output", None) is not None:
         command += ["--oci-output", _wsl_path(args.oci_output, args.wsl_mount_root)]
@@ -170,6 +171,9 @@ def main(argv=None):
     if argv and argv[0] == "fast":
         from fast import main as fast_main
         return fast_main(argv[1:])
+    if argv and argv[0] == "builds":
+        from build_records import main as builds_main
+        return builds_main(argv[1:])
     if argv and argv[0] == "cas":
         from cas_store import main as cas_main
         return cas_main(argv[1:])
@@ -189,7 +193,7 @@ def main(argv=None):
         argv.pop(0)
     parser = argparse.ArgumentParser(
         description=__doc__,
-        epilog="Commands: build (default), pull, fast, cas, load, save, export, import, flatten, rmi, images, "
+        epilog="Commands: build (default), builds, pull, fast, cas, load, save, export, import, flatten, rmi, images, "
                "image prune, system df, inspect, verify, history, cache, tag, "
                "manifest inspect/create/push, push, analyze, optimize. "
                "Use 'main.py COMMAND --help' for command options.")
@@ -233,6 +237,7 @@ def main(argv=None):
     parser.add_argument("--workspace", help="Native Linux temporary filesystem for RUN; defaults to /tmp")
     parser.add_argument("--cache-dir", type=Path, help="Persistent local layer cache directory")
     parser.add_argument("--no-cache", action="store_true", help="Disable cache reads and writes")
+    parser.add_argument("--no-build-records", action="store_true", help="Do not write a local build record")
     parser.add_argument("--verify-cache", action="store_true",
                         help="Fully hash cached layers and recheck base archive layers")
     parser.add_argument("--trusted-base-cache", action="store_true", help=argparse.SUPPRESS)
@@ -284,6 +289,7 @@ def main(argv=None):
         with publication_transaction() as published:
             with ExitStack() as cleanup:
                 settings, _ = load_settings(args.config)
+                ledger = None if args.no_build_records else records_directory(settings)
                 if not args.hermetic:
                     args.image_store = args.image_store or cache_directory(settings, "imageStore", None)
                     args.cache_dir = args.cache_dir or cache_directory(settings, "layerCache", None)
@@ -333,6 +339,10 @@ def main(argv=None):
                     published.extend(_build_products(args))
                     published.append(report)
                     digest, size = _archive_digest(result, reporter)
+                    if ledger is not None:
+                        secondary = _build_products(args)[1] if args.format == "both" else None
+                        published.append(record_build(ledger, args.tag, args.platform, args.format, result,
+                                                      oci_output=secondary, digest=digest, size=size))
                     reporter.success(image=args.tag, platform=args.platform, output=str(result),
                                      digest=digest, size=size, hermetic_report=str(report))
                     return 0
@@ -355,7 +365,14 @@ def main(argv=None):
                 if args.wsl:
                     status = _run_wsl(args, managed_base)
                     if status == 0:
-                        published.extend(_build_products(args))
+                        products = _build_products(args)
+                        published.extend(products)
+                        # 由 Windows 入口登记本机路径，避免 WSL 子进程另写一份台账。
+                        cleanup.close()
+                        if ledger is not None:
+                            published.append(record_build(
+                                ledger, args.tag, args.platform, args.format, products[0],
+                                oci_output=products[1] if args.format == "both" else None))
                     return status
                 chosen_cache = None if args.no_cache else (args.cache_dir or
                     Path(tempfile.gettempdir()) / "pyimagebuilder-layer-cache")
@@ -372,6 +389,10 @@ def main(argv=None):
                                verify_cache=args.verify_cache)
                 published.extend(_build_products(args))
             digest, size = _archive_digest(result, reporter)
+            if ledger is not None:
+                published.append(record_build(ledger, args.tag, build_info.get("platform", args.platform),
+                                              args.format, result, oci_output=build_info.get("oci_output"),
+                                              digest=digest, size=size))
             reporter.success(image=args.tag, platform=build_info.get("platform", args.platform), output=str(result),
                              digest=digest, size=size, layers=build_info.get("layers"),
                              cache=("disabled" if args.no_cache else

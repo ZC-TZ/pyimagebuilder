@@ -12,6 +12,7 @@
 | `python main.py fast init --help` | 查看首次创建模板的参数 |
 | `python main.py build CONTEXT -t IMAGE -o archive.tar` | 使用 Dockerfile 构建 |
 | `python main.py build CONTEXT --check` | 静态检查，不下载或执行 RUN |
+| `python main.py builds --project hisq` | 按时间倒序查看本机记录的 Fast 打包；去掉项目筛选则列出全部构建 |
 
 首次步骤：[Fast 指南](FAST.md) · [Dockerfile 构建](BUILD.md)。`main.py` 也接受省略 build 的旧式构建参数；新命令示例统一使用显式 build。
 
@@ -21,7 +22,7 @@
 | --- | --- |
 | `python main.py verify archive.tar` | 核对归档结构、摘要与层 |
 | `python main.py inspect archive.tar` | 查看归档里的镜像配置 |
-| `python main.py history archive.tar` | 查看镜像保存的构建历史 |
+| `python main.py history archive.tar` | 查看单个归档内镜像的层和指令历史 |
 | `python main.py images` | 列出本工具镜像库的镜像 |
 | `python main.py load -i archive.tar` | 导入已有 Docker 镜像归档到本工具镜像库 |
 | `python main.py save IMAGE -o archive.tar` | 从本工具镜像库导出 Docker 归档 |
