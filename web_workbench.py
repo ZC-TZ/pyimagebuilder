@@ -16,6 +16,7 @@ from web_job_journal import form_snapshot
 from web_delivery import DELIVERY_ACTIONS, Delivery, library_items
 from web_jobs import FORMATS, LABELS, PLATFORMS, Jobs, command_for, fast_plan, file_stamp, open_artifact
 from web_maintenance import PROFILE_FIELDS, _revision, cache_fingerprint, cache_plan, cache_root, candidate_profile, save_profile
+from web_ui import HERO, icon
 
 
 STATES = {"queued": "排队中", "running": "运行中", "success": "成功", "failed": "失败",
@@ -36,6 +37,7 @@ FAST_SCRIPT = r"""
     clearTimeout(timer);
     if (request) request.abort();
     output.placeholder = original;
+    preview.dataset.tone = '';
     if (!['package', 'project', 'version'].every(key => form.elements[key].value.trim())) {
       preview.textContent = '填好应用包、项目和版本后显示预览。';
       return;
@@ -49,8 +51,13 @@ FAST_SCRIPT = r"""
         });
         const plan = await response.json();
         if (generation !== current) return;
-        if (!response.ok) { preview.textContent = plan.error || '无法预览'; return; }
+        if (!response.ok) {
+          preview.dataset.tone = 'alert';
+          preview.textContent = plan.error || '无法预览';
+          return;
+        }
         output.placeholder = plan.outputs[0];
+        preview.dataset.tone = plan.conflicts.length ? 'alert' : '';
         preview.textContent = ['标签：' + plan.tag, '基础镜像：' + plan.base, '部署：' + plan.deploy,
           '输出：' + plan.outputs.join('、'), plan.conflicts.length ? '已存在：' + plan.conflicts.join('、') : '']
           .filter(Boolean).join('\n');
@@ -71,14 +78,16 @@ def _e(value):
 
 
 def _input(name, label, placeholder="", required=False, value=""):
-    return '<label>{}<input name="{}" placeholder="{}" value="{}" {}></label>'.format(
-        label, name, _e(placeholder), _e(value), "required" if required else "")
+    wide = name in ("package", "context", "archive", "baseUrl")
+    return '<label data-field="{}"{}>{}<input name="{}" placeholder="{}" value="{}" {}></label>'.format(
+        name, ' class="field-wide"' if wide else "", label, name, _e(placeholder), _e(value),
+        "required" if required else "")
 
 
 def _select(name, label, options, selected="", labels=None):
     choices = "".join('<option value="{}"{}>{}</option>'.format(
         _e(value), " selected" if value == selected else "", _e((labels or {}).get(value, value or "自动"))) for value in options)
-    return '<label>{}<select name="{}">{}</select></label>'.format(label, name, choices)
+    return '<label data-field="{}">{}<select name="{}">{}</select></label>'.format(name, label, name, choices)
 
 
 def _check(name, label, checked=False):
@@ -86,13 +95,26 @@ def _check(name, label, checked=False):
         name, " checked" if checked else "", label)
 
 
-def _section(title, body):
-    return '<article><h2>{}</h2>{}</article>'.format(title, body)
+def _section(title, body, anchor="", primary=False, description=""):
+    attrs = (' id="{}"'.format(_e(anchor)) if anchor else "") + (' class="primary-panel"' if primary else "")
+    description = '<p class="section-copy">{}</p>'.format(_e(description)) if description else ""
+    return '<article{}><h2>{}</h2>{}{}</article>'.format(attrs, title, description, body)
 
 
 def _pairs(values):
     return "<dl>" + "".join("<dt>{}</dt><dd><code>{}</code></dd>".format(label, _e(value))
                             for label, value in values) + "</dl>"
+
+
+def _job_state(state):
+    return '<span class="state" data-state="{}">{}</span>'.format(state, STATES[state])
+
+
+def _size_label(size):
+    for unit, scale in (("GiB", 1024 ** 3), ("MiB", 1024 ** 2), ("KiB", 1024)):
+        if size >= scale:
+            return "{:.1f} {}".format(size / scale, unit)
+    return "{:,} B".format(size)
 
 
 class Workbench:
@@ -104,15 +126,22 @@ class Workbench:
         self.delivery = Delivery(settings, self.config_arg, directory)
         self.jobs = Jobs(directory)
 
-    def nav(self):
-        return '<nav class="tabs" aria-label="工作台">{}</nav>'.format("".join(
-            '<a href="{}{}">{}</a>'.format(self.prefix, path, label) for path, label in
-            (("/workbench", "构建"), ("/jobs", "任务"), ("/images", "镜像库"),
-             ("/history", "打包台账"), ("/space", "空间"), ("/config", "配置"))))
+    def nav(self, active=""):
+        links = "".join('<a href="{}{}"{}>{}<span>{}</span></a>'.format(
+            self.prefix, path, ' aria-current="page"' if key == active else "", icon(key), label)
+            for key, path, label in (("build", "/workbench", "构建"), ("jobs", "/jobs", "任务"),
+            ("images", "/images", "镜像库"), ("history", "/history", "打包台账"),
+            ("space", "/space", "空间"), ("config", "/config", "配置")))
+        return ('<aside class="sidebar"><a class="brand" href="{}/workbench"><span class="brand-icon">{}</span>'
+                '<span class="brand-text">PyImageBuilder<span class="brand-sub">镜像构建工作台</span></span></a>'
+                '<nav class="tabs" aria-label="主导航">{}</nav>'
+                '<div class="sidebar-foot"><span class="dot"></span>仅在本机运行</div></aside>').format(
+                    self.prefix, icon("logo"), links)
 
     def form(self, action, body, label=None):
-        return '<form class="job-form" method="post" action="{}/submit/{}">{}<button type="submit">{}</button></form>'.format(
-            self.prefix, action, body, label or LABELS[action])
+        return ('<form class="job-form" data-action="{0}" method="post" action="{1}/submit/{0}">{2}'
+                '<div class="form-footer"><button type="submit"{3}>{4}</button></div></form>').format(
+            action, self.prefix, body, ' class="danger"' if action == "remove" else "", label or LABELS[action])
 
     def builds(self, action=None, draft=None):
         draft = draft or {}
@@ -121,7 +150,8 @@ class Workbench:
             return _input(name, label, placeholder, required, draft.get(name, ""))
 
         platform = _select("platform", "平台", PLATFORMS, draft.get("platform", PLATFORMS[0]))
-        formats = _select("format", "归档格式", FORMATS, draft.get("format", FORMATS[0]))
+        formats = _select("format", "归档格式", FORMATS, draft.get("format", FORMATS[0]),
+                          {"docker": "Docker tar", "oci": "OCI tar", "both": "Docker + OCI"})
         destination = field("output", "输出 tar 路径", "/data/images/hisq_front-1.0.0.tar", True)
         context = field("context", "构建上下文目录", "/data/project", True)
         dockerfile = field("dockerfile", "Dockerfile（可选）", "默认使用上下文中的 Dockerfile")
@@ -130,11 +160,13 @@ class Workbench:
             fast = self.form("fast", field("package", "WAR／dist.zip 路径", "/data/packages/dist.zip", True)
                              + field("project", "项目", "hisq", True) + field("version", "版本", "1.0.0", True)
                              + _select("profile", "模板", sorted(self.profiles), default)
-                             + field("output", "输出 tar 路径（可选）", "留空按模板自动生成")
-                             + platform + formats)
-            fast += '<p id="fast-preview" class="muted preview" aria-live="polite">留空使用默认输出路径。</p>'
+                             + platform + formats
+                             + field("output", "输出 tar 路径（可选）", "留空按模板自动生成") +
+                             '<p id="fast-preview" class="preview" aria-live="polite">输出路径留空时，按模板自动生成。</p>',
+                             "开始快速打包")
         else:
-            fast = '<p>当前配置没有 Fast 模板。<a href="{}/config">查看配置</a>。</p>'.format(self.prefix)
+            fast = ('<p class="muted">新增 Tomcat 或 TongWeb 模板后，即可打包 WAR 或 dist.zip。</p>'
+                    '<a class="button primary" href="{}/profile">新增 Fast 模板</a>').format(self.prefix)
         ordinary = context + dockerfile + field("base-tar", "基础镜像 tar（可选）") + \
             field("tag", "镜像标签", "hisq_back:1.0.0", True) + destination + platform + formats + \
             field("target", "目标阶段（可选）") + _check("offline", "仅使用本地基础镜像", draft.get("offline")) + \
@@ -156,9 +188,18 @@ class Workbench:
                               _input("arm64", "arm64 OCI tar", "", True) +
                               _input("tag", "多平台镜像标签", "", True) + destination +
                               _input("epoch", "可复现时间戳（可选）"))
-        return "".join((_section("快速打包", fast), _section("普通 Dockerfile 构建", self.form("build", ordinary)),
-                        _section("静态检查 Dockerfile", self.form("check", context + dockerfile + platform)),
-                        _section("多架构 OCI 合并", multiarch)))
+        hero = ('<div class="hero"><div><h2>准备交付镜像</h2>'
+                '<p>已有 WAR 或 dist.zip 用快速打包。有 Dockerfile 则直接构建。</p>'
+                '<nav class="shortcuts" aria-label="构建方式"><a class="button primary compact" href="#fast">快速打包 {}</a>'
+                '<a class="button compact" href="#dockerfile">Dockerfile 构建</a>'
+                '<a class="button compact" href="#multiarch">合并 OCI</a></nav></div>{}</div>').format(icon("arrow"), HERO)
+        checks = self.form("check", context + dockerfile + platform)
+        return "".join((hero, _section("快速打包", fast, "fast", True, "选择应用包和模板，预览输出后提交。"),
+                        _section("Dockerfile 构建", self.form("build", ordinary), "dockerfile",
+                                 description="从本机项目目录构建镜像；高级选项可按需展开。"),
+                        _section("静态检查 Dockerfile", checks, description="检查 Dockerfile 和构建输入。"),
+                        _section("多架构 OCI 合并", multiarch, "multiarch",
+                                 description="使用已有的 amd64 和 arm64 OCI 归档，生成一个多平台产物。")))
 
     def images(self, search="", platform_filter="", source_filter=""):
         result = library_items(self.settings)
@@ -174,9 +215,9 @@ class Workbench:
                 ("平台", item.get("platform", "—")), ("来源", item.get("source", item.get("storage", "归档"))),
                 ("归档", item.get("archive") or "—"))) +
                 ('<p>{}</p>'.format(_e(item["error"])) if item.get("error") else "") +
-                "".join('<p>{} <code>{}</code></p>'.format(
+                '<div class="actions">' + "".join('<span>{} <code>{}</code></span>'.format(
                     self.delivery_link("library", selected["id"]), _e(selected["tag"]))
-                    for selected in item["delivery_items"])))
+                    for selected in item["delivery_items"]) + "</div>"))
         platform = _select("platform", "平台", PLATFORMS, PLATFORMS[0])
         reference = _input("reference", "镜像引用", "harbor.example/project/image:1", True)
         archive = _input("archive", "现有 tar 路径", "/data/images/app.tar", True)
@@ -187,9 +228,7 @@ class Workbench:
             _select("platform", "筛选平台", ("",) + PLATFORMS, platform_filter, {"": "全部"}),
             _select("source", "筛选来源", ("", "local", "registry", "artifactory", "archive"), source_filter,
                     {"": "全部", "archive": "未标注来源的归档"}))
-        return "".join((
-            _section("镜像库位置", '<p><code>{}</code></p><p>显示 {} / {} 条</p>'.format(
-                _e(result["image_store"]), len(items), len(result["images"])) + filters),
+        tools = "".join((
             _section("拉取基础镜像", self.form("pull", reference + platform + _select("source", "来源", source))),
             _section("导入 Docker tar", self.form("load", archive + tag + platform)),
             _section("从镜像库导出 tar", self.form("save", reference + platform +
@@ -198,14 +237,17 @@ class Workbench:
             _section("磁盘占用", self.form("df", "")),
             _section("删除本地镜像引用", self.form("remove", reference + platform +
                      _select("source", "来源", source + ("local",)) +
-                     _input("confirm", "再次输入完整镜像引用", "", True))),
-            "".join(items)))
+                     _input("confirm", "再次输入完整镜像引用", "", True)))))
+        overview = _section("镜像列表", '<p class="muted">显示 {} / {} 条 · <code>{}</code></p>'.format(
+            len(items), len(result["images"]), _e(result["image_store"])) + filters)
+        tools = '<details class="toolbox"><summary>镜像库工具：拉取、导入、导出、检查</summary><div class="toolbox-body">{}</div></details>'.format(tools)
+        return overview + tools + ("".join(items) or '<p class="empty">没有符合条件的镜像。</p>')
 
     def delivery_link(self, scope, identity, index=None):
         params = {"scope": scope, "id": identity}
         if index is not None:
             params["file"] = index
-        return '<a href="{}/delivery?{}">产物操作</a>'.format(self.prefix, _e(urlencode(params)))
+        return '<a class="button compact" href="{}/delivery?{}">产物操作</a>'.format(self.prefix, _e(urlencode(params)))
 
     def delivery_page(self, data):
         item = self.delivery.select(data)
@@ -227,7 +269,7 @@ class Workbench:
             buttons.append(_section(DELIVERY_ACTIONS[action],
                 '<form class="job-form" action="{}/delivery/prepare" method="post">{}<button>{}</button></form>'.format(
                     self.prefix, content, "预览推送" if action == "push" else DELIVERY_ACTIONS[action])))
-        return _section("所选产物", _pairs(fields)) + "".join(buttons)
+        return _section("所选产物", _pairs(fields)) + '<div class="operation-grid">{}</div>'.format("".join(buttons))
 
     def push_confirmation(self, plan):
         token = self.delivery.offer(plan)
@@ -265,13 +307,17 @@ class Workbench:
                     token = self.delivery.offer({"action": "cache-clean", "cache": str(root),
                                 "config": str(self.config_arg) if self.config_arg is not None else None,
                                 "label": str(root), "days": days, "fingerprint": cache_fingerprint(plan)})
-                    confirmation = '<form method="post" action="{}/cache/confirm"><input type="hidden" name="token" value="{}"><button>确认清理以上构建缓存</button></form>'.format(self.prefix, token)
+                    confirmation = '<form method="post" action="{}/cache/confirm"><input type="hidden" name="token" value="{}"><button class="danger">确认清理以上构建缓存</button></form>'.format(self.prefix, token)
         forms = '<form method="get" action="{}/space"><label>文件年龄（天）<input name="days" type="number" min="0" max="36500" value="{}" required></label>{}<button>预览</button></form>'.format(
             self.prefix, days, _select("kind", "检查范围", tuple(SPACE_KINDS), kind or "images", SPACE_KINDS))
+        tiles = []
         for key, title in (("image_store", "镜像库"), ("layer_cache", "构建缓存"), ("deliveries", "已登记的交付 tar")):
             item = usage[key]
-            forms += _section(title, _pairs((("文件数", item["files"]), ("文件字节", "{:,} B".format(item["bytes"])),
-                                             ("位置", item.get("path", "台账中存在的库外归档")))))
+            tiles.append(_section(title, '<div class="tile-value">{}</div><p class="muted">{} 个文件 · {:,} B</p>'
+                                  '<code class="tile-path">{}</code>'.format(
+                                      _size_label(item["bytes"]), item["files"], item["bytes"],
+                                      _e(item.get("path", "台账中存在的库外归档")))))
+        forms = '<div class="tiles">{}</div>{}'.format("".join(tiles), _section("清理预览", forms))
         if kind is not None:
             details = '<p>候选文件估算：<strong>{:,} B（{:.1f} MiB）</strong></p><p>{}</p>'.format(
                 estimate, estimate / (1024 * 1024), _e(summary))
@@ -294,12 +340,12 @@ class Workbench:
             ("打包台账", self.directory), ("镜像库", cache.get("imageStore", "系统默认")),
             ("层缓存", cache.get("layerCache", "系统临时目录")),
             ("默认 Fast 模板", self.settings.get("fast", {}).get("defaultProfile", "—")))))]
-        sections.append(_section("Fast 模板管理", '<p><a href="{}/profile">新增模板</a></p>'.format(self.prefix)))
+        sections.append(_section("Fast 模板管理", '<a class="button primary" href="{}/profile">新增模板</a>'.format(self.prefix)))
         for name, data in sorted(self.profiles.items()):
             sections.append(_section("Fast · " + _e(name), _pairs((
                 ("类型", data.get("flavor", "—")), ("基础镜像", data.get("baseImage", "—")),
                 ("容器部署目录", data.get("deployDir", "默认")), ("输出目录", data.get("outputDir", "应用包所在目录")))) +
-                '<p><a href="{}/profile?{}">编辑或测试模板</a></p>'.format(self.prefix, _e(urlencode({"name": name})))))
+                '<a class="button compact" href="{}/profile?{}">编辑或测试模板</a>'.format(self.prefix, _e(urlencode({"name": name})))))
         sources = self.settings.get("repositories", {})
         if sources:
             sections.append(_section("已配置仓库", _pairs(
@@ -328,7 +374,7 @@ class Workbench:
         form += _check("default", "设为默认 Fast 模板")
         form += _select("platform", "基础镜像测试平台", PLATFORMS, PLATFORMS[0])
         return _section("Fast 模板", '<p>本地 tar 和 Artifactory 地址二选一。测试不保存配置。</p>' +
-            '<form method="post" action="{}/profile/preview">{}<button>预览配置差异</button><button formaction="{}/profile/test">测试基础镜像</button></form>'.format(
+            '<form method="post" action="{}/profile/preview">{}<div class="form-footer"><button>预览配置差异</button><button class="secondary" formaction="{}/profile/test">测试基础镜像</button></div></form>'.format(
                 self.prefix, form, self.prefix))
 
     def profile_preview(self, data):
@@ -367,10 +413,14 @@ class Workbench:
         active = {item["id"] for item in jobs}
         jobs += [self._archived(item) for item in self.jobs.journal.recent() if item["id"] not in active]
         if not jobs:
-            return '<p class="empty">还没有网页任务。</p>'
-        return "".join(_section(LABELS[job["action"]], '<p>{}　<code>{}</code> · <a href="{}/job?{}">查看任务</a></p>'.format(
-            STATES[job["state"]], _e(job["label"] or job.get("updated", "")), self.prefix,
-            urlencode({"id": job["id"]}))) for job in jobs if job["action"] in LABELS)
+            return ('<div class="empty"><p>还没有网页任务。</p>'
+                    '<a class="button primary" href="{}/workbench">去构建</a></div>').format(self.prefix)
+        rows = "".join(('<li class="job-row"><div>{} <strong>{}</strong><code>{}</code></div>'
+                        '<a class="button compact" href="{}/job?{}">查看任务</a></li>').format(
+                            _job_state(job["state"]), LABELS[job["action"]],
+                            _e(job["label"] or job.get("updated", "")), self.prefix,
+                            urlencode({"id": job["id"]})) for job in jobs if job["action"] in LABELS)
+        return _section("任务列表", '<ul class="job-list">{}</ul>'.format(rows))
 
     def _archived(self, item):
         state = "unknown" if item["state"] in ("queued", "running") else item["state"]
@@ -386,10 +436,10 @@ class Workbench:
     def job_page(self, job):
         identity, state = job["id"], job["state"]
         running = state in ("queued", "running")
-        content = '<p><code>{}</code></p><p><strong>{}</strong>　{}</p>'.format(
-            _e(job["label"]), STATES[state], _e(job["status"]))
+        content = '<div class="job-summary">{} <code>{}</code></div><p class="muted">{}</p>'.format(
+            _job_state(state), _e(job["label"]), _e(job["status"]))
         if state == "queued" or (state == "running" and os.name == "posix" and not job.get("interrupt")):
-            content += '<form method="post" action="{}/cancel?{}"><button>取消任务</button></form>'.format(
+            content += '<form method="post" action="{}/cancel?{}"><button class="secondary">取消任务</button></form>'.format(
                 self.prefix, urlencode({"id": identity}))
         if "code" in job:
             content += "<p>退出码：{}</p>".format(_e(job["code"]))
@@ -402,18 +452,18 @@ class Workbench:
             content += _pairs((names[key], "{:,} B".format(value) if key.endswith("bytes") else value)
                               for key, value in metrics.items() if key in names)
         if job.get("form") and not running:
-            content += '<p><a href="{}/reuse?{}">复用参数</a>，提交前可修改版本或输出。</p>'.format(
+            content += '<p><a class="button compact" href="{}/reuse?{}">复用参数</a>　<small>提交前可修改版本或输出。</small></p>'.format(
                 self.prefix, urlencode({"id": identity}))
         for index, (path, _) in enumerate(job["files"]):
-            content += '<p><a href="{}/download?{}">{}</a>　<code>{}</code></p>'.format(
+            content += '<p><a class="button compact" href="{}/download?{}">{}</a>　<code>{}</code></p>'.format(
                 self.prefix, _e(urlencode({"id": identity, "file": index})),
                 "下载归档" if path.suffix.lower() == ".tar" else "下载附属文件", _e(path))
         if job.get("archived"):
             content += "<p>这里只保存任务结果；成功的归档请到打包台账查看。</p>"
         else:
-            content += '<h2>任务日志</h2><pre>{}</pre>'.format(_e("\n".join(job["logs"]) or "等待输出…"))
+            content += '<h2>任务日志</h2><pre tabindex="0" aria-label="任务日志">{}</pre>'.format(_e("\n".join(job["logs"]) or "等待输出…"))
             if job["logs"]:
-                content += '<p><a href="{}/job-log?{}">导出当前日志</a>　<small>分享前请检查命令输出。</small></p>'.format(
+                content += '<p><a class="button compact" href="{}/job-log?{}">导出当前日志</a>　<small>分享前请检查命令输出。</small></p>'.format(
                     self.prefix, urlencode({"id": identity}))
         return _section(LABELS[job["action"]], content), running
 

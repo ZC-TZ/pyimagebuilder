@@ -10,48 +10,10 @@ from urllib.parse import parse_qs, urlencode
 
 from build_records import get_build, list_builds
 from errors import BuildError
+from web_ui import document
 
 
 PAGE_SIZE = 25
-STYLE = """
-:root{color-scheme:light;--ink:#182c35;--muted:#536873;--line:#d7e4e8;--accent:#0b695c}
-*{box-sizing:border-box}
-body{margin:0;background:#f2f7f8;color:var(--ink);font:16px/1.55 system-ui,sans-serif}
-main{max-width:1120px;margin:auto;padding:40px 24px 56px}
-header{border-bottom:1px solid var(--line);padding-bottom:22px;margin-bottom:24px}
-h1{font-size:clamp(28px,5vw,44px);line-height:1.15;margin:0 0 12px}
-p{margin:0 0 8px}
-.muted,small{color:var(--muted)}
-code{font:inherit;overflow-wrap:anywhere}
-form{display:flex;flex-wrap:wrap;gap:12px;align-items:end;margin-bottom:24px}
-label{display:grid;gap:4px;flex:1 1 210px;font-weight:600}
-input,select,textarea,button,.button{border:1px solid var(--line);border-radius:8px;font:inherit;padding:9px 12px}
-input,select,textarea{width:100%;color:var(--ink);background:#fff}
-.advanced{flex:1 0 100%;padding:8px;border:1px solid var(--line);border-radius:8px}
-.advanced label{margin-top:8px}
-button{color:#fff;background:var(--accent);border-color:var(--accent);cursor:pointer}
-a{color:var(--accent)}
-.button{display:inline-block;background:#fff;text-decoration:none;white-space:nowrap}
-:focus-visible{outline:3px solid #318478;outline-offset:2px}
-.records{display:grid;gap:12px}
-article,.empty{background:#fff;border:1px solid var(--line);border-radius:12px;padding:16px 20px}
-article h2{font-size:18px;margin:0 0 6px;overflow-wrap:anywhere}
-ul{padding:0;margin:10px 0 0;list-style:none}
-li+li{margin-top:5px}
-.badge{display:inline-block;background:#e9f4f2;color:#0a574e;padding:1px 7px;border-radius:6px;
-font-size:12px;font-weight:700;margin-right:6px}
-.meta{display:flex;gap:4px 16px;flex-wrap:wrap;font-size:14px}
-.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:18px}
-.controls .muted{margin-right:auto}
-.tabs{display:flex;gap:8px 18px;flex-wrap:wrap;margin:0 0 22px;font-weight:700}
-.job-form{padding-top:10px;margin-bottom:0}
-.preview{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:10px}
-.check{display:flex;align-items:center;gap:8px}
-.check input{width:auto}
-dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:4px 14px;margin:8px 0}
-dd{margin:0}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#edf4f5;padding:12px;border-radius:8px}
-@media(max-width:550px){main{padding:26px 14px}article,.empty{padding:12px}form{gap:8px}}
-"""
 
 
 def _url(project="", tag="", page=1, root="/"):
@@ -75,16 +37,17 @@ def _artifact(item, workspace=None, identity=None, index=None):
     path = escape(item["path"])
     count = item.get("bytes")
     size = " <small>({:,} B)</small>".format(count) if type(count) is int and count >= 0 else ""
-    actions = ""
+    actions, state_html = "", ""
     if workspace is not None:
         from web_artifacts import artifact_state
         state, _ = artifact_state(item)
-        actions = "　<small>{}</small>".format(ARTIFACT_STATES[state])
+        state_html = '<span class="state" data-state="{}">{}</span>'.format(state, ARTIFACT_STATES[state])
         if state == "available":
             query = urlencode({"id": identity, "file": index})
-            actions += '　<a href="{}/history-download?{}">校验并下载</a>'.format(workspace.prefix, escape(query))
-            actions += "　" + workspace.delivery_link("history", identity, index)
-    return '<li><span class="badge">{}</span><code>{}</code>{}{}</li>'.format(kind, path, size, actions)
+            actions = '<div class="actions"><a class="button compact" href="{}/history-download?{}">校验并下载</a>{}</div>'.format(
+                workspace.prefix, escape(query), workspace.delivery_link("history", identity, index))
+    return ('<li class="artifact"><div class="artifact-line"><span class="badge">{}</span><code>{}</code>{}{}</div>'
+            '{}</li>').format(kind, path, size, state_html, actions)
 
 
 def _card(row, workspace=None):
@@ -114,30 +77,42 @@ def _page(directory, project, tag, page, rows, more, error=False, workspace=None
         links.append(("下一页", page + 1))
     controls.extend('<a class="button" href="{}">{}</a>'.format(escape(_url(project, tag, number, root)), label)
                     for label, number in links)
-    return """<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>打包台账 · PyImageBuilder</title><style>{}</style></head>
-<body><main><header><h1>打包台账</h1>
-<p class="muted">按完成时间倒序排列（UTC）。路径为打包时的原始位置。</p>
-<p class="muted"><code>{}</code></p></header>{}
-<form action="{}" method="get">
+    body = """<div class="panel history-filter"><form action="{}" method="get">
 <label>项目<input name="project" value="{}" placeholder="例如 hisq"></label>
 <label>镜像标签<input name="tag" value="{}" placeholder="例如 hisq_front:1.0.0"></label>
 <button type="submit">筛选</button><a class="button" href="{}">清除筛选</a>
-</form><section class="records" aria-label="构建记录">{}</section>
-<nav class="controls" aria-label="分页">{}</nav></main></body></html>""".format(
-        STYLE, escape(str(directory)), workspace.nav() if workspace is not None else "", root,
-        escape(project), escape(tag), root, cards, "".join(controls))
+</form><p class="muted"><code>{}</code></p></div>
+<section class="records" aria-label="构建记录">{}</section>
+<nav class="controls" aria-label="分页">{}</nav>""".format(
+        root, escape(project), escape(tag), root, escape(str(directory)), cards, "".join(controls))
+    return document("打包台账", body, workspace.nav("history") if workspace is not None else "",
+                    "按完成时间倒序排列（UTC）。归档路径为打包时的原始位置。")
 
 
-def _workbench_page(workspace, title, body, refresh=False, fast_script=False):
-    return """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">{}<title>{} · PyImageBuilder</title>
-<style>{}</style>{}</head><body><main><header><h1>镜像构建工作台</h1>
-<p class="muted">{}</p></header>{}<section class="records">{}</section></main></body></html>""".format(
-        '<meta http-equiv="refresh" content="2">' if refresh else "", escape(title),
-        STYLE, '<script defer src="{}/fast.js"></script>'.format(workspace.prefix) if fast_script else "",
-        escape(title), workspace.nav(), body)
+PAGES = {
+    "构建与打包": ("build", "从应用包或 Dockerfile 构建镜像，生成可交付的归档。"),
+    "复用构建参数": ("build", "核对项目、版本和输出路径后，可再次提交。"),
+    "最近任务": ("jobs", "查看进度、历史结果和可下载的产物。"),
+    "任务详情": ("jobs", ""),
+    "本地镜像库": ("images", "按标签、平台或来源查找镜像并执行产物操作。"),
+    "产物操作": ("", "基于选中的归档或镜像执行校验、分析与交付。"),
+    "推送确认": ("", ""),
+    "空间与清理预览": ("space", "查看文件占用，核对清理候选项后再执行。"),
+    "配置概览": ("config", "管理 Fast 模板，查看仓库类型和本机运行路径。"),
+    "Fast 模板管理": ("config", "编辑模板后可先测试基础镜像，再预览并保存。"),
+    "配置变更预览": ("config", ""),
+}
+
+
+def _workbench_page(workspace, title, body, refresh=False, fast_script=False, active=None):
+    default_active, description = PAGES.get(title, ("", ""))
+    head = '<meta http-equiv="refresh" content="2">' if refresh else ""
+    if fast_script:
+        head += '<script defer src="{}/fast.js"></script>'.format(workspace.prefix)
+    if refresh:
+        description = "任务执行期间每两秒刷新一次。"
+    return document(title, '<section class="records">{}</section>'.format(body),
+                    workspace.nav(default_active if active is None else active), description, head)
 
 
 def _query(value):
@@ -295,7 +270,8 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                         raise ValueError("Invalid delivery selector")
                     data = {key: values[0] for key, values in fields.items()}
                     return self._reply(200, _workbench_page(workspace, "产物操作",
-                                       workspace.delivery_page(data)), html=True)
+                                       workspace.delivery_page(data),
+                                       active="history" if data.get("scope") == "history" else "images"), html=True)
                 if route == "/space" and len(query) <= 100:
                     fields = parse_qs(query)
                     kind, = fields.get("kind", [None])
@@ -362,7 +338,8 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                     plan = workspace.delivery.plan(form_data(self))
                     if plan["action"] == "push":
                         return self._reply(200, _workbench_page(workspace, "推送确认",
-                                           workspace.push_confirmation(plan)), html=True)
+                                           workspace.push_confirmation(plan),
+                                           active="history" if "record" in plan else "images"), html=True)
                     identity = workspace.submit_delivery(plan)
                 elif route == "/delivery/confirm" and not query:
                     fields = form_data(self)

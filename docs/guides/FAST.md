@@ -93,6 +93,8 @@ python3 ./main.py --web
 
 用 UOS 本机的浏览器打开终端输出的完整会话链接。默认端口是 8765；冲突时可加 `--port 0` 自动选择。原来的 `python3 ./main.py builds --web` 同样可用。
 
+从主导航切换构建、任务、镜像库、打包台账、空间和配置。构建页可直接跳到 Fast、Dockerfile 或 OCI 合并；镜像库默认先显示筛选和结果，拉取、导入等表单可在「镜像库工具」中展开。
+
 | 页面 | 操作 |
 | --- | --- |
 | 构建 | WAR/dist.zip 快速打包；Dockerfile 检查和构建；高级区支持 ARG、基础镜像映射、固定时间戳、输入锁、SBOM 和签名；合并 amd64/arm64 OCI tar |
