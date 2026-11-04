@@ -389,7 +389,13 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                     escape(str(exc)))), html=True)
             return self._redirect(workspace.prefix + "/job?" + urlencode({"id": identity}))
 
-    return ThreadingHTTPServer(("127.0.0.1", port), LedgerHandler)
+    class LedgerServer(ThreadingHTTPServer):
+        def service_actions(self):
+            super().service_actions()
+            if workspace is not None:
+                workspace.uploads.reap()
+
+    return LedgerServer(("127.0.0.1", port), LedgerHandler)
 
 
 def serve(directory, port=8765, project=None, tag=None, limit=None, *, settings=None, config=None):

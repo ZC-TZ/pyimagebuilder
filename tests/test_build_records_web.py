@@ -342,6 +342,46 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(self.http("/discard-fast-upload", {"token": token})[0], 200)
         self.assertFalse(staged.parent.exists())
 
+    def test_idle_upload_expires_without_any_further_request(self):
+        with patch("web_uploads.IDLE_SECONDS", 0.3):
+            status, body = self.upload_package("unused.war", b"war")
+            self.assertEqual(status, 200, body)
+            staged = self.workspace.uploads.path(json.loads(body)["token"])
+        deadline = time.monotonic() + 2
+        while staged.parent.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(staged.parent.exists())
+
+    def test_upload_cleanup_retry_preserves_quota_and_invalidates_token(self):
+        import shutil
+        from errors import BuildError
+        status, body = self.upload_package("locked.war", b"war")
+        self.assertEqual(status, 200, body)
+        uploads = self.workspace.uploads
+        token = json.loads(body)["token"]
+        staged = uploads.path(token)
+        real_rmtree = shutil.rmtree
+        denied = threading.Event()
+
+        def temporarily_busy(path, *args, **kwargs):
+            if Path(path) == staged.parent and not denied.is_set():
+                denied.set()
+                raise PermissionError("busy")
+            return real_rmtree(path, *args, **kwargs)
+
+        with patch("web_uploads.CLEANUP_RETRY_SECONDS", 0.6), patch.object(
+                shutil, "rmtree", side_effect=temporarily_busy):
+            self.assertEqual(self.http("/discard-fast-upload", {"token": token})[0], 400)
+            with uploads.lock:
+                self.assertIn(token, uploads.entries)
+                self.assertTrue(staged.exists())
+            with self.assertRaises(BuildError):
+                uploads.path(token)
+            deadline = time.monotonic() + 4
+            while staged.parent.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+        self.assertFalse(staged.parent.exists())
+
     def test_fast_preview_matches_default_and_reuse_survives_a_new_workbench(self):
         import zipfile
         package = self.root / "dist.zip"

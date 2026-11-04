@@ -42,15 +42,17 @@ FAST_SCRIPT = r"""
   const original = output.placeholder;
   const originalPath = path.placeholder;
   let timer, request, upload, generation = 0;
+  let release = Promise.resolve();
+  let submitting = false;
 
   function endpoint(name) {
     return form.action.replace(/\/submit\/fast$/, '/' + name);
   }
   function discard(value) {
     if (value) {
-      fetch(endpoint('discard-fast-upload'), {
+      release = release.then(() => fetch(endpoint('discard-fast-upload'), {
         method: 'POST', body: new URLSearchParams({token: value})
-      }).catch(() => {});
+      })).catch(() => {});
     }
   }
   function clearUpload() {
@@ -81,6 +83,8 @@ FAST_SCRIPT = r"""
     fileStatus.textContent = '正在暂存 ' + file.name + '…';
     update();
     try {
+      await release;
+      if (upload !== current) return;
       const response = await fetch(endpoint('upload-fast') + '?' + new URLSearchParams({name: file.name}), {
         method: 'POST', headers: {'Content-Type': 'application/octet-stream'},
         body: file, signal: current.signal
@@ -166,7 +170,16 @@ FAST_SCRIPT = r"""
     stage(event.dataTransfer.files);
   });
   form.addEventListener('submit', event => {
-    if (upload) event.preventDefault();
+    if (upload || submitting) {
+      event.preventDefault();
+      return;
+    }
+    submitting = true;
+    submit.disabled = true;
+  });
+  window.addEventListener('pageshow', () => {
+    submitting = false;
+    submit.disabled = Boolean(upload);
   });
   form.addEventListener('input', update);
   form.addEventListener('change', update);

@@ -331,8 +331,8 @@ class Jobs:
                     command = [sys.executable, "-u", str(Path(__file__).with_name(entry))] + job["args"]
                     env = dict(os.environ, PYTHONIOENCODING="utf-8",
                                PYIMAGEBUILDER_BUILD_RECORDS_DIR=str(self.directory))
-                    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                               env=env, **options)
+                    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                               stderr=subprocess.STDOUT, env=env, **options)
                     job["process"] = process
                 except (OSError, ValueError) as exc:
                     self._append_log(job, str(exc))
