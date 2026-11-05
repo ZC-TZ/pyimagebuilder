@@ -9,7 +9,7 @@ from errors import ArchiveError
 from image_reader import (MAX_JSON, archive_members, digest_hex, docker_manifest,
                           image_config_bytes, image_history, outer_name, parse_image_json,
                           verify_layer_tar)
-from reproducible import add_file
+from reproducible import TAR_COPY_BUFFER, add_file
 
 
 def _add_bytes(archive, name, raw, epoch=0):
@@ -76,7 +76,8 @@ class ImageArchiveWriter:
         total_bytes = sum(path.stat().st_size for path in layers) if progress is not None else 0
         written_bytes = 0
         target = {"fileobj": fileobj} if fileobj is not None else {"name": output}
-        with tarfile.open(mode="w", format=tarfile.PAX_FORMAT, **target) as archive:
+        with tarfile.open(mode="w", format=tarfile.PAX_FORMAT,
+                          copybufsize=TAR_COPY_BUFFER, **target) as archive:
             _add_bytes(archive, "manifest.json", manifest_raw, self.source_date_epoch)
             _add_bytes(archive, config_name, raw_config, self.source_date_epoch)
             _add_bytes(archive, "repositories", repositories_raw, self.source_date_epoch)

@@ -3,11 +3,12 @@
 import hashlib
 import io
 import json
-import tarfile
 import zipfile
+from contextlib import nullcontext
 from urllib.parse import quote
 
 from errors import ArchiveError
+from layer_reader import LayerReader
 from reproducible import timestamp
 
 
@@ -17,29 +18,25 @@ def canonical_json(value):
                        separators=(",", ":")) + "\n").encode("utf-8")
 
 
-def _file_checksums(rootfs, path):
+def _file_checksums(rootfs, path, reader=None):
     # RootFSIndex 应用层时已固定硬链接的内容来源；
     # 原目标路径可能已被覆盖，不能再按该路径计算 SBOM 摘要。
     entry = rootfs.entries[path]
     if entry.kind not in ("file", "hardlink") or not entry.layer:
         raise ArchiveError("Cannot inventory image file: /" + path)
     first, second = hashlib.sha1(), hashlib.sha256()
-    with tarfile.open(entry.layer, "r:") as archive:
-        member = archive.getmember(entry.member)
-        stream = archive.extractfile(member)
-        if stream is None:
-            raise ArchiveError("Unreadable image file: /" + path)
-        with stream:
+    with (LayerReader() if reader is None else nullcontext(reader)) as files:
+        with files.open_file(entry) as (_, stream):
             for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
                 first.update(block)
                 second.update(block)
     return first.hexdigest(), second.hexdigest()
 
 
-def _small_file(rootfs, path, limit):
+def _small_file(rootfs, path, limit, reader=None):
     if rootfs.kind(path) not in ("file", "hardlink"):
         return None
-    return rootfs.read_file(path, limit=limit)
+    return rootfs.read_file(path, limit=limit, reader=reader)
 
 
 def _paragraphs(text):
@@ -55,7 +52,7 @@ def _paragraphs(text):
             yield fields
 
 
-def _detected_packages(rootfs):
+def _detected_packages(rootfs, reader=None):
     found = {}
 
     def add(kind, name, version, architecture=""):
@@ -64,14 +61,14 @@ def _detected_packages(rootfs):
         key = kind, name.lower(), version, architecture
         found[key] = key
 
-    data = _small_file(rootfs, "var/lib/dpkg/status", 64 * 1024 * 1024)
+    data = _small_file(rootfs, "var/lib/dpkg/status", 64 * 1024 * 1024, reader)
     if data is not None:
         for item in _paragraphs(data.decode("utf-8", "replace")):
             if item.get("Status") == "install ok installed":
                 add("deb", item.get("Package"), item.get("Version"),
                     item.get("Architecture", ""))
 
-    data = _small_file(rootfs, "lib/apk/db/installed", 64 * 1024 * 1024)
+    data = _small_file(rootfs, "lib/apk/db/installed", 64 * 1024 * 1024, reader)
     if data is not None:
         for block in data.decode("utf-8", "replace").split("\n\n"):
             fields = {}
@@ -83,7 +80,7 @@ def _detected_packages(rootfs):
     for path, entry in sorted(rootfs.entries.items()):
         if entry.kind != "file" or not path.endswith(".dist-info/METADATA"):
             continue
-        data = _small_file(rootfs, path, 1024 * 1024)
+        data = _small_file(rootfs, path, 1024 * 1024, reader)
         if data is None:
             continue
         fields = next(_paragraphs(data.decode("utf-8", "replace")), {})
@@ -118,7 +115,7 @@ def _detected_packages(rootfs):
         if entry.kind != "file" or not path.lower().endswith((".war", ".jar", ".ear")):
             continue
         try:
-            data = _small_file(rootfs, path, 128 * 1024 * 1024)
+            data = _small_file(rootfs, path, 128 * 1024 * 1024, reader)
         except ArchiveError:
             continue
         if data is not None:
@@ -128,6 +125,12 @@ def _detected_packages(rootfs):
 
 def create_sbom(rootfs, config, tag, epoch):
     """为最终可见文件及已识别的软件包生成 SPDX 2.3 文档。"""
+    with LayerReader() as reader:
+        return _create_sbom(rootfs, config, tag, epoch, reader)
+
+
+def _create_sbom(rootfs, config, tag, epoch, reader):
+    """文件摘要与包检测共用本次读取器，Python 包很多时也不重复扫描基础层。"""
     files = []
     relationships = [{"spdxElementId": "SPDXRef-DOCUMENT",
                       "relationshipType": "DESCRIBES",
@@ -136,7 +139,7 @@ def create_sbom(rootfs, config, tag, epoch):
     for path, entry in sorted(rootfs.entries.items()):
         if entry.kind not in ("file", "hardlink"):
             continue
-        sha1, sha256 = _file_checksums(rootfs, path)
+        sha1, sha256 = _file_checksums(rootfs, path, reader)
         identity = "SPDXRef-File-" + hashlib.sha256(path.encode("utf-8")).hexdigest()
         files.append({"SPDXID": identity, "fileName": "./" + path,
                       "checksums": [{"algorithm": "SHA1", "checksumValue": sha1},
@@ -154,7 +157,7 @@ def create_sbom(rootfs, config, tag, epoch):
                  "packageVerificationCode": {"packageVerificationCodeValue": verification_code},
                  "licenseConcluded": "NOASSERTION", "licenseDeclared": "NOASSERTION",
                  "copyrightText": "NOASSERTION"}]
-    for kind, name, version, architecture in _detected_packages(rootfs):
+    for kind, name, version, architecture in _detected_packages(rootfs, reader):
         identity = "SPDXRef-Package-" + hashlib.sha256(
             (kind + "\0" + name + "\0" + version + "\0" + architecture).encode()).hexdigest()
         if kind == "maven":

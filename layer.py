@@ -15,6 +15,8 @@ from compat import is_linked_directory
 from errors import ArchiveError, BuildError, UnsupportedInstruction
 from image_reader import sha256_file
 from image_identity import checked_identity_id
+from layer_reader import LayerReader
+from reproducible import TAR_COPY_BUFFER
 from rootfs import clean_path
 from path_policy import container_path, host_components
 from permissions import normalized_metadata, validate_metadata
@@ -186,6 +188,7 @@ class LayerBuilder:
         return relative
 
     def _add_data(self, archive, info, stream):
+        archive.copybufsize = TAR_COPY_BUFFER
         if self.reporter is None or info.size < 4 * 1024 * 1024:
             archive.addfile(info, stream)
         else:
@@ -567,8 +570,8 @@ class LayerBuilder:
                 return entry.metadata
             if not entry.layer:
                 return None
-            with tarfile.open(entry.layer, "r:") as original:
-                return normalized_metadata(original.getmember(entry.member))
+            _, member = source_files.member(entry.layer, entry.member)
+            return normalized_metadata(member)
 
         def file_entry(path):
             seen = set()
@@ -617,21 +620,17 @@ class LayerBuilder:
                     archive.addfile(info)
                     return
                 data_entry = file_entry(source)
-                with tarfile.open(data_entry.layer, "r:") as original:
-                    member = original.getmember(data_entry.member)
-                    stream = original.extractfile(member)
-                    if stream is None:
-                        raise ArchiveError("Unreadable prior-stage file: /" + source)
+                with source_files.open_file(data_entry) as (member, stream):
                     info.size = member.size
-                    with stream:
-                        self._add_data(archive, info, stream)
+                    self._add_data(archive, info, stream)
                 if identity is not None:
                     # 用源 inode 分组，不能按字节摘要或 backing member 合并独立文件。
                     hardlinks[identity] = output
             else:
                 raise UnsupportedInstruction("Cannot COPY prior-stage special file: /" + source)
 
-        with tarfile.open(target, "w", format=tarfile.PAX_FORMAT) as archive:
+        with LayerReader() as source_files, tarfile.open(
+                target, "w", format=tarfile.PAX_FORMAT, copybufsize=TAR_COPY_BUFFER) as archive:
             for source, expression in expanded:
                 if _matches_exclude(source, transfer.exclude):
                     continue

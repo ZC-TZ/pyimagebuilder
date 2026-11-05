@@ -3,9 +3,11 @@
 import copy
 import posixpath
 import tarfile
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 from errors import ArchiveError
+from layer_reader import LayerReader
 from path_policy import archive_path, container_path
 from permissions import merge_metadata, normalized_metadata, validate_metadata
 
@@ -86,7 +88,7 @@ class RootFSIndex:
         entry = self.entries.get(container_path(path).lstrip("/"))
         return entry.kind if entry else None
 
-    def read_file(self, path, limit=2 * 1024 * 1024):
+    def read_file(self, path, limit=2 * 1024 * 1024, *, reader=None):
         """直接读取镜像中较小的配置文件，无需物化 Linux rootfs。"""
         pending = clean_path(path.lstrip("/")).split("/")
         if path.endswith("/"):
@@ -128,15 +130,8 @@ class RootFSIndex:
                 continue
             if entry.kind not in ("file", "hardlink"):
                 raise ArchiveError("Rootfs path is not a file: " + path)
-            with tarfile.open(entry.layer, "r:") as archive:
-                member = archive.getmember(entry.member)
-                if member.size > limit:
-                    raise ArchiveError("Rootfs config file exceeds size limit: " + path)
-                stream = archive.extractfile(member)
-                if stream is None:
-                    raise ArchiveError("Unreadable rootfs file: " + path)
-                with stream:
-                    return stream.read(limit + 1)
+            with (LayerReader() if reader is None else nullcontext(reader)) as files:
+                return files.read_file(entry, limit)
         raise ArchiveError("Too many rootfs hardlinks: " + path)
 
     def _remove(self, path, include=True):

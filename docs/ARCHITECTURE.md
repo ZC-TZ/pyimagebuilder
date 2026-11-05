@@ -281,6 +281,7 @@ pyimagebuilder/
   image_writer.py         Docker save 归档生成、内部验证
   oci_writer.py           OCI Image Layout tar 生成、内部验证
   reproducible.py         固定时间戳与确定性归档头
+  layer_reader.py         COPY/SBOM 操作内复用层句柄和成员索引，按 LRU 限制打开数量
   compat.py               Python 3.7 与较新字符串/pathlib API 的差异适配
   sbom.py                 SPDX 2.3 文件和组件清单
   attest.py               SLSA provenance、DSSE 封套与离线校验 CLI

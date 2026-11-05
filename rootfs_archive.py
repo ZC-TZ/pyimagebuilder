@@ -29,7 +29,7 @@ from platforms import architecture, normalize_platform
 from permissions import normalized_metadata
 from progress import make_reporter
 from registry import parse_reference
-from reproducible import parse_epoch, timestamp
+from reproducible import TAR_COPY_BUFFER, parse_epoch, timestamp
 from rootfs import RootFSIndex, clean_path
 from settings import cache_directory, load_settings
 
@@ -133,7 +133,8 @@ def merge_rootfs(layers, output, reporter=None):
     opened = _LayerFiles()
     inodes = {}
     try:
-        with tarfile.open(output, "w", format=tarfile.PAX_FORMAT) as target:
+        with tarfile.open(output, "w", format=tarfile.PAX_FORMAT,
+                          copybufsize=TAR_COPY_BUFFER) as target:
             if index.root_metadata is not None:
                 target.addfile(_header(index.root_metadata, "."))
             for number, name in enumerate(sorted(index.entries), 1):
@@ -178,7 +179,8 @@ def prepare_rootfs(source, output):
     """
     seen = set()
     with tarfile.open(source, "r:*") as archive, \
-            tarfile.open(output, "w", format=tarfile.PAX_FORMAT) as target:
+            tarfile.open(output, "w", format=tarfile.PAX_FORMAT,
+                         copybufsize=TAR_COPY_BUFFER) as target:
         for member in archive:
             name = _member_name(member.name)
             _supported(member)

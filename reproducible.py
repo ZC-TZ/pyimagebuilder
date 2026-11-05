@@ -9,6 +9,8 @@ from errors import BuildError
 
 
 MAX_EPOCH = 253402300799  # 9999-12-31T23:59:59Z
+# TarFile 默认每次复制 16 KiB；大层采用有界的 256 KiB 块，减少读写及进度包装开销。
+TAR_COPY_BUFFER = 256 * 1024
 
 
 def parse_epoch(value):

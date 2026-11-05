@@ -9,7 +9,7 @@ import tarfile
 from errors import ArchiveError
 from image_reader import (MAX_JSON, archive_members, digest_hex, image_config_bytes, image_history, image_json_bytes,
                           parse_image_json, same_json_value, verify_layer_tar)
-from reproducible import add_file
+from reproducible import TAR_COPY_BUFFER, add_file
 
 
 INDEX_TYPE = "application/vnd.oci.image.index.v1+json"
@@ -121,7 +121,8 @@ class OCIImageWriter:
                            {item[1]["digest"]: item for item in zip(layers, layer_descriptors)}.values())
                        if progress is not None else 0)
         written_bytes = 0
-        with tarfile.open(output, "w", format=tarfile.PAX_FORMAT) as archive:
+        with tarfile.open(output, "w", format=tarfile.PAX_FORMAT,
+                          copybufsize=TAR_COPY_BUFFER) as archive:
             _add_bytes(archive, "oci-layout", _json_bytes({"imageLayoutVersion": "1.0.0"}),
                        self.source_date_epoch)
             _add_bytes(archive, "index.json", index_raw, self.source_date_epoch)
