@@ -3,8 +3,9 @@
 from path_policy import output_path
 
 import copy
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 import json
+import os
 import platform
 import re
 import tempfile
@@ -12,6 +13,7 @@ from pathlib import Path
 from dataclasses import asdict, dataclass, replace
 
 from cache import CACHE_VERSION, LayerCache, cache_key
+from compat import unlink_missing
 from cache_activity import cache_activity
 from dockerfile_parser import parse, valid_stop_signal
 from errors import BaseImageNotFound, BuildError, UnsupportedInstruction
@@ -20,6 +22,7 @@ from image_reader import BaseImage, ImageArchiveReader
 from cas_store import CASStore
 from image_writer import ImageArchiveWriter
 from file_publish import publication_transaction, publish_new_file
+from file_resources import open_regular_file
 from oci_writer import OCIImageWriter
 from layer import LayerBuilder, container_path
 from rootfs import RootFSIndex
@@ -203,7 +206,8 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
         cache_stats.update(hits=0, misses=0, stored=0)
     workspace_parent.mkdir(parents=True, exist_ok=True)
     with publication_transaction() as published, cache_activity(cache_root), \
-            tempfile.TemporaryDirectory(prefix="pyimagebuilder-", dir=workspace_parent) as temp:
+            tempfile.TemporaryDirectory(prefix="pyimagebuilder-", dir=workspace_parent) as temp, \
+            ExitStack() as export_areas:
         cache = LayerCache(cache_root, verify=verify_cache) if cache_root is not None else None
         workspace = Path(temp)
         if reporter is not None and reporter.debug:
@@ -716,11 +720,44 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                 writer.write_image(partial, export_image, tag, progress=progress)
             else:
                 writer.write_new(partial, export_config, layers, tag, progress=progress)
+            if partial.parent != workspace:
+                # 原跨盘发布会在副本完成后 fsync；同盘暂存也保留该落盘步骤。
+                with open_regular_file(partial, writable=True) as stream:
+                    os.fsync(stream.fileno())
+
+        def archive_partial(destination, name):
+            """默认跨盘导出在目标盘暂存；保留显式工作区、上下文和无硬链接盘的行为。"""
+            parent = destination.parent
+            if (workspace_dir is not None or parent == context or context in parent.parents or
+                    parent.stat().st_dev == workspace.stat().st_dev):
+                return workspace / name
+            probe = link = None
+            try:
+                directory = Path(export_areas.enter_context(tempfile.TemporaryDirectory(
+                    prefix="pyimagebuilder-export-", dir=parent)))
+                # 同盘暂存的收益依赖硬链接发布；不支持时继续使用原工作区，
+                # 避免在 FAT/受限文件系统上同时积压多份完整归档。
+                probe, link = directory / "probe", directory / "probe.link"
+                with open(probe, "xb"):
+                    pass
+                os.link(probe, link)
+            except OSError as exc:
+                if reporter is not None and reporter.debug:
+                    reporter.log("Export staging fallback: " + str(exc))
+                return workspace / name
+            finally:
+                if link is not None:
+                    unlink_missing(link)
+                if probe is not None:
+                    unlink_missing(probe)
+            if reporter is not None and reporter.debug:
+                reporter.log("Export staging: " + str(directory))
+            return directory / name
 
         if reporter is not None:
             reporter.phase_start("Exporting image archive")
         if image_format in ("docker", "both"):
-            partial = workspace / "docker-image.tar"
+            partial = archive_partial(output, "docker-image.tar")
             writer = ImageArchiveWriter(source_date_epoch)
             with reporter.timed("Write Docker archive") if reporter is not None else nullcontext():
                 if reporter is None:
@@ -733,7 +770,7 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                 writer.verify(partial, tag)
             products.append(("docker", partial, output))
         if image_format in ("oci", "both"):
-            partial = workspace / "oci-image.tar"
+            partial = archive_partial(oci_output if image_format == "both" else output, "oci-image.tar")
             writer = OCIImageWriter(source_date_epoch)
             with reporter.timed("Write OCI archive") if reporter is not None else nullcontext():
                 if reporter is None:
@@ -764,9 +801,12 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                 envelope_part.write_bytes(canonical_json(sign_envelope(provenance_bytes, seed)))
                 products.append(("signature", envelope_part, sidecars[2]))
 
-        for _, partial, destination in products:
-            publish_new_file(partial, destination)
-            published.append(destination)
+        for kind, partial, destination in products:
+            label = {"docker": "Publish Docker archive", "oci": "Publish OCI archive"}.get(
+                kind, "Publish " + kind)
+            with reporter.timed(label) if reporter is not None else nullcontext():
+                publish_new_file(partial, destination)
+                published.append(destination)
         if reporter is not None:
             reporter.phase_success("Exporting image archive")
         if build_info is not None:

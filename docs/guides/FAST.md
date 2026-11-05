@@ -187,4 +187,10 @@ python .\main.py verify D:\images\sfcx_back-1.3.4.tar
 
 在目标 Docker 机器上执行 `docker load -i sfcx_back-1.3.4.tar`，再启动应用验收。
 
-Fast 还支持 `--format docker|oci|both`、`--platform linux/amd64|linux/arm64`、`--cache-dir`、`--verify-cache`、`--source-date-epoch` 和进度选项。Fast 不提供 build 的全部参数；需要 RUN、`--offline`、`--attest` 或自定义多阶段 Dockerfile 时，使用 [普通 build](BUILD.md)。
+Fast 还支持 `--format docker|oci|both`、`--platform linux/amd64|linux/arm64`、`--cache-dir`、`--verify-cache`、`--workspace`、`--source-date-epoch` 和进度选项。Fast 不提供 build 的全部参数；需要 RUN、`--offline`、`--attest` 或自定义多阶段 Dockerfile 时，使用 [普通 build](BUILD.md)。
+
+跨盘导出时，默认可在输出盘的私有目录生成并验证归档，再以硬链接发布，减少一次完整 tar 的搬运。
+这要求输出目录在构建上下文外，且支持硬链接；不满足时继续使用原工作区。
+想固定临时构建和归档写出位置时，显式指定 `--workspace /data/build-tmp`，该目录必须在构建上下文外。
+机械硬盘或网络输出盘的读写表现可能不同，可与 `--workspace /tmp` 对照后选择；
+独立 `fast.py` 和 `main.py fast` 都支持该参数。它不会修改镜像内容或缓存键。

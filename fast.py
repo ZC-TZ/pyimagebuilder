@@ -263,7 +263,7 @@ def quick_build(artifact, project, version, config_path=None, *,
                 tag=None, output=None, image_format="docker", platform="linux/amd64",
                 source_date_epoch=0, cache_dir=None, profile_name=None,
                 reporter=None, cache_stats=None, build_info=None,
-                verify_cache=False):
+                verify_cache=False, workspace_dir=None):
     """根据应用包、显式主题名和版本号准备临时 Dockerfile，再调用通用构建器。"""
     artifact = resolve_host_path(artifact)
     if not artifact.is_file():
@@ -345,7 +345,8 @@ def quick_build(artifact, project, version, config_path=None, *,
             raise BuildError("Output must differ from the cached base tar")
         info = build_info if build_info is not None else {}
         result = build(dockerfile, context, base_tar, None, tag, output,
-                       enable_run=False, cache_dir=cache_dir, cache_stats=cache_stats,
+                       enable_run=False, workspace_dir=workspace_dir,
+                       cache_dir=cache_dir, cache_stats=cache_stats,
                        image_format=image_format, source_date_epoch=epoch,
                        target_platform=platform, reporter=reporter, build_info=info,
                        trusted_base_cache=profile.get("baseTar") is None,
@@ -467,6 +468,8 @@ def main(argv=None):
         parser.add_argument("--platform", choices=("linux/amd64", "linux/arm64"), default="linux/amd64")
         parser.add_argument("--source-date-epoch", default="0")
         parser.add_argument("--cache-dir", type=Path)
+        parser.add_argument("--workspace", type=Path,
+                            help="Explicit temporary build and export filesystem")
         parser.add_argument("--verify-cache", action="store_true")
         parser.add_argument("--no-build-records", action="store_true", help="Do not write a local build record")
         parser.add_argument("--progress", choices=("auto", "plain", "json"), default="auto")
@@ -490,7 +493,7 @@ def main(argv=None):
                                       source_date_epoch=args.source_date_epoch,
                                       cache_dir=args.cache_dir, profile_name=args.profile,
                                       reporter=reporter, cache_stats=stats, build_info=info,
-                                      verify_cache=args.verify_cache)
+                                      verify_cache=args.verify_cache, workspace_dir=args.workspace)
             published.append(result)
             secondary = info.get("oci_output")
             if secondary is not None:

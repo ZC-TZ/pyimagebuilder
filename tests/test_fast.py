@@ -16,6 +16,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import fast
+import builder
 import main as builder_main
 from errors import BuildError
 from image_reader import ImageArchiveReader
@@ -80,6 +81,31 @@ class FastBuildTests(unittest.TestCase):
         self.assertEqual(copymode.call_args[0][0], war)
         self.inspect(output, tag, "soft/tomcat/webapps/sfcx.war", b"WAR fallback")
         self.assertEqual(linked.read_bytes(), output.read_bytes())
+
+    def test_main_and_standalone_honor_explicit_workspace(self):
+        self.init()
+        war = self.root / "app.war"
+        war.write_bytes(b"WAR contents")
+        workspace = self.root / "workspace"
+        original = builder.publish_new_file
+        for name, invoke, prefix in (("main", builder_main.main, ["fast"]),
+                                      ("standalone", fast.main, [])):
+            with self.subTest(entry=name):
+                sources = []
+
+                def publish(source, target):
+                    sources.append(Path(source))
+                    return original(source, target)
+
+                output = self.root / (name + "-workspace.tar")
+                args = prefix + [str(war), "sfcx", "1.3.4", "--config", str(self.profile),
+                                 "--workspace", str(workspace), "--no-build-records", "-o", str(output)]
+                with patch.object(builder, "publish_new_file", side_effect=publish), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(invoke(args), 0)
+                self.assertTrue(sources)
+                self.assertTrue(all(workspace in source.parents for source in sources))
+                self.inspect(output, "sfcx_back:1.3.4", "soft/tomcat/webapps/sfcx.war", b"WAR contents")
 
     @unittest.skipUnless(os.name == "nt", "Windows read-only file cleanup")
     def test_readonly_war_preserves_source_and_cleans_independent_copy(self):

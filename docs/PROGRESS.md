@@ -84,6 +84,12 @@ Artifactory 来源会显示 URL、下载文件进度、格式转换与打包状�
 
 网页日志复用普通控制台格式，每层保留一条完成或失败记录，显示序号、处理量和耗时。当前层的中间进度显示在任务状态区，心跳显示该层持续时间。构建结束后日志列出阶段耗时，可用来区分下载、基础镜像读取和导出。
 
+导出统计分别列出 `Write Docker/OCI archive`、`Verify Docker/OCI archive` 和
+`Publish Docker/OCI archive`。Publish 包含最终排他发布，以及必要的跨盘或无硬链接回退复制；
+最终整个交付文件的 SHA-256 仍单列为 `Hash final output archive`。
+这些是导出阶段内部的子项，不能再与外层导出总耗时重复相加。
+使用输出盘暂存时，Write 包含该私有归档的 fsync；它通过完整验证后才发布。
+
 Artifactory（CAS 和 Docker tar）、Registry、CAS 读取、本地 tar 读取与构建索引共用
 `progress.layers.LayerProgress`。每层固定发出开始和成功/失败事件，中间字节事件逐层节流；
 小层不会因为不到五秒而缺失完成记录。缓存命中仍校验数据，标记“复用缓存”，不会伪装成重新下载。

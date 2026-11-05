@@ -234,7 +234,7 @@ def main(argv=None):
                         help="Build-time ARG value; do not use for secrets")
     parser.add_argument("--secret", action="append", default=[], metavar="ID=/absolute/file",
                         help="File for RUN --mount=type=secret,id=ID")
-    parser.add_argument("--workspace", help="Native Linux temporary filesystem for RUN; defaults to /tmp")
+    parser.add_argument("--workspace", help="Explicit temporary build/export filesystem; RUN needs native Linux")
     parser.add_argument("--cache-dir", type=Path, help="Persistent local layer cache directory")
     parser.add_argument("--no-cache", action="store_true", help="Disable cache reads and writes")
     parser.add_argument("--no-build-records", action="store_true", help="Do not write a local build record")
