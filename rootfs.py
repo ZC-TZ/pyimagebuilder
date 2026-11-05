@@ -140,6 +140,15 @@ class RootFSIndex:
         raise ArchiveError("Too many rootfs hardlinks: " + path)
 
     def _remove(self, path, include=True):
+        # 索引始终补齐目录祖先，因此不存在的路径或非目录节点不可能有子项。
+        # 新增/覆盖每个普通文件都扫描整棵树，会让大镜像索引退化为平方复杂度。
+        entry = self.entries.get(path)
+        if entry is None:
+            return
+        if entry.kind != "dir":
+            if include:
+                del self.entries[path]
+            return
         for existing in list(self.entries):
             if (include and existing == path) or existing.startswith(path + "/"):
                 del self.entries[existing]
@@ -150,7 +159,8 @@ class RootFSIndex:
             current = self.entries.get(parent)
             if current and current.kind != "dir":
                 raise ArchiveError("Layer member descends through a non-directory parent: " + path)
-            self.entries.setdefault(parent, Entry("dir"))
+            if current is None:
+                self.entries[parent] = Entry("dir")
             parent = posixpath.dirname(parent)
 
     def apply_layer(self, layer_path):
