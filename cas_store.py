@@ -31,7 +31,7 @@ from oci_writer import OCIImageWriter, CONFIG_TYPE, LAYER_TYPE, MANIFEST_TYPE
 from platforms import architecture, normalize_platform
 from settings import cache_directory, load_settings
 from store_lock import file_lock
-from file_publish import LINK_FALLBACK, publication_transaction
+from file_publish import LINK_FALLBACK, publication_transaction, publish_new_file
 
 
 SCHEMA_VERSION = 1
@@ -139,18 +139,22 @@ class CASStore:
                 os.fsync(output.fileno())
             if written != size or hasher.hexdigest() != expected:
                 raise ArchiveError("CAS blob size or digest mismatch: " + digest)
-            # 并发导入可能发布相同摘要；即使目标已存在，
-            # 也必须核对大小和内容，不能只信任文件名。
-            if target.exists():
-                if target.is_symlink():
-                    raise ArchiveError("CAS blob path is a symlink: " + digest)
-                if target.stat().st_size != size or sha256_file(target) != expected:
-                    raise ArchiveError("CAS blob collision: " + digest)
-            else:
-                os.replace(pending, target)
+            self._publish_blob(Path(pending), digest, size)
         finally:
-            if os.path.exists(pending):
-                os.unlink(pending)
+            unlink_missing(pending)
+        return target
+
+    def _publish_blob(self, pending, digest, size):
+        """排他发布私有暂存文件；并发赢家必须通过摘要校验，不能覆盖它。"""
+        target = self._blob(digest)
+        try:
+            publish_new_file(pending, target)
+        except FileExistsError:
+            if target.is_symlink():
+                raise ArchiveError("CAS blob path is a symlink: " + digest)
+            identity = verified_layer_identity(target, digest, file_identity)
+            if identity[2] != size:
+                raise ArchiveError("CAS blob size mismatch: " + digest)
         return target
 
     def _put_bytes(self, raw):
@@ -160,7 +164,7 @@ class CASStore:
         return digest
 
     def store_decoded_layer(self, path, diff_id, *, owned=False):
-        """校验并保存解码层。owned 仅用于下载器独占且此后只删除的临时文件。"""
+        """校验并保存解码层。owned 转交独占临时文件，成功或失败后原路径可能消失。"""
         path = Path(path)
         if owned:
             return self._store_owned_layer(path, diff_id)
@@ -170,41 +174,35 @@ class CASStore:
             return self._put_stream(stream, diff_id, path.stat().st_size)
 
     def _store_owned_layer(self, path, diff_id):
-        """仅接收调用方独占且此后只会删除的临时层，同盘共享 inode 以省去复制。"""
+        """先接管到私有路径再校验，同盘移动原文件以省去复制和原路径写入窗口。"""
         target = self._blob(diff_id)
         if path.resolve() == target.resolve():
             raise ArchiveError("Owned layer must be a private temporary file")
-        stamp = verified_layer_identity(path, diff_id, file_identity)
-        with open_regular_file(path, writable=True) as stream:
-            if stat_identity(os.fstat(stream.fileno()))[:4] != stamp[:4]:
-                raise ArchiveError("Decoded layer changed before CAS ingestion")
-            verify_layer_tar(stream, "decoded CAS layer: " + diff_id)
-            if os.name != "nt":
-                os.fchmod(stream.fileno(), 0o600)
-            os.fsync(stream.fileno())
-            if stat_identity(os.fstat(stream.fileno()))[:4] != stamp[:4]:
-                raise ArchiveError("Decoded layer changed during CAS ingestion")
         self.blobs.mkdir(parents=True, exist_ok=True)
+        descriptor, pending = tempfile.mkstemp(prefix="decoded-", suffix=".part", dir=self.blobs)
         try:
-            os.link(path, target)
-        except FileExistsError:
-            if target.is_symlink():
-                raise ArchiveError("CAS blob path is a symlink: " + diff_id)
-            verified_layer_identity(target, diff_id, file_identity)
-            return target
-        except OSError as exc:
-            if exc.errno not in LINK_FALLBACK:
-                raise
-            # 跨盘或文件系统不支持硬链接时，复用已校验的流式复制路径。
-            return self.store_decoded_layer(path, diff_id)
-        try:
-            if (target.is_symlink() or stat_identity(target.stat())[:4] != stamp[:4] or
-                    stat_identity(path.stat())[:4] != stamp[:4]):
-                raise ArchiveError("Decoded layer changed during CAS publication")
-        except BaseException:
-            unlink_missing(target)
-            raise
-        return target
+            with fdopen_owned(descriptor, "wb"):
+                pass
+            try:
+                os.replace(path, pending)
+            except OSError as exc:
+                if exc.errno not in LINK_FALLBACK:
+                    raise
+                return self.store_decoded_layer(path, diff_id)
+            pending = Path(pending)
+            with open_regular_file(pending, writable=True) as stream:
+                stamp = verified_layer_identity(pending, diff_id, file_identity)
+                if stat_identity(os.fstat(stream.fileno()))[:4] != stamp[:4]:
+                    raise ArchiveError("Decoded layer changed before CAS ingestion")
+                verify_layer_tar(stream, "decoded CAS layer: " + diff_id)
+                if os.name != "nt":
+                    os.fchmod(stream.fileno(), 0o600)
+                os.fsync(stream.fileno())
+                if stat_identity(os.fstat(stream.fileno()))[:4] != stamp[:4]:
+                    raise ArchiveError("Decoded layer changed during CAS ingestion")
+            return self._publish_blob(pending, diff_id, stamp[2])
+        finally:
+            unlink_missing(pending)
 
     def _publish(self, reference, platform, source, config_digest, layers,
                  replace=False, manifest_raw=None):

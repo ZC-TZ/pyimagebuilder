@@ -576,8 +576,9 @@ def pull(reference, output, username=None, password=None, ca_file=None,
             storing = LayerProgress("store", len(layers), reporter, source="registry", image=reference)
             for number, (layer, diff_id) in enumerate(zip(layers, diff_ids), 1):
                 with storing.layer(number, diff_id) as task:
-                    cas_store.store_decoded_layer(layer, diff_id, owned=True)
-                    task.current = layer.stat().st_size
+                    stored_layer = cas_store.store_decoded_layer(layer, diff_id, owned=True)
+                    layers[number - 1] = stored_layer
+                    task.current = stored_layer.stat().st_size
             raw_layers = [workspace / ("download-{}.blob".format(index))
                           if descriptor["mediaType"] != LAYER_TYPE else layers[index]
                           for index, descriptor in enumerate(descriptors)]

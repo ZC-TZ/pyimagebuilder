@@ -80,9 +80,11 @@ class CASIngestDedupTests(unittest.TestCase):
         source = self.root / "decoded.tar"
         raw = layer(b"owned decoded content")
         source.write_bytes(raw)
+        original = source.stat()
         target = store.store_decoded_layer(source, digest(raw), owned=True)
-        self.assertTrue(os.path.samefile(source, target))
-        source.unlink()
+        self.assertFalse(source.exists())
+        self.assertEqual((target.stat().st_dev, target.stat().st_ino),
+                         (original.st_dev, original.st_ino))
         self.assertEqual(target.read_bytes(), raw)
         copied = self.root / "ordinary.tar"
         copied.write_bytes(raw)
@@ -95,7 +97,14 @@ class CASIngestDedupTests(unittest.TestCase):
         source = self.root / "decoded.tar"
         raw = layer(b"valid decoded content")
         source.write_bytes(raw)
-        with patch.object(cas_store.os, "link", side_effect=OSError(errno.EXDEV, "cross-device")):
+        replace = os.replace
+
+        def cross_device(src, dst):
+            if Path(src) == source:
+                raise OSError(errno.EXDEV, "cross-device")
+            return replace(src, dst)
+
+        with patch.object(cas_store.os, "replace", side_effect=cross_device):
             target = store.store_decoded_layer(source, digest(raw), owned=True)
         self.assertFalse(os.path.samefile(source, target))
         self.assertEqual(target.read_bytes(), raw)
@@ -107,6 +116,41 @@ class CASIngestDedupTests(unittest.TestCase):
         target.write_bytes(b"corrupt CAS")
         with self.assertRaises(ArchiveError):
             store.store_decoded_layer(source, digest(raw), owned=True)
+
+    def test_owned_layer_detaches_original_path_before_verification_and_publication(self):
+        store = CASStore(self.root / "store")
+        source = self.root / "decoded.tar"
+        raw, changed = layer(b"original"), layer(b"replaced")
+        source.write_bytes(raw)
+        original = source.stat()
+        link = os.link
+
+        def rewrite_original_then_publish(src, dst):
+            source.write_bytes(changed)
+            os.utime(source, ns=(original.st_atime_ns, original.st_mtime_ns))
+            return link(src, dst)
+
+        with patch.object(cas_store.os, "link", side_effect=rewrite_original_then_publish):
+            target = store.store_decoded_layer(source, digest(raw), owned=True)
+        self.assertEqual(target.read_bytes(), raw)
+        self.assertEqual(source.read_bytes(), changed)
+        self.assertEqual(list(store.blobs.glob("*.part")), [])
+
+    def test_blob_publication_preserves_a_competing_file(self):
+        store = CASStore(self.root / "store")
+        raw = b"verified input"
+        target = store._blob(digest(raw))
+        publish = cas_store.publish_new_file
+
+        def compete(src, dst):
+            target.write_bytes(b"competing file")
+            return publish(src, dst)
+
+        with patch.object(cas_store, "publish_new_file", side_effect=compete):
+            with self.assertRaises(ArchiveError):
+                store._put_stream(io.BytesIO(raw), digest(raw), len(raw))
+        self.assertEqual(target.read_bytes(), b"competing file")
+        self.assertEqual(list(store.blobs.glob("*.part")), [])
 
     def test_existing_blob_does_not_hide_incoming_read_failure(self):
         store = CASStore(self.root / "store")

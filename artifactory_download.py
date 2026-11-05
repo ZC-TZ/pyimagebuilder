@@ -1045,7 +1045,7 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
                                       descriptor.get("digest"), progress=task.update)
                     task.current = decoded.stat().st_size
                     cas_store.store_decoded_layer(decoded, diff_id, owned=True)
-                    decoded.unlink()
+                    unlink_missing(decoded)
                     layer_paths.append(blob)
         else:
             decoded_layers = convert_registry_to_docker_archive(
