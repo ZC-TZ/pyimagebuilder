@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, quote, urlencode
 
 from errors import BuildError
 from web_artifacts import artifact_state, space_report, verified_artifact
-from web_job_journal import form_snapshot
+from web_job_journal import form_snapshot, task_artifact_suffixes
 from web_delivery import DELIVERY_ACTIONS, Delivery, library_items
 from web_jobs import FORMATS, LABELS, PLATFORMS, Jobs, _path, command_for, fast_plan, path_value
 from web_maintenance import (PROFILE_FIELDS, _revision, cache_fingerprint, cache_plan, cache_root, candidate_profile,
@@ -27,8 +27,10 @@ STATES = {"queued": "排队中", "running": "运行中", "success": "成功", "f
 SPACE_KINDS = {"images": "旧镜像", "cache": "过期构建缓存", "orphans": "无引用镜像层",
                "deliveries": "旧交付 tar（仅列出）"}
 UPLOAD_FIELDS = {"fast": {"package": "package"}, "build": {"dockerfile": "dockerfile"},
+                 "lock-inputs": {"dockerfile": "dockerfile"},
                  "check": {"dockerfile": "dockerfile"}, "load": {"archive": "archive"},
                  "inspect": {"archive": "archive"}, "verify": {"archive": "archive"},
+                 "rootfs-export": {"archive": "archive"}, "rootfs-import": {"archive": "rootfs"},
                  "multiarch": {"amd64": "archive", "arm64": "archive"}}
 
 FAST_SCRIPT = r"""
@@ -211,7 +213,8 @@ def _path_field(name, label, placeholder="", required=False, value="", mode="fil
     chooser = '<button type="button" class="secondary" data-browse hidden>浏览{}</button>'.format(
         "目录" if mode != "file" else "本机")
     if upload:
-        accept = {"package": ".war,.zip", "dockerfile": ""}.get(upload, ".tar")
+        accept = {"package": ".war,.zip", "dockerfile": "",
+                  "rootfs": ".tar,.tar.gz,.tar.bz2,.tar.xz,.tgz"}.get(upload, ".tar")
         chooser += ('<button type="button" class="secondary" data-pick hidden>选择文件</button>'
                     '<button type="button" class="secondary" data-reset-pick hidden>清除</button>'
                     '<input type="file" data-picker{} hidden><input type="hidden" name="{}-upload">'
@@ -231,6 +234,12 @@ def _select(name, label, options, selected="", labels=None):
 def _check(name, label, checked=False):
     return '<label class="check"><input type="checkbox" name="{}" value="1"{}>{}</label>'.format(
         name, " checked" if checked else "", label)
+
+
+def _change_field():
+    return ('<label>运行配置变更（可选，每行一条指令）'
+            '<textarea name="changes" rows="4" maxlength="8192" '
+            'placeholder="ENV APP_ENV=production&#10;EXPOSE 8089"></textarea></label>')
 
 
 def _section(title, body, anchor="", primary=False, description=""):
@@ -277,17 +286,19 @@ class Workbench:
                 '<div class="sidebar-foot"><span class="dot"></span>仅在本机运行</div></aside>').format(
                     self.prefix, icon("logo"), links)
 
-    def form(self, action, body, label=None):
+    def form(self, action, body, label=None, secondary=""):
         return ('<form class="job-form" data-action="{0}" method="post" action="{1}/submit/{0}">{2}'
-                '<div class="form-footer"><button type="submit"{3}>{4}</button></div></form>').format(
-            action, self.prefix, body, ' class="danger"' if action == "remove" else "", label or LABELS[action])
+                '<div class="form-footer"><button type="submit"{3}>{4}</button>{5}</div></form>').format(
+            action, self.prefix, body, ' class="danger"' if action == "remove" else "", label or LABELS[action],
+            secondary)
 
     def builds(self, action=None, draft=None):
         draft = draft or {}
 
         def field(name, label, placeholder="", required=False):
             modes = {"output": "output", "context": "directory", "dockerfile": "file",
-                     "base-tar": "file", "base-map": "file", "input-lock": "file", "sign-key": "file"}
+                     "base-tar": "file", "base-map": "file", "input-lock": "file", "sign-key": "file",
+                     "lock-output": "output-json"}
             if name in modes:
                 return _path_field(name, label, placeholder, required, draft.get(name, ""),
                                    modes[name], "dockerfile" if name == "dockerfile" else None)
@@ -322,13 +333,18 @@ class Workbench:
             _check("pull", "刷新基础镜像", draft.get("pull")) + _check("no-cache", "禁用构建缓存", draft.get("no-cache"))
         if sys.platform == "linux":
             ordinary += _check("run", "允许执行可信 Dockerfile 的 RUN", draft.get("run"))
-        ordinary += ('<details class="advanced"><summary>高级构建选项</summary>' +
+        ordinary += ('<details class="advanced"{}><summary>高级构建选项</summary>'.format(
+                     " open" if draft.get("input-lock") else "") +
                      field("base-map", "基础镜像映射 JSON") +
                      field("epoch", "可复现时间戳（Unix 秒）") +
                      field("input-lock", "封闭构建输入锁 JSON") +
+                     field("lock-output", "生成输入锁的输出路径", "/data/images/input-lock.json") +
+                     '<p class="muted">生成输入锁时须填可复现时间戳，JSON 须写到构建上下文之外。</p>' +
                      '<label>构建参数（每行 NAME=VALUE，不填凭据）<textarea name="build-args" rows="3"></textarea></label>' +
                      _check("attest", "生成 SBOM 和 provenance", draft.get("attest")) +
                      field("sign-key", "本机签名私钥路径（可选）") + "</details>")
+        lock_button = ('<button type="submit" class="secondary" formnovalidate '
+                       'formaction="{}/submit/lock-inputs">生成输入锁</button>').format(self.prefix)
         if action == "fast":
             return _section("复用快速打包参数", fast)
         if action == "build":
@@ -336,7 +352,9 @@ class Workbench:
             if needs_dockerfile:
                 note = '<p class="muted">上次的 Dockerfile 路径未保存。请先重新选择文件，再提交构建。</p>'
                 ordinary += '<input type="hidden" name="require-dockerfile" value="1">'
-            return _section("复用 Dockerfile 构建参数", note + self.form("build", ordinary))
+            if draft.get("input-lock"):
+                note += '<p class="muted">如原任务使用了构建参数，请按原值重新填写。</p>'
+            return _section("复用 Dockerfile 构建参数", note + self.form("build", ordinary, secondary=lock_button))
         multiarch = self.form("multiarch", _path_field("amd64", "amd64 OCI tar", required=True, upload="amd64") +
                               _path_field("arm64", "arm64 OCI tar", required=True, upload="arm64") +
                               _input("tag", "多平台镜像标签", "", True) + destination +
@@ -348,7 +366,7 @@ class Workbench:
                 '<a class="button compact" href="#multiarch">合并 OCI</a></nav></div>{}</div>').format(icon("arrow"), HERO)
         checks = self.form("check", context + dockerfile + platform)
         return "".join((hero, _section("快速打包", fast, "fast", True, "选择应用包和模板，预览输出后提交。"),
-                        _section("Dockerfile 构建", self.form("build", ordinary), "dockerfile",
+                        _section("Dockerfile 构建", self.form("build", ordinary, secondary=lock_button), "dockerfile",
                                  description="从本机项目目录构建镜像；高级选项可按需展开。"),
                         _section("静态检查 Dockerfile", checks, description="检查 Dockerfile 和构建输入。"),
                         _section("多架构 OCI 合并", multiarch, "multiarch",
@@ -375,6 +393,8 @@ class Workbench:
         reference = _input("reference", "镜像引用", "harbor.example/project/image:1", True)
         archive = _path_field("archive", "现有 tar 路径", "/data/images/app.tar", True, upload="archive")
         tag = _input("tag", "镜像标签（可选）")
+        output = _path_field("output", "输出 tar 路径", required=True, mode="output")
+        rootfs = _path_field("archive", "rootfs 归档", "/data/images/rootfs.tar", True, upload="rootfs")
         source = ("", "registry", "artifactory")
         filters = '<form method="get" action="{}/images">{}{}{}<button>筛选</button></form>'.format(
             self.prefix, _input("search", "标签包含", "", value=search),
@@ -389,6 +409,12 @@ class Workbench:
             _section("从镜像库导出 tar", self.form("save", reference + platform +
                      _select("source", "来源", source + ("local",)) + _path_field("output", "输出 tar 路径", required=True, mode="output"))),
             _section("检查现有 Docker tar", self.form("inspect", archive + tag) + self.form("verify", archive + tag)),
+            _section("导出 rootfs", self.form("rootfs-export", archive + tag + platform + output),
+                     description="从 Docker 或 OCI 镜像归档导出合并后的文件系统。需要 docker load 时，先用下方工具生成 Docker 镜像 tar。"),
+            _section("从 rootfs 创建镜像", self.form("rootfs-import", rootfs +
+                     _input("tag", "新镜像标签", "example/app:1.0.0", True) + platform +
+                     _select("format", "归档格式", ("docker", "oci"), "docker") +
+                     _input("epoch", "可复现时间戳（可选）") + _change_field() + output)),
             _section("磁盘占用", self.form("df", "")),
             _section("删除本地镜像引用", self.form("remove", reference + platform +
                      _select("source", "来源", source + ("local",)) +
@@ -415,8 +441,12 @@ class Workbench:
         buttons = []
         for action in self.delivery.actions(item):
             content = hidden + '<input type="hidden" name="action" value="{}">'.format(action)
-            if action in ("tag", "save", "optimize", "flatten"):
+            if action in ("tag", "save", "optimize", "flatten", "rootfs-export"):
                 content += _path_field("output", "新 tar 输出路径", "/data/images/release.tar", True, mode="output")
+            if action == "rootfs-export":
+                content += '<p class="muted">输出只包含合并后的文件系统，可用于 rootfs 导入。</p>'
+            if action == "flatten":
+                content += _change_field()
             if action == "tag":
                 content += _input("new-tag", "新镜像标签", "hisq_front:1.0.1", True)
             if action == "push":
@@ -717,11 +747,13 @@ class Workbench:
             content += _pairs((names[key], "{:,} B".format(value) if key.endswith("bytes") else value)
                               for key, value in metrics.items() if key in names)
         if job.get("form") and not running:
-            content += '<p><a class="button compact" href="{}/reuse?{}">复用参数</a>　<small>提交前可修改版本或输出。</small></p>'.format(
-                self.prefix, urlencode({"id": identity}))
+            locked = state == "success" and job["action"] == "lock-inputs" and job.get("artifacts")
+            content += '<p><a class="button compact" href="{}/reuse?{}">{}</a>　<small>{}</small></p>'.format(
+                self.prefix, urlencode({"id": identity}), "使用此输入锁构建" if locked else "复用参数",
+                "填写输出 tar 路径，构建时会核对锁定的输入。" if locked else "提交前可修改版本或输出。")
         artifacts = job.get("artifacts", [])
         for index, item in enumerate(artifacts):
-            if artifact_state(item, tar_only=False)[0] == "available":
+            if artifact_state(item, suffixes=task_artifact_suffixes(job["action"]))[0] == "available":
                 content += '<p><a class="button compact" href="{}/download?{}">校验并下载</a>　<code>{}</code></p>'.format(
                     self.prefix, _e(urlencode({"id": identity, "file": index})), _e(item["path"]))
             else:
@@ -810,13 +842,13 @@ class Workbench:
             return self.submit_delivery(dict(plan, action=action, label=plan["host"],
                                              config=str(self.config_arg) if self.config_arg is not None else None))
         effective = dict(data, **{field: str(path) for field, path in paths.items() if field != "package"})
-        if action == "build" and data.get("require-dockerfile") == "1":
+        if action in ("build", "lock-inputs") and data.get("require-dockerfile") == "1":
             path_value(effective, "dockerfile", required=True)
         args, outputs = command_for(action, effective, self.config_arg, self.profiles, paths.get("package"))
         if any(path.parent in output.parents for path in paths.values() for output in outputs):
             raise BuildError("输出路径不能位于文件暂存目录内")
-        delivery = action == "multiarch"
-        if delivery:
+        delivery = action in ("multiarch", "lock-inputs")
+        if action == "multiarch":
             archives, expected = {}, {}
             for architecture in ("amd64", "arm64"):
                 archive = Path(path_value(effective, architecture, required=True)).expanduser().absolute()
@@ -828,7 +860,7 @@ class Workbench:
                                 "epoch": effective.get("epoch", "").strip() or "0"}, ensure_ascii=True)]
         label = next((data[key] for key in ("project", "tag", "reference", "archive", "context") if data.get(key)), "")
         draft = form_snapshot(action, data)
-        if action == "build":
+        if action in ("build", "lock-inputs"):
             draft.setdefault("dockerfile", "")
         for field in paths:
             draft.pop(field, None)
@@ -836,8 +868,7 @@ class Workbench:
             value = path_value(draft, key)
             if value:
                 draft[key] = str(Path(value).expanduser().absolute())
-        return self.jobs.submit(action, args, outputs, tag if delivery else label[:300],
-                                draft, delivery=delivery, cleanup=cleanup)
+        return self.jobs.submit(action, args, outputs, label[:300], draft, delivery=delivery, cleanup=cleanup)
 
     def close(self):
         try:
@@ -878,7 +909,7 @@ def download(handler, job, index):
     if job is None or not 0 <= index < len(job.get("artifacts", [])):
         return handler._reply(404, "Artifact not found")
     item = job["artifacts"][index]
-    _, stream = verified_artifact(item, tar_only=False)
+    _, stream = verified_artifact(item, suffixes=task_artifact_suffixes(job["action"]))
     if stream is None:
         return handler._reply(409, "Artifact was moved or changed")
     with stream:

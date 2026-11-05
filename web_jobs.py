@@ -27,7 +27,8 @@ LABELS = {"fast": "快速打包", "build": "Dockerfile 构建", "check": "检查
           "history": "镜像层历史", "analyze": "分析镜像层", "optimize": "优化镜像",
           "flatten": "扁平化镜像", "multiarch": "合并多架构归档",
           "cache-clean": "清理过期构建缓存", "profile-test": "测试 Fast 基础镜像", "repo-test": "仓库诊断",
-          "image-clean": "批量清理旧镜像", "attest-verify": "校验交付签名"}
+          "image-clean": "批量清理旧镜像", "attest-verify": "校验交付签名",
+          "rootfs-export": "导出 rootfs", "rootfs-import": "从 rootfs 创建镜像", "lock-inputs": "生成构建输入锁"}
 PLATFORMS = ("linux/amd64", "linux/arm64")
 FORMATS = ("docker", "oci", "both")
 LOG_LINE_CHARS = 4000
@@ -73,10 +74,10 @@ def _path(value):
         raise BuildError("Cannot resolve local path: " + str(exc)) from exc
 
 
-def _target(data):
-    target = output_path(_path(path_value(data, "output", required=True)))
-    if target.suffix.lower() != ".tar" or target.exists():
-        raise BuildError("Output must be a new .tar file: " + str(target))
+def _target(data, field="output", suffix=".tar"):
+    target = output_path(_path(path_value(data, field, required=True)))
+    if target.suffix.lower() != suffix or target.exists():
+        raise BuildError("输出必须是尚不存在的 {} 文件：{}".format(suffix, target))
     return target
 
 
@@ -113,6 +114,22 @@ def fast_plan(data, config, profiles, uploaded_package=None):
             "conflicts": [path for path in outputs if path.exists()]}
 
 
+def _build_args(data):
+    raw = data.get("build-args", "")
+    if len(raw) > 8192:
+        raise BuildError("构建参数太长")
+    values = [line.strip() for line in raw.splitlines() if line.strip()]
+    arguments(values)
+    return values
+
+
+def rootfs_changes(data):
+    raw = data.get("changes", "")
+    if len(raw) > 8192:
+        raise BuildError("运行配置变更太长")
+    return [line.strip() for line in raw.splitlines() if line.strip()]
+
+
 def command_for(action, data, config, profiles, uploaded_package=None):
     """只拼装已知子命令的参数；路径不是选项，仓库凭据由原 CLI 读取。"""
     platform = _choice(data, "platform", PLATFORMS, PLATFORMS[0])
@@ -127,6 +144,23 @@ def command_for(action, data, config, profiles, uploaded_package=None):
             raise BuildError("输出文件已存在：" + "、".join(map(str, plan["conflicts"])))
         args = [action, str(plan["package"]), plan["project"], plan["version"], "--profile=" + plan["profile"],
                 "--format=" + plan["format"], "--output=" + str(outputs[0])] + shared + common + progress
+    elif action == "lock-inputs":
+        context = resolve_host_path(_path(path_value(data, "context", required=True)))
+        if not context.is_dir():
+            raise BuildError("构建上下文必须是目录")
+        sources = {key: str(_path(path_value(data, key))) for key in ("base-tar", "base-map") if path_value(data, key)}
+        if len(sources) > 1:
+            raise BuildError("基础 tar 与基础镜像映射只能选一项")
+        dockerfile = path_value(data, "dockerfile")
+        target = _target(data, "lock-output", ".json")
+        if context in target.parents:
+            raise BuildError("输入锁必须写到构建上下文之外")
+        plan = {"action": action, "context": str(context),
+                "dockerfile": str(_path(dockerfile) if dockerfile else context / "Dockerfile"),
+                "sources": sources, "tag": _required(data, "tag"), "platform": platform,
+                "target": _text(data, "target") or None, "format": _choice(data, "format", FORMATS, "docker"),
+                "epoch": _required(data, "epoch"), "build_args": _build_args(data), "output": str(target)}
+        args, outputs = [json.dumps(plan, ensure_ascii=True)], [target]
     elif action in ("build", "check"):
         context = _path(path_value(data, "context", required=True))
         if not context.is_dir():
@@ -138,12 +172,7 @@ def command_for(action, data, config, profiles, uploaded_package=None):
             value = path_value(data, key)
             if value and (key == "dockerfile" or action == "build"):
                 args.append("--" + key + "=" + str(_path(value)))
-        raw_args = data.get("build-args", "")
-        if len(raw_args) > 8192:
-            raise BuildError("构建参数太长")
-        build_args = [line.strip() for line in raw_args.splitlines() if line.strip()]
-        arguments(build_args)
-        args += ["--build-arg=" + item for item in build_args]
+        args += ["--build-arg=" + item for item in _build_args(data)]
         if action == "check":
             args.append("--check")
         else:
@@ -207,6 +236,25 @@ def command_for(action, data, config, profiles, uploaded_package=None):
             outputs = [target]
         elif _required(data, "confirm") != reference:
             raise BuildError("Confirm removal by entering the exact image reference again")
+    elif action in ("rootfs-export", "rootfs-import"):
+        archive = _path(path_value(data, "archive", required=True))
+        if not archive.is_file():
+            raise BuildError("请选择已有的归档文件")
+        target = _target(data)
+        args = ["export" if action == "rootfs-export" else "import", "--output=" + str(target)] + common + progress
+        if action == "rootfs-export":
+            tag = _text(data, "tag")
+            if tag:
+                args.append("--tag=" + tag)
+            args += ["--", str(archive)]
+        else:
+            args += ["--format=" + _choice(data, "format", ("docker", "oci"), "docker")]
+            epoch = _text(data, "epoch")
+            if epoch:
+                args.append("--source-date-epoch=" + epoch)
+            args += ["--change=" + line for line in rootfs_changes(data)]
+            args += ["--", str(archive), _required(data, "tag")]
+        outputs = [target]
     elif action in ("load", "inspect", "verify"):
         archive = _path(path_value(data, "archive", required=True))
         if not archive.is_file():
@@ -339,6 +387,8 @@ class Jobs:
                     command = [sys.executable, "-u", str(Path(__file__).with_name(entry))] + job["args"]
                     env = dict(os.environ, PYTHONIOENCODING="utf-8",
                                PYIMAGEBUILDER_BUILD_RECORDS_DIR=str(self.directory))
+                    if job["action"] == "lock-inputs" or (job["action"] == "build" and "--hermetic" in job["args"]):
+                        env["PYTHONHASHSEED"] = "0"
                     process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                                stderr=subprocess.STDOUT, env=env, **options)
                     job["process"] = process

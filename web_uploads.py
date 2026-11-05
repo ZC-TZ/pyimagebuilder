@@ -85,6 +85,8 @@ class FastUploads:
             stored_name = "dist.zip" if name == "dist.zip" else "package.war"
         elif kind == "archive" and name.endswith(".tar"):
             stored_name = "image.tar"
+        elif kind == "rootfs" and name.endswith((".tar", ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz")):
+            stored_name = "rootfs.tar"
         elif kind == "dockerfile" and size <= 1024 ** 2:
             stored_name = "Dockerfile"
         else:

@@ -16,6 +16,7 @@ from image_cli import (_select_tag, history_archive, load_archive, tag_archive,
 from image_reader import ImageArchiveReader
 from oci_writer import OCIImageWriter
 from registry import parse_reference, push, push_index
+from rootfs_archive import export_rootfs, flatten_image
 from settings import cache_directory, load_settings, repository_settings
 from web_artifacts import verified_artifact
 from web_jobs import file_stamp, open_artifact
@@ -106,6 +107,15 @@ def _deliver_index(plan, settings):
 
 def execute(plan):
     action = plan["action"]
+    if action == "lock-inputs":
+        from build_args import arguments
+        from hermetic import write_lock
+        sources = {key.replace("-", "_"): Path(path) for key, path in plan["sources"].items()}
+        output = write_lock(Path(plan["output"]), Path(plan["dockerfile"]), Path(plan["context"]),
+                            tag=plan["tag"], target_platform=plan["platform"], target_stage=plan["target"],
+                            image_format=plan["format"], source_date_epoch=plan["epoch"],
+                            build_args=arguments(plan["build_args"]), **sources)
+        return {"tag": plan["tag"], "output": str(output)}
     if action == "attest-verify":
         from attest import verify_bundle
         inputs = {name.replace("-", "_"): path for name, path in plan["inputs"].items()}
@@ -151,9 +161,11 @@ def execute(plan):
         if action == "save":
             output = cas.export_docker(tag, plan["output"], platform, plan["source"])
             return {"tag": tag, "platform": platform, "source": plan["source"], "output": str(output)}
+        if action == "rootfs-export":
+            return export_rootfs(tag, plan["output"], platform=platform, store=store, kind=plan["source"])
         if action == "flatten":
-            from rootfs_archive import flatten_image
-            return flatten_image(tag, plan["output"], platform=platform, store=store, kind=plan["source"])
+            return flatten_image(tag, plan["output"], platform=platform, store=store, kind=plan["source"],
+                                 changes=plan["changes"])
         if action in ("history", "analyze", "optimize"):
             with tempfile.TemporaryDirectory(prefix="pyimagebuilder-delivery-cas-") as temporary:
                 archive = cas.export_docker(tag, Path(temporary) / "source.tar", platform, plan["source"])
@@ -190,10 +202,11 @@ def execute(plan):
         if action == "analyze":
             return analyze_image(path, tag)
         return optimize_image(path, plan["output"], tag)
+    if action == "rootfs-export":
+        return export_rootfs(path, plan["output"], tag=tag, platform=platform)
     if action == "flatten":
-        from rootfs_archive import flatten_image
         result = flatten_image(path, plan["output"], tag=tag, platform=platform,
-                               format="oci" if is_oci else "docker")
+                               format="oci" if is_oci else "docker", changes=plan["changes"])
         result.update(before_bytes=stamp[2], after_bytes=Path(plan["output"]).stat().st_size)
         result["saved_bytes"] = result["before_bytes"] - result["after_bytes"]
         return result

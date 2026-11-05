@@ -12,7 +12,7 @@ from path_policy import host_components, output_path, resolve_host_path
 def browse(data):
     mode = data.get("mode")
     initial = data.get("initial", "")
-    if (set(data) - {"path", "filter", "mode", "base", "initial"} or mode not in ("directory", "file", "output")
+    if (set(data) - {"path", "filter", "mode", "base", "initial"} or mode not in ("directory", "file", "output", "output-json")
             or initial not in ("", "1")):
         raise BuildError("无效的路径浏览请求")
     raw = data.get("path", "")
@@ -26,7 +26,7 @@ def browse(data):
     except RuntimeError as exc:
         raise BuildError("无法展开所填路径") from exc
     directory = start
-    if initial and mode in ("file", "output") and not start.is_dir():
+    if initial and mode in ("file", "output", "output-json") and not start.is_dir():
         directory = start.parent
     if not directory.is_dir():
         raise BuildError("目录不存在：" + str(directory))
@@ -52,17 +52,17 @@ def browse(data):
                         for kind, _, name, path in items[:200]]}
 
 
-def selected_output(directory, filename):
+def selected_output(directory, filename, suffix=".tar"):
     if (not filename or filename in (".", "..") or "/" in filename or "\\" in filename or
             any(ord(char) < 32 or ord(char) == 127 for char in filename)):
-        raise BuildError("请输入有效的 tar 文件名")
+        raise BuildError("请输入有效的输出文件名")
     host_components([filename])
     parent = resolve_host_path(directory)
     if not parent.is_dir():
         raise BuildError("所选输出目录已不存在")
     path = output_path(parent / filename)
-    if path.suffix.lower() != ".tar" or path.exists():
-        raise BuildError("请选择尚不存在的 .tar 文件：" + str(path))
+    if path.suffix.lower() != suffix or path.exists():
+        raise BuildError("请选择尚不存在的 {} 文件：{}".format(suffix, path))
     return str(path)
 
 
@@ -173,7 +173,8 @@ PATH_SCRIPT = r"""
   });
   apply.addEventListener('click', async () => {
     if (!current) return;
-    if (active.dataset.pathMode !== 'output') {
+    const mode = active.dataset.pathMode;
+    if (mode !== 'output' && mode !== 'output-json') {
       usePath(current.path);
       return;
     }
@@ -181,7 +182,8 @@ PATH_SCRIPT = r"""
     const requestedName = filename.value;
     apply.disabled = true;
     try {
-      const result = await post('choose-output', {path: current.path, filename: requestedName});
+      const result = await post('choose-output', {path: current.path, filename: requestedName,
+        kind: mode === 'output-json' ? 'json' : 'tar'});
       if (id === revision && dialog.open && filename.value === requestedName) usePath(result.path);
     } catch (error) {
       if (id === revision && dialog.open && filename.value === requestedName) browseStatus.textContent = error.message;
@@ -202,9 +204,11 @@ PATH_SCRIPT = r"""
         locationField.value = input.value;
         filter.value = '';
         filename.value = '';
-        el('name-label').hidden = mode !== 'output';
+        const outputMode = mode === 'output' || mode === 'output-json';
+        el('name-label').hidden = !outputMode;
+        filename.placeholder = mode === 'output-json' ? '例如 input-lock.json' : '例如 image.tar';
         apply.hidden = mode === 'file';
-        apply.textContent = mode === 'output' ? '使用输出路径' : '选择当前目录';
+        apply.textContent = outputMode ? '使用输出路径' : '选择当前目录';
         dialog.showModal();
         browse(input.value, true);
       });
@@ -253,7 +257,7 @@ PATH_SCRIPT = r"""
       const file = files[0];
       const accepted = kind === 'dockerfile' || (kind === 'package'
         ? /\.war$/i.test(file.name) || file.name.toLowerCase() === 'dist.zip'
-        : /\.tar$/i.test(file.name));
+        : kind === 'rootfs' ? /\.(tar(\.gz|\.bz2|\.xz)?|tgz)$/i.test(file.name) : /\.tar$/i.test(file.name));
       if (files.length !== 1 || !accepted) {
         failed(kind === 'package' ? '请选择一个 WAR 或名为 dist.zip 的文件。' : '请选择一个符合要求的文件。');
         return;
@@ -311,8 +315,15 @@ PATH_SCRIPT = r"""
   for (const form of forms) {
     let submitting = false;
     form.addEventListener('submit', event => {
+      const invalidFile = Array.from(form.querySelectorAll('[data-upload-kind] input:not([type])'))
+        .find(input => input.validity.customError);
       if (submitting || form.querySelector('[data-staging]')) {
         event.preventDefault();
+        return;
+      }
+      if (invalidFile) {
+        event.preventDefault();
+        invalidFile.reportValidity();
         return;
       }
       submitting = true;

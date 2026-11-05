@@ -364,9 +364,15 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                     if route == "/reuse":
                         if not job.get("form"):
                             return self._reply(404, "No reusable form")
+                        action, draft = job["action"], job["form"]
+                        if action == "lock-inputs":
+                            action = "build"
+                            draft = {key: value for key, value in draft.items()
+                                     if key not in ("run", "pull", "attest", "input-lock")}
+                            if job["state"] == "success" and job.get("artifacts"):
+                                draft["input-lock"] = job["artifacts"][0]["path"]
                         return self._reply(200, _workbench_page(workspace, "复用构建参数",
-                                           workspace.builds(job["action"], job["form"]),
-                                           fast_script=job["action"] == "fast"), html=True)
+                                           workspace.builds(action, draft), fast_script=action == "fast"), html=True)
                     return self._reply(200, _workbench_page(workspace, "任务详情", workspace.job_page(job),
                                        job_script=not job.get("archived")), html=True)
             except (BuildError, OSError, ValueError) as exc:
@@ -390,9 +396,10 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                     if route == "/browse-path":
                         result = browse(fields)
                     else:
-                        if set(fields) != {"path", "filename"}:
+                        kind = fields.pop("kind", "tar")
+                        if set(fields) != {"path", "filename"} or kind not in ("tar", "json"):
                             raise ValueError("无效的输出路径")
-                        result = {"path": selected_output(fields["path"], fields["filename"])}
+                        result = {"path": selected_output(fields["path"], fields["filename"], "." + kind)}
                     return self._json(200, result)
                 except (BuildError, OSError, ValueError) as exc:
                     return self._json(400, {"error": str(exc)})
@@ -405,7 +412,7 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                     kind = "package"
                     if route == "/upload-path":
                         kind, = fields.get("kind", [])
-                        if kind not in ("package", "archive", "dockerfile", "amd64", "arm64"):
+                        if kind not in ("package", "archive", "rootfs", "dockerfile", "amd64", "arm64"):
                             raise ValueError("不支持的文件用途")
                     lengths = self.headers.get_all("Content-Length") or []
                     if (len(lengths) != 1 or not lengths[0].isascii() or not lengths[0].isdecimal() or

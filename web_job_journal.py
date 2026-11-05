@@ -26,11 +26,17 @@ STATES = ("queued", "running", "success", "failed", "cancelled")
 
 
 def form_snapshot(action, data):
+    if action == "lock-inputs":
+        action = "build"
     return {key: data[key] for key in FORM_FIELDS.get(action, ())
             if isinstance(data.get(key), str) and len(data[key]) <= 4096}
 
 
-def artifact_records(value):
+def task_artifact_suffixes(action):
+    return (".json",) if action == "lock-inputs" else TASK_ARTIFACT_SUFFIXES
+
+
+def artifact_records(value, action):
     if not isinstance(value, list):
         return []
     records = []
@@ -39,7 +45,7 @@ def artifact_records(value):
             continue
         path, size, digest = item.get("path"), item.get("bytes"), item.get("sha256")
         if (isinstance(path, str) and 0 < len(path) <= 4096 and "\0" not in path and
-                Path(path).is_absolute() and path.lower().endswith(TASK_ARTIFACT_SUFFIXES) and
+                Path(path).is_absolute() and path.lower().endswith(task_artifact_suffixes(action)) and
                 type(size) is int and size >= 0 and isinstance(digest, str) and ARTIFACT_DIGEST.fullmatch(digest)):
             records.append({"path": path, "bytes": size, "sha256": digest})
     return records
@@ -61,7 +67,7 @@ class JobJournal:
         if "elapsed" in job:
             item["elapsed"] = job["elapsed"]
         if job["state"] == "success" and job.get("artifacts"):
-            item["artifacts"] = artifact_records(job["artifacts"])
+            item["artifacts"] = artifact_records(job["artifacts"], job["action"])
         self.directory.mkdir(parents=True, exist_ok=True)
         fd, pending = tempfile.mkstemp(prefix=".web-job-", suffix=".part", dir=self.directory)
         try:
@@ -90,7 +96,8 @@ class JobJournal:
             item["form"] = form_snapshot(item["action"], item["form"])
             if type(item.get("elapsed")) is not int or item["elapsed"] < 0:
                 item.pop("elapsed", None)
-            item["artifacts"] = artifact_records(item.get("artifacts")) if item["state"] == "success" else []
+            item["artifacts"] = (artifact_records(item.get("artifacts"), item["action"])
+                                 if item["state"] == "success" else [])
             return item
         except (OSError, ValueError, RecursionError):
             return None

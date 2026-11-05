@@ -16,13 +16,13 @@ from image_store import _archive_path
 from settings import cache_directory
 from web_artifacts import artifact_state
 from web_delivery_worker import push_destination
-from web_jobs import PLATFORMS, _required, _target, file_stamp, open_artifact
+from web_jobs import PLATFORMS, _required, _target, file_stamp, open_artifact, rootfs_changes
 
 
 DELIVERY_ACTIONS = {"verify": "校验", "load": "导入镜像库", "tag": "改标签并另存",
                     "push": "推送到 Registry / Harbor", "save": "导出 Docker tar",
                     "history": "镜像层历史", "analyze": "大层与重复文件分析",
-                    "optimize": "优化并另存", "flatten": "扁平化并另存"}
+                    "optimize": "优化并另存", "flatten": "扁平化并另存", "rootfs-export": "导出 rootfs"}
 
 
 def _key(parts):
@@ -99,10 +99,10 @@ class Delivery:
         if selected["format"] == "oci-index":
             return ("verify", "push")
         if selected["format"] == "cas":
-            return ("verify", "save", "history", "analyze", "optimize", "flatten")
+            return ("verify", "save", "history", "analyze", "optimize", "flatten", "rootfs-export")
         if selected["format"] == "oci":
-            return ("verify", "load", "push", "history", "analyze", "optimize", "flatten")
-        return ("verify", "load", "tag", "push", "history", "analyze", "optimize", "flatten")
+            return ("verify", "load", "push", "history", "analyze", "optimize", "flatten", "rootfs-export")
+        return ("verify", "load", "tag", "push", "history", "analyze", "optimize", "flatten", "rootfs-export")
 
     def plan(self, data):
         selected = self.select(data)
@@ -118,8 +118,10 @@ class Delivery:
                 result["stamp"] = file_stamp(os.fstat(stream.fileno()))
         else:
             result["source"] = selected["source"]
-        if action in ("tag", "save", "optimize", "flatten"):
+        if action in ("tag", "save", "optimize", "flatten", "rootfs-export"):
             result["output"] = str(_target(data))
+        if action == "flatten":
+            result["changes"] = rootfs_changes(data)
         if action == "tag":
             new_tag = _required(data, "new-tag")
             _check_tag(new_tag)

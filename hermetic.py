@@ -314,6 +314,21 @@ def build_locked(lock_path, dockerfile, context, base_tar, base_map, tag, output
     return output, report_path
 
 
+def write_lock(output, dockerfile, context, base_tar=None, base_map=None, **options):
+    output = output_path(output)
+    if _inside(output, context) or output.exists():
+        raise BuildError("Input lock must be a new file outside context")
+    lock = make_lock(dockerfile, context, base_tar, base_map, **options)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with publication_transaction() as published, \
+            tempfile.TemporaryDirectory(prefix="pyib-input-lock-", dir=output.parent) as temporary:
+        pending = Path(temporary) / "input-lock.json"
+        pending.write_bytes(_json(lock) + b"\n")
+        publish_new_file(pending, output)
+        published.append(output)
+    return output
+
+
 def main(argv=None):
     """独立脚本入口：生成封闭构建的输入锁文件。"""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -332,20 +347,14 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True, help="New input-lock JSON path")
     args = parser.parse_args(argv)
     try:
-        args.output = output_path(args.output)
-        if _inside(args.output, args.context) or args.output.exists():
-            raise BuildError("Input lock must be a new file outside context")
-        lock = make_lock(args.dockerfile, args.context, args.base_tar, args.base_map,
+        output = write_lock(args.output, args.dockerfile, args.context, args.base_tar, args.base_map,
                          tag=args.tag, target_platform=args.platform,
                          target_stage=args.target, image_format=args.format,
                          source_date_epoch=args.source_date_epoch,
                          build_args=arguments(args.build_arg))
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        with open(args.output, "xb") as stream:
-            stream.write(_json(lock) + b"\n")
     except (BuildError, OSError) as exc:
         parser.exit(1, "Lock failed: {}\n".format(exc))
-    print("Created {}".format(args.output.resolve()))
+    print("Created {}".format(output))
     return 0
 
 

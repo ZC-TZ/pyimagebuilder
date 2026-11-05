@@ -7,6 +7,7 @@ import os
 import re
 import socket
 import struct
+import tarfile
 import tempfile
 import threading
 import time
@@ -600,6 +601,11 @@ class WorkbenchTests(unittest.TestCase):
         _, job = self.run_request("/delivery/prepare", {
             "scope": "library", "id": item["id"], "action": "save", "output": str(target)})
         self.assertEqual(self.http("/download?id=" + job + "&file=0")[2], target.read_bytes())
+        from_oci, from_cas = self.root / "oci-rootfs.tar", self.root / "cas-rootfs.tar"
+        self.run_request("/delivery/prepare", dict(source, action="rootfs-export", output=str(from_oci)))
+        self.run_request("/delivery/prepare", {"scope": "library", "id": item["id"],
+                         "action": "rootfs-export", "output": str(from_cas)})
+        self.assertEqual(from_cas.read_bytes(), from_oci.read_bytes())
 
     def configured_registry(self):
         class LocalRegistry(RegistryHandler):
@@ -837,11 +843,80 @@ class WorkbenchTests(unittest.TestCase):
         self.assertIn("archive_bytes", self.workspace.jobs.snapshot(analysis)["metrics"])
         for action in ("optimize", "flatten"):
             output = self.root / (action + ".tar")
-            route, identity = self.run_request("/delivery/prepare", dict(source, action=action, output=str(output)))
+            form = dict(source, action=action, output=str(output))
+            if action == "flatten":
+                form["changes"] = "ENV FLATTENED=yes"
+            route, identity = self.run_request("/delivery/prepare", form)
             metrics = self.workspace.jobs.snapshot(identity)["metrics"]
             self.assertEqual(metrics["before_bytes"], original.stat().st_size)
             self.assertEqual(metrics["after_bytes"], output.stat().st_size)
             self.assertIn("体积差", self.http(route)[2].decode("utf-8"))
+            if action == "flatten":
+                from image_cli import inspect_archive
+                self.assertIn("FLATTENED=yes", inspect_archive(output)["config"]["Env"])
+
+    def test_rootfs_export_and_compressed_upload_import(self):
+        import gzip
+        from image_cli import inspect_archive
+
+        original, source = self.built_delivery()
+        menu = self.http("/delivery?" + urlencode(source))[2]
+        self.assertIn("导出 rootfs".encode(), menu)
+        self.assertIn(b'data-upload-kind="rootfs"', self.http("/images")[2])
+        rootfs = self.root / "rootfs.tar"
+        _, identity = self.run_request("/delivery/prepare", dict(source, action="rootfs-export", output=str(rootfs)))
+        self.assertEqual(self.http("/download?id=" + identity + "&file=0")[2], rootfs.read_bytes())
+        with tarfile.open(rootfs, "r:") as archive:
+            self.assertEqual(archive.extractfile("contents").read(), b"contents for registry")
+            self.assertNotIn("manifest.json", archive.getnames())
+        direct = self.root / "direct-rootfs.tar"
+        self.run_job("rootfs-export", {"archive": str(original), "output": str(direct)})
+        self.assertEqual(direct.read_bytes(), rootfs.read_bytes())
+
+        status, raw = self.upload_package("rootfs.tar.gz", gzip.compress(rootfs.read_bytes()), kind="rootfs")
+        self.assertEqual(status, 200, raw)
+        output = self.root / "imported.tar"
+        self.run_job("rootfs-import", {"archive-upload": json.loads(raw)["token"], "output": str(output),
+                                     "tag": "rootfs:1", "changes": 'ENV PROFILE=local\nCMD ["bin/start"]'})
+        self.assertFalse(self.workspace.uploads.entries)
+        config = inspect_archive(output)["config"]
+        self.assertIn("PROFILE=local", config["Env"])
+        self.assertEqual(config["Cmd"], ["bin/start"])
+        rejected = self.root / "bad-rootfs.tar"
+        self.run_request("/submit/rootfs-import", {"archive": str(rootfs), "output": str(rejected),
+                         "tag": "rootfs:1", "changes": "RUN touch /unexpected"}, expected="failed")
+        self.assertFalse(rejected.exists())
+
+    def test_generate_lock_download_and_build_with_same_inputs(self):
+        context = self.root / "locked-context"
+        context.mkdir()
+        (context / "Dockerfile").write_text("FROM scratch\nARG NOTE\nLABEL test=$NOTE\n", encoding="utf-8")
+        lock = self.root / "input-lock.json"
+        output = self.root / "locked.tar"
+        fields = {"context": str(context), "tag": "locked:1", "epoch": "100", "build-args": "NOTE=web-lock"}
+        self.assertIn(b'/submit/lock-inputs"', self.http("/workbench")[2])
+        self.assertEqual(self.http("/submit/lock-inputs", dict(fields, **{
+            "lock-output": str(context / "inside.json")}))[0], 400)
+        status, _, body = self.http("/choose-output", {"path": str(self.root), "filename": lock.name, "kind": "json"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(Path(json.loads(body)["path"]), lock)
+        with patch.dict(os.environ, {"PYTHONHASHSEED": "123"}):
+            _, identity = self.run_job("lock-inputs", dict(fields, **{"lock-output": str(lock)}))
+            original = lock.read_bytes()
+            self.assertEqual(json.loads(original)["parameters"]["buildArgNames"], ["NOTE"])
+            self.assertNotIn(b"web-lock", original)
+            with self.workspace.jobs.condition:
+                del self.workspace.jobs.jobs[identity]
+            self.assertEqual(self.http("/download?id=" + identity + "&file=0")[2], original)
+            reuse = self.http("/reuse?id=" + identity)[2]
+            self.assertIn(str(lock).encode(), reuse)
+            self.assertNotIn(b"NOTE=web-lock", reuse)
+            self.run_job("build", dict(fields, output=str(output), **{"input-lock": str(lock)}))
+        from image_cli import inspect_archive
+        self.assertEqual(inspect_archive(output)["config"]["Labels"]["test"], "web-lock")
+        self.assertTrue(Path(str(output) + ".hermetic.json").is_file())
+        self.assertEqual(self.http("/submit/lock-inputs", dict(fields, **{"lock-output": str(lock)}))[0], 400)
+        self.assertEqual(lock.read_bytes(), original)
 
     def test_advanced_build_attest_and_multiarch_outputs(self):
         from attest import keygen
@@ -881,7 +956,6 @@ class WorkbenchTests(unittest.TestCase):
         output = self.root / "combined.oci.tar"
         wrong = Path(archives["amd64"]).read_bytes()
         self.assertEqual(self.upload_package("wrong.tar", wrong, kind="arm64")[0], 400)
-        import tarfile
         mislabeled = io.BytesIO()
         with tarfile.open(fileobj=io.BytesIO(wrong), mode="r:") as source, \
                 tarfile.open(fileobj=mislabeled, mode="w:") as target:
@@ -902,7 +976,6 @@ class WorkbenchTests(unittest.TestCase):
             tokens[arch + "-upload"] = json.loads(raw)["token"]
         _, multi_job = self.run_job("multiarch", dict(tokens, tag="multi:1", output=str(output), epoch="100"))
         self.assertFalse(self.workspace.uploads.entries)
-        import tarfile
         with tarfile.open(output, "r:") as bundle:
             index = json.load(bundle.extractfile("index.json"))
         self.assertEqual({item["platform"]["architecture"] for item in index["manifests"]}, {"amd64", "arm64"})
