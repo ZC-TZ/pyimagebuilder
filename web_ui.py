@@ -136,6 +136,10 @@ li+li{margin-top:6px}
 .state[data-state=success]{background:#e5f5ee;color:#17684a}
 .state[data-state=failed],.state[data-state=changed],.state[data-state=unsafe]{background:#fcecef;color:#912f43}
 .state[data-state=running],.state[data-state=available]{background:#e9f1ff;color:#2456a5}
+.state[data-state=running]::before{content:"";width:12px;height:12px;flex:none;box-sizing:border-box;
+  border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:job-spin .85s linear infinite}
+@keyframes job-spin{to{transform:rotate(1turn)}}
+@media(prefers-reduced-motion:reduce){.state[data-state=running]::before{animation:none}}
 .state[data-state=queued],.state[data-state=unverified]{background:#fff2de;color:#795018}
 .state[data-state=cancelled],.state[data-state=missing],.state[data-state=unknown],.state[data-state=unreadable]{background:#edf0f5;color:#4d5d73}
 .meta{display:flex;gap:4px 13px;flex-wrap:wrap;font-size:13px;overflow-wrap:anywhere}
