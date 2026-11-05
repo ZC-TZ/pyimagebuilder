@@ -44,7 +44,7 @@ from file_publish import publication_transaction, publish_new_file
 from path_policy import archive_path, host_components, output_path
 from errors import ArchiveError, BuildError
 from progress.layers import LayerProgress
-from image_reader import read_image_json_file, verify_layer_tar
+from image_reader import DigestReader, read_image_json_file, verify_layer_tar
 from reproducible import TAR_COPY_BUFFER
 
 
@@ -178,27 +178,6 @@ class CountingReader(object):
         if data:
             self.stats.add(len(data))
         return data
-
-
-class DigestReader(object):
-    """边读取边计算压缩 blob 摘要，避免 gzip 解压后再完整扫描源文件。"""
-
-    def __init__(self, raw):
-        self.raw = raw
-        self.digest = hashlib.sha256()
-
-    def read(self, size=-1):
-        """在 gzip 解压器读取压缩输入时同步计算原始 blob 摘要。"""
-        data = self.raw.read(size)
-        if data:
-            self.digest.update(data)
-        return data
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args):
-        return False
 
 
 def _http_origin(url):

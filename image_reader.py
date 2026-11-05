@@ -1,6 +1,7 @@
 """读取本地 Docker save 归档，验证配置和未压缩层的 DiffID。"""
 
 import errno
+import gzip
 import hashlib
 import json
 import os
@@ -16,7 +17,7 @@ from errors import ArchiveError, BaseImageNotFound, BuildError
 from permissions import validate_metadata
 from path_policy import archive_path
 from compat import is_linked_directory
-from file_resources import fdopen_owned
+from file_resources import fdopen_owned, open_regular_file
 from cache_identity import file_identity, stat_identity
 from platforms import architecture, normalize_platform
 from progress.layers import LayerProgress
@@ -50,6 +51,52 @@ def sha256_file(path, progress=None):
             if progress is not None:
                 progress(processed)
     return value.hexdigest()
+
+
+class DigestReader:
+    """对解码器实际读到的传输字节计算摘要，不以另一次按路径校验代替。"""
+    def __init__(self, raw):
+        self.raw = raw
+        self.digest = hashlib.sha256()
+        self.current = 0
+
+    def read(self, size=-1):
+        data = self.raw.read(size)
+        self.digest.update(data)
+        self.current += len(data)
+        return data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+def copy_verified_gzip_blob(blob, target, expected_digest, expected_size=None, progress=None):
+    """以同一输入句柄同步解压和核对传输摘要，target 是调用方管理的私有流。
+
+    调用方仍需验证未压缩 DiffID 和 tar 结构，全部成功后才可发布引用或归档。
+    路径替换不会切换已打开的输入；原地修改产生的实际字节也必须匹配 descriptor。
+    """
+    expected = digest_hex(expected_digest)
+    copied = 0
+    with open_regular_file(Path(blob)) as raw:
+        incoming = DigestReader(raw)
+        with gzip.open(incoming, "rb") as decoded:
+            for block in iter(lambda: decoded.read(BUFFER), b""):
+                target.write(block)
+                copied += len(block)
+                if progress is not None:
+                    progress(copied)
+        # gzip 的读前缓冲与尾部零填充同样属于 Registry 传输身份。
+        for _ in iter(lambda: incoming.read(BUFFER), b""):
+            pass
+        if incoming.digest.hexdigest() != expected:
+            raise ArchiveError("Compressed layer blob SHA-256 mismatch")
+        if expected_size is not None and incoming.current != expected_size:
+            raise ArchiveError("Compressed layer blob size mismatch")
+    return copied
 
 
 def verified_layer_identity(path, expected, identity):

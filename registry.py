@@ -27,6 +27,7 @@ from path_policy import output_path
 from errors import ArchiveError, BuildError
 from cas_store import docker_archive_tag
 from image_reader import (BaseImage, ImageArchiveReader, archive_members, digest_hex,
+                          copy_verified_gzip_blob,
                           image_history, image_json_bytes, parse_image_json, read_image_json_file,
                           same_json_value, sha256_file, verify_layer_tar)
 from image_writer import ImageArchiveWriter
@@ -536,15 +537,16 @@ def pull(reference, output, username=None, password=None, ca_file=None,
                 compressed = workspace / ("download-{}.blob".format(index))
                 layer = workspace / ("layer-{}.tar".format(index))
                 if descriptor["mediaType"] == LAYER_TYPE:
+                    if digest_hex(descriptor["digest"]) != digest_hex(diff_id):
+                        raise BuildError("Uncompressed Registry layer digest must equal DiffID")
                     os.replace(compressed, layer)
+                    if layer.stat().st_size != descriptor["size"]:
+                        raise BuildError("Registry layer size changed after download")
                 else:
                     try:
-                        with gzip.open(compressed, "rb") as source, open(layer, "wb") as target:
-                            copied = 0
-                            for block in iter(lambda: source.read(BUFFER), b""):
-                                target.write(block)
-                                copied += len(block)
-                                task.update(copied)
+                        with open(layer, "wb") as target:
+                            copy_verified_gzip_blob(compressed, target, descriptor["digest"],
+                                                    descriptor["size"], progress=task.update)
                     except (OSError, EOFError, zlib.error) as exc:
                         raise BuildError("Invalid compressed Registry layer: " + str(exc)) from exc
                 if sha256_file(layer) != digest_hex(diff_id):

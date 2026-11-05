@@ -24,6 +24,7 @@ from cache_identity import file_identity, stat_identity
 from progress.layers import LayerProgress
 from errors import ArchiveError, BuildError
 from image_reader import (MAX_JSON, BaseImage, ImageArchiveReader, archive_members, digest_hex,
+                          copy_verified_gzip_blob,
                           image_history, parse_image_json, read_image_json_file, same_json_value, sha256_file,
                           verified_layer_identity, verify_layer_tar)
 from image_writer import ImageArchiveWriter
@@ -35,6 +36,8 @@ from file_publish import LINK_FALLBACK, publication_transaction, publish_new_fil
 
 
 SCHEMA_VERSION = 1
+# 旧 true 标记未证明解码与传输摘要来自同一次读取，首次使用需离线补验。
+DIFF_ID_VERIFICATION_VERSION = 2
 BUFFER = 4 * 1024 * 1024
 
 
@@ -342,6 +345,7 @@ class CASStore:
                            "mediaType": media_type, "size": size})
             if verified_diff_ids:
                 layers[-1]["diff_id_verified"] = True
+                layers[-1]["diff_id_verification_version"] = DIFF_ID_VERIFICATION_VERSION
         return self._publish(reference, platform, source, config_digest, layers,
                              replace, manifest_raw)
 
@@ -465,7 +469,10 @@ class CASStore:
                         type(item.get("size")) is not int or item["size"] < 0 or
                         not isinstance(item.get("mediaType"), str) or
                         not item["mediaType"] or
-                        ("diff_id_verified" in item and type(item["diff_id_verified"]) is not bool)):
+                        ("diff_id_verified" in item and type(item["diff_id_verified"]) is not bool) or
+                        ("diff_id_verification_version" in item and
+                         (type(item["diff_id_verification_version"]) is not int or
+                          item["diff_id_verification_version"] < 1))):
                     raise ArchiveError("CAS ref has invalid layer descriptor")
                 digest_hex(item["diff_id"])
             digests = [value["manifest"], value["config"]] + [item["digest"] for item in value["layers"]]
@@ -581,9 +588,8 @@ class CASStore:
                 elif media_type.endswith("+gzip") or media_type.endswith(".gzip"):
                     layer = Path(temporary) / ("layer-{}.tar".format(index))
                     try:
-                        with gzip.open(blob, "rb") as source_stream, open(layer, "wb") as target:
-                            for block in iter(lambda: source_stream.read(BUFFER), b""):
-                                target.write(block)
+                        with open(layer, "wb") as target:
+                            copy_verified_gzip_blob(blob, target, item["digest"], item["size"])
                     except (OSError, EOFError, zlib.error) as exc:
                         raise ArchiveError("Cannot decompress CAS layer: " + str(exc)) from exc
                 else:
@@ -618,6 +624,7 @@ class CASStore:
             updated = dict(value, layers=[dict(item) for item in value["layers"]])
             for index in indices:
                 updated["layers"][index]["diff_id_verified"] = True
+                updated["layers"][index]["diff_id_verification_version"] = DIFF_ID_VERIFICATION_VERSION
             self._publish_ref(updated, replace=True)
 
     def open_base(self, reference, platform="linux/amd64", source=None, reporter=None):
@@ -644,8 +651,10 @@ class CASStore:
         checking = LayerProgress("verify", len(value["layers"]), reporter, source="cas", image=reference)
         for index, item in enumerate(value["layers"]):
             with checking.layer(index + 1, item["diff_id"]) as task:
+                verified_binding = (item.get("diff_id_verified") is True and
+                                    item.get("diff_id_verification_version") == DIFF_ID_VERIFICATION_VERSION)
                 task.cached = (self._blob(item["diff_id"]).is_file() and
-                               (item["mediaType"].endswith(".tar") or item.get("diff_id_verified") is True))
+                               (item["mediaType"].endswith(".tar") or verified_binding))
                 media_type = item["mediaType"]
                 diff_id = item["diff_id"]
                 digest_hex(diff_id)
@@ -661,18 +670,14 @@ class CASStore:
                     layer = self._blob(diff_id)
                 elif media_type.endswith("+gzip") or media_type.endswith(".gzip"):
                     layer = self._blob(diff_id)
-                    if not layer.is_file() or item.get("diff_id_verified") is not True:
+                    if not layer.is_file() or not verified_binding:
                         self.blobs.mkdir(parents=True, exist_ok=True)
                         descriptor, pending = tempfile.mkstemp(prefix="decoded-", suffix=".part",
                                                                 dir=self.blobs)
                         try:
-                            with fdopen_owned(descriptor, "wb") as target, \
-                                    gzip.open(self._blob(item["digest"]), "rb") as source_stream:
-                                copied = 0
-                                for block in iter(lambda: source_stream.read(BUFFER), b""):
-                                    target.write(block)
-                                    copied += len(block)
-                                    task.update(encoded_size + copied, task.amount)
+                            with fdopen_owned(descriptor, "wb") as target:
+                                copy_verified_gzip_blob(blob, target, item["digest"], item["size"],
+                                    progress=lambda copied: task.update(encoded_size + copied, task.amount))
                             # 即使同 DiffID 的旧文件存在，也必须验证新解码结果，
                             # 否则仅复用旧解码层会掩盖错误的 blob→DiffID 对应关系。
                             self.store_decoded_layer(pending, diff_id, owned=True)
