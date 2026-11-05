@@ -1,5 +1,6 @@
 """执行网页交付任务；源归档和目标由工作台确认后传入。"""
 
+import hashlib
 import json
 import os
 import shutil
@@ -14,7 +15,7 @@ from image_cli import (_select_tag, history_archive, load_archive, tag_archive,
                        verify_archive)
 from image_reader import ImageArchiveReader
 from oci_writer import OCIImageWriter
-from registry import parse_reference, push
+from registry import parse_reference, push, push_index
 from settings import cache_directory, load_settings, repository_settings
 from web_artifacts import verified_artifact
 from web_jobs import file_stamp, open_artifact
@@ -62,6 +63,47 @@ def _verify_oci(path, tag, platform):
     return {"archive": str(path), "tag": tag, "platform": platform, "format": "oci"}
 
 
+def _deliver_index(plan, settings):
+    from multiarch import verify
+    item = plan["record"]
+    path = Path(item["path"])
+    tag = plan["tag"]
+    if plan["action"] == "verify":
+        _, stream = verified_artifact(item)
+        if stream is None:
+            raise BuildError("多架构归档已移走或摘要不匹配")
+        with stream:
+            verify(path, tag, fileobj=stream)
+        return {"tag": tag, "platforms": ["linux/amd64", "linux/arm64"], "result": "校验通过"}
+
+    destination = push_destination(settings, plan["destination"])
+    connection = repository_settings(settings, destination)
+    password = (os.environ.get(connection.get("passwordEnv", "PYIMAGEBUILDER_REGISTRY_PASSWORD"))
+                if connection.get("username") is not None else None)
+    print("正在核对多架构归档摘要…", flush=True)
+    with tempfile.TemporaryDirectory(prefix="pyimagebuilder-deliver-index-") as temporary:
+        snapshot = Path(temporary) / "multi.oci.tar"
+        digest = hashlib.sha256()
+        remaining = item["bytes"]
+        with open_artifact(path) as source, snapshot.open("xb") as target:
+            if os.fstat(source.fileno()).st_size != remaining:
+                raise BuildError("多架构归档大小已变更")
+            while remaining:
+                block = source.read(min(remaining, 4 * 1024 * 1024))
+                if not block:
+                    raise BuildError("多架构归档在读取期间被截断")
+                digest.update(block)
+                target.write(block)
+                remaining -= len(block)
+        if "sha256:" + digest.hexdigest() != item["sha256"]:
+            raise BuildError("多架构归档摘要不匹配")
+        print("正在推送 amd64 和 arm64 到 " + destination, flush=True)
+        result = push_index(snapshot, destination, connection.get("username"), password,
+                            connection.get("caFile"), connection.get("insecureHttp", False),
+                            connection.get("authHost"), overwrite=False, expected_tag=tag)
+    return {"reference": destination, "digest": result, "platforms": ["linux/amd64", "linux/arm64"]}
+
+
 def execute(plan):
     action = plan["action"]
     if action == "multiarch":
@@ -74,12 +116,17 @@ def execute(plan):
         from web_maintenance import test_profile
         return test_profile(Path(plan["config"]), plan["form"], plan["platform"])
     settings, _ = load_settings(plan.get("config"))
+    if action == "repo-test":
+        from web_repository import diagnose
+        return diagnose(settings, plan["host"], plan["reference"])
     if action == "cache-clean":
         from web_maintenance import cache_root, clean_cache
         root = cache_root(settings)
         if str(root) != plan["cache"]:
             raise BuildError("缓存目录已变化，请重新预览")
         return clean_cache(root, plan["days"], plan["fingerprint"])
+    if plan["format"] == "oci-index":
+        return _deliver_index(plan, settings)
     store = cache_directory(settings, "imageStore", None)
     tag, platform = plan["tag"], plan["platform"]
     if plan["format"] == "cas":
@@ -182,7 +229,8 @@ def execute(plan):
 
 def main():
     try:
-        result = execute(json.loads(sys.argv[1]))
+        plan = json.loads(sys.argv[1])
+        result = execute(plan)
         metrics = {key: result[key] for key in ("before_bytes", "after_bytes", "saved_bytes",
                    "archive_bytes", "hidden_file_bytes", "duplicate_groups", "deleted", "bytes")
                    if type(result.get(key)) is int}
@@ -190,7 +238,7 @@ def main():
             metrics["large_layers"] = result["large_layers"][:50]
         if metrics:
             print(json.dumps({"web_metrics": metrics}))
-        print(json.dumps(result, ensure_ascii=True, indent=2))
+        print(json.dumps(result, ensure_ascii=plan["action"] != "repo-test", indent=2))
         return 0
     except (BuildError, OSError, ValueError, KeyError, TypeError, RuntimeError, tarfile.TarError) as exc:
         print("交付任务失败：{}".format(exc), file=sys.stderr)

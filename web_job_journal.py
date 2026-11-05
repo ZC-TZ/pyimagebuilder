@@ -7,11 +7,16 @@ import stat
 import tempfile
 from datetime import datetime, timezone
 
+from pathlib import Path
+
 from compat import unlink_missing
 from file_resources import fdopen_owned
 
 
 IDENTITY = re.compile(r"[0-9a-f]{32}\Z")
+ARTIFACT_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+TASK_ARTIFACT_SUFFIXES = (".tar", ".spdx.json", ".provenance.json", ".dsse.json", ".hermetic.json")
+MAX_JOB_BYTES = 512 * 1024
 FORM_FIELDS = {
     "fast": ("package", "project", "version", "profile", "output", "platform", "format"),
     "build": ("context", "dockerfile", "base-tar", "tag", "output", "platform", "format",
@@ -25,6 +30,21 @@ def form_snapshot(action, data):
             if isinstance(data.get(key), str) and len(data[key]) <= 4096}
 
 
+def artifact_records(value):
+    if not isinstance(value, list):
+        return []
+    records = []
+    for item in value[:8]:
+        if not isinstance(item, dict):
+            continue
+        path, size, digest = item.get("path"), item.get("bytes"), item.get("sha256")
+        if (isinstance(path, str) and 0 < len(path) <= 4096 and "\0" not in path and
+                Path(path).is_absolute() and path.lower().endswith(TASK_ARTIFACT_SUFFIXES) and
+                type(size) is int and size >= 0 and isinstance(digest, str) and ARTIFACT_DIGEST.fullmatch(digest)):
+            records.append({"path": path, "bytes": size, "sha256": digest})
+    return records
+
+
 class JobJournal:
     def __init__(self, directory):
         self.directory = directory / "web-jobs"
@@ -34,10 +54,12 @@ class JobJournal:
         identity = job["id"]
         form = form_snapshot(job["action"], job.get("form", {}))
         item = {"version": 1, "id": identity, "action": job["action"], "state": job["state"],
-                "label": job["label"] if form else "", "form": form,
+                "label": job["label"] if form or job["action"] == "multiarch" else "", "form": form,
                 "updated": datetime.now(timezone.utc).isoformat(timespec="seconds")}
         if "code" in job:
             item["code"] = job["code"]
+        if job["state"] == "success" and job.get("artifacts"):
+            item["artifacts"] = artifact_records(job["artifacts"])
         self.directory.mkdir(parents=True, exist_ok=True)
         fd, pending = tempfile.mkstemp(prefix=".web-job-", suffix=".part", dir=self.directory)
         try:
@@ -55,7 +77,7 @@ class JobJournal:
         path = self.directory / (identity + ".json")
         try:
             info = path.lstat()
-            if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_JOB_BYTES:
                 return None
             item = json.loads(path.read_text(encoding="utf-8"))
             if (not isinstance(item, dict) or item.get("version") != 1 or item.get("id") != identity or
@@ -64,6 +86,7 @@ class JobJournal:
                     not isinstance(item.get("form"), dict)):
                 return None
             item["form"] = form_snapshot(item["action"], item["form"])
+            item["artifacts"] = artifact_records(item.get("artifacts")) if item["state"] == "success" else []
             return item
         except (OSError, ValueError, RecursionError):
             return None

@@ -157,10 +157,10 @@ def combine(amd64_archive, arm64_archive, output, tag, source_date_epoch=0, *, e
     return output
 
 
-def verify(path, expected_tag):
+def verify(path, expected_tag, *, fileobj=None):
     """验证合并归档中的平台描述及其引用的全部 blob。"""
     try:
-        with tarfile.open(path, "r:") as archive:
+        with tarfile.open(path, "r:", fileobj=fileobj) as archive:
             members = archive_members(archive)
             if any(not member.isfile() for member in members.values()):
                 raise ArchiveError("Non-file OCI member")

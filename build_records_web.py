@@ -216,7 +216,7 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                     index = int(index)
                 except ValueError:
                     return self._reply(400, "Invalid artifact selector")
-                return download(self, workspace.jobs.snapshot(identity), index)
+                return download(self, workspace.get_job(identity), index)
             if route == "/history-download" and len(query) <= 200:
                 try:
                     params = parse_qs(query)
@@ -286,7 +286,7 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                     data = {key: values[0] for key, values in fields.items()}
                     return self._reply(200, _workbench_page(workspace, "产物操作",
                                        workspace.delivery_page(data),
-                                       active="history" if data.get("scope") == "history" else "images"), html=True)
+                                       active={"history": "history", "job": "jobs"}.get(data.get("scope"), "images")), html=True)
                 if route == "/space" and len(query) <= 100:
                     fields = parse_qs(query)
                     kind, = fields.get("kind", [None])
@@ -405,7 +405,8 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                     if plan["action"] == "push":
                         return self._reply(200, _workbench_page(workspace, "推送确认",
                                            workspace.push_confirmation(plan),
-                                           active="history" if "record" in plan else "images"), html=True)
+                                           active=("jobs" if plan["format"] == "oci-index" else
+                                                   "history" if "record" in plan else "images")), html=True)
                     identity = workspace.submit_delivery(plan)
                 elif route == "/delivery/confirm" and not query:
                     fields = form_data(self)

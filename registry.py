@@ -749,7 +749,7 @@ def push(archive_path, reference, username=None, password=None, ca_file=None,
 
 
 def push_index(archive_path, reference, username=None, password=None, ca_file=None,
-               insecure_http=False, auth_host=None, overwrite=False):
+               insecure_http=False, auth_host=None, overwrite=False, *, expected_tag=None):
     """上传各平台 manifest，再以一个 tag 发布多平台 OCI index。"""
     from multiarch import verify as verify_multiarch
 
@@ -766,6 +766,8 @@ def push_index(archive_path, reference, username=None, password=None, ca_file=No
             old_tag = index["manifests"][0]["annotations"]["org.opencontainers.image.ref.name"]
     except (tarfile.TarError, KeyError, IndexError, TypeError) as exc:
         raise ArchiveError("Invalid multi-platform OCI archive: " + str(exc)) from exc
+    if expected_tag is not None and old_tag != expected_tag:
+        raise ArchiveError("OCI index tag does not match the selected artifact")
     verify_multiarch(archive_path, old_tag)
     with tempfile.TemporaryDirectory(prefix="pyimagebuilder-push-index-") as temporary:
         with tarfile.open(archive_path, "r:") as archive:

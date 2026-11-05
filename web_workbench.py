@@ -4,7 +4,6 @@ import hmac
 import json
 import os
 import secrets
-import stat
 import sys
 from functools import partial
 from html import escape
@@ -12,10 +11,10 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode
 
 from errors import BuildError
-from web_artifacts import space_report
+from web_artifacts import artifact_state, space_report, verified_artifact
 from web_job_journal import form_snapshot
 from web_delivery import DELIVERY_ACTIONS, Delivery, library_items
-from web_jobs import FORMATS, LABELS, PLATFORMS, Jobs, command_for, fast_plan, file_stamp, open_artifact, path_value
+from web_jobs import FORMATS, LABELS, PLATFORMS, Jobs, command_for, fast_plan, path_value
 from web_maintenance import PROFILE_FIELDS, _revision, cache_fingerprint, cache_plan, cache_root, candidate_profile, save_profile
 from web_ui import HERO, icon
 from web_uploads import FastUploads
@@ -261,7 +260,7 @@ class Workbench:
         self.prefix = "/session/" + secrets.token_urlsafe(24)
         self.config_arg = config if config.is_file() else None
         self.profiles = settings.get("fast", {}).get("profiles", {})
-        self.delivery = Delivery(settings, self.config_arg, directory)
+        self.delivery = Delivery(settings, self.config_arg, directory, self.get_job)
         self.uploads = FastUploads()
         self.jobs = Jobs(directory)
 
@@ -383,6 +382,7 @@ class Workbench:
                     {"": "全部", "archive": "未标注来源的归档"}))
         tools = "".join((
             _section("拉取基础镜像", self.form("pull", reference + platform + _select("source", "来源", source))),
+            self.repository_diagnostics(),
             _section("导入 Docker tar", self.form("load", archive + tag + platform)),
             _section("从镜像库导出 tar", self.form("save", reference + platform +
                      _select("source", "来源", source + ("local",)) + _path_field("output", "输出 tar 路径", required=True, mode="output"))),
@@ -506,7 +506,24 @@ class Workbench:
             sections.append(_section("已配置仓库", _pairs(
                 (_e(host if "@" not in host else "隐藏的仓库地址"), data.get("source", "registry"))
                 for host, data in sorted(sources.items()))))
+            sections.append(self.repository_diagnostics())
         return "".join(sections)
+
+    def repository_diagnostics(self):
+        from registry import parse_reference
+        hosts = []
+        for host in sorted(self.settings.get("repositories", {})):
+            try:
+                parse_reference(host + "/pyimagebuilder/probe:latest")
+            except BuildError:
+                continue
+            hosts.append(host)
+        if not hosts:
+            return ""
+        form = _select("host", "仓库", hosts, hosts[0])
+        form += _input("reference", "远端镜像引用（可选）", "harbor.example/project/app:1")
+        return _section("仓库诊断", '<p class="muted">留空只检查仓库 API。填写镜像引用可检查标签和读取权限。</p>'
+                        + self.form("repo-test", form, "开始诊断"))
 
     def profile_page(self, name=None):
         if name is not None and name not in self.profiles:
@@ -612,12 +629,19 @@ class Workbench:
         if job.get("form") and not running:
             content += '<p><a class="button compact" href="{}/reuse?{}">复用参数</a>　<small>提交前可修改版本或输出。</small></p>'.format(
                 self.prefix, urlencode({"id": identity}))
-        for index, (path, _) in enumerate(job["files"]):
-            content += '<p><a class="button compact" href="{}/download?{}">{}</a>　<code>{}</code></p>'.format(
-                self.prefix, _e(urlencode({"id": identity, "file": index})),
-                "下载归档" if path.suffix.lower() == ".tar" else "下载附属文件", _e(path))
+        artifacts = job.get("artifacts", [])
+        for index, item in enumerate(artifacts):
+            if artifact_state(item, tar_only=False)[0] == "available":
+                content += '<p><a class="button compact" href="{}/download?{}">校验并下载</a>　<code>{}</code></p>'.format(
+                    self.prefix, _e(urlencode({"id": identity, "file": index})), _e(item["path"]))
+            else:
+                content += '<p class="muted">产物已移走或变更 · <code>{}</code></p>'.format(_e(item["path"]))
+        if (state == "success" and job["action"] == "multiarch" and len(artifacts) == 1
+                and artifact_state(artifacts[0])[0] == "available"):
+            content += '<p><a class="button compact" href="{}/delivery?{}">校验并推送多架构镜像</a></p>'.format(
+                self.prefix, _e(urlencode({"scope": "job", "id": identity})))
         if job.get("archived"):
-            content += "<p>这里只保存任务结果；成功的归档请到打包台账查看。</p>"
+            content += "<p>历史任务保存结果和产物记录，原始日志保留在运行任务的会话中。</p>"
         return content
 
     def job_page(self, job):
@@ -674,6 +698,11 @@ class Workbench:
             raise
 
     def _submit(self, action, data, paths, cleanup):
+        if action == "repo-test":
+            from web_repository import diagnostic_plan
+            plan = diagnostic_plan(self.settings, data.get("host", ""), data.get("reference", "").strip())
+            return self.submit_delivery(dict(plan, action=action, label=plan["host"],
+                                             config=str(self.config_arg) if self.config_arg is not None else None))
         effective = dict(data, **{field: str(path) for field, path in paths.items() if field != "package"})
         if action == "build" and data.get("require-dockerfile") == "1":
             path_value(effective, "dockerfile", required=True)
@@ -687,8 +716,9 @@ class Workbench:
                 archive = Path(path_value(effective, architecture, required=True)).expanduser().absolute()
                 archives[architecture] = str(archive)
                 expected[architecture] = check_oci_platform(archive, architecture)
+            tag = effective["tag"].strip()
             args = [json.dumps({"action": action, "archives": archives, "manifests": expected,
-                                "tag": effective["tag"].strip(), "output": str(outputs[0]),
+                                "tag": tag, "output": str(outputs[0]),
                                 "epoch": effective.get("epoch", "").strip() or "0"}, ensure_ascii=True)]
         label = next((data[key] for key in ("project", "tag", "reference", "archive", "context") if data.get(key)), "")
         draft = form_snapshot(action, data)
@@ -700,7 +730,8 @@ class Workbench:
             value = path_value(draft, key)
             if value:
                 draft[key] = str(Path(value).expanduser().absolute())
-        return self.jobs.submit(action, args, outputs, label[:300], draft, delivery=delivery, cleanup=cleanup)
+        return self.jobs.submit(action, args, outputs, tag if delivery else label[:300],
+                                draft, delivery=delivery, cleanup=cleanup)
 
     def close(self):
         try:
@@ -737,19 +768,15 @@ def session_route(path, prefix):
 
 
 def download(handler, job, index):
-    """只导出已完成任务登记的归档，打开文件后再次核对文件身份。"""
-    if job is None or not 0 <= index < len(job["files"]):
+    """下载前核对任务登记的摘要，兼容当前会话和重启后的任务。"""
+    if job is None or not 0 <= index < len(job.get("artifacts", [])):
         return handler._reply(404, "Artifact not found")
-    path, expected = job["files"][index]
-    try:
-        stream = open_artifact(path)
-    except OSError:
+    item = job["artifacts"][index]
+    _, stream = verified_artifact(item, tar_only=False)
+    if stream is None:
         return handler._reply(409, "Artifact was moved or changed")
     with stream:
-        status = os.fstat(stream.fileno())
-        if not stat.S_ISREG(status.st_mode) or file_stamp(status) != expected:
-            return handler._reply(409, "Artifact was moved or changed")
-        send_artifact(handler, stream, path.name, status.st_size)
+        return send_artifact(handler, stream, Path(item["path"]).name, item["bytes"])
 
 
 def send_artifact(handler, stream, filename, size):

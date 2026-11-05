@@ -15,15 +15,17 @@ from image_cli import disk_usage, prune_images, prune_old_cache
 from image_store import default_store
 from settings import cache_directory
 from web_jobs import file_stamp, open_artifact
+from web_job_journal import TASK_ARTIFACT_SUFFIXES
 
 
 SHA256 = re.compile(r"sha256:[a-f0-9]{64}\Z")
 
 
-def artifact_state(item):
+def artifact_state(item, *, tar_only=True):
     """列表只检查路径和大小；点击下载时才读取文件内容。"""
     path = Path(item["path"])
-    if not path.is_absolute() or path.suffix.lower() != ".tar":
+    allowed = (".tar",) if tar_only else TASK_ARTIFACT_SUFFIXES
+    if not path.is_absolute() or not path.name.lower().endswith(allowed):
         return "unsafe", None
     try:
         info = path.lstat()
@@ -41,9 +43,9 @@ def artifact_state(item):
     return "available", info
 
 
-def verified_artifact(item):
+def verified_artifact(item, *, tar_only=True):
     """核对台账摘要后复用同一个文件句柄，避免重新按路径打开另一份文件。"""
-    status, _ = artifact_state(item)
+    status, _ = artifact_state(item, tar_only=tar_only)
     if status != "available":
         return status, None
     stream = None

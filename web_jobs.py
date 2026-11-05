@@ -1,9 +1,9 @@
 """网页任务使用固定参数调用 CLI；在同一工作台串行操作镜像库。"""
 
+import hashlib
 import json
 import os
 import signal
-import stat
 import subprocess
 import sys
 import threading
@@ -25,7 +25,7 @@ LABELS = {"fast": "快速打包", "build": "Dockerfile 构建", "check": "检查
           "remove": "删除镜像引用", "tag": "改标签并另存", "push": "推送镜像",
           "history": "镜像层历史", "analyze": "分析镜像层", "optimize": "优化镜像",
           "flatten": "扁平化镜像", "multiarch": "合并多架构归档",
-          "cache-clean": "清理过期构建缓存", "profile-test": "测试 Fast 基础镜像"}
+          "cache-clean": "清理过期构建缓存", "profile-test": "测试 Fast 基础镜像", "repo-test": "仓库诊断"}
 PLATFORMS = ("linux/amd64", "linux/arm64")
 FORMATS = ("docker", "oci", "both")
 LOG_LINE_CHARS = 4000
@@ -249,7 +249,7 @@ class Jobs:
                 del self.jobs[oldest]
             identity = uuid.uuid4().hex
             self.jobs[identity] = {"id": identity, "action": action, "args": args, "outputs": outputs,
-                                   "state": "queued", "logs": deque(maxlen=250), "log_end": 0, "files": [],
+                                   "state": "queued", "logs": deque(maxlen=250), "log_end": 0, "files": [], "artifacts": [],
                                    "status": "", "process": None, "label": label,
                                    "form": form_snapshot(action, form or {}), "delivery": delivery,
                                    "cleanup": cleanup}
@@ -277,7 +277,7 @@ class Jobs:
     def snapshot(self, identity=None):
         with self.condition:
             def view(job):
-                snapshot = {key: list(value) if key in ("logs", "files") else value
+                snapshot = {key: list(value) if key in ("logs", "files", "artifacts") else value
                             for key, value in job.items() if key not in ("args", "process", "outputs", "cleanup")}
                 if job["state"] == "running" and job.get("interrupt"):
                     snapshot["status"] = "正在取消"
@@ -378,19 +378,35 @@ class Jobs:
             with self.condition:
                 self._append_log(job, str(exc))
         code = process.wait()
+        files, artifacts = [], []
+        completed_status = job["status"]
+        if code == 0 and job["outputs"]:
+            with self.condition:
+                job["status"] = "正在登记产物摘要"
+            for path in job["outputs"]:
+                try:
+                    with open_artifact(path) as stream:
+                        stamp = file_stamp(os.fstat(stream.fileno()))
+                        digest = hashlib.sha256()
+                        remaining = stamp[2]
+                        while remaining:
+                            block = stream.read(min(remaining, 4 * 1024 * 1024))
+                            if not block:
+                                break
+                            digest.update(block)
+                            remaining -= len(block)
+                        if remaining or stamp != file_stamp(os.fstat(stream.fileno())):
+                            raise OSError("产物在登记时发生变更")
+                    files.append((path, stamp))
+                    artifacts.append({"path": str(path), "bytes": stamp[2], "sha256": "sha256:" + digest.hexdigest()})
+                except OSError as exc:
+                    with self.condition:
+                        self._append_log(job, "未能登记产物 {}：{}".format(path.name, exc))
         with self.condition:
             job["state"] = "success" if code == 0 else ("cancelled" if job.get("interrupt") else "failed")
             job["code"] = code
-            if code == 0:
-                for path in job["outputs"]:
-                    try:
-                        # Windows 的路径和句柄统计可能使用不同文件 ID 表示。
-                        with open_artifact(path) as stream:
-                            status = os.fstat(stream.fileno())
-                            if stat.S_ISREG(status.st_mode):
-                                job["files"].append((path, file_stamp(status)))
-                    except OSError:
-                        pass
+            job["files"], job["artifacts"] = files, artifacts
+            job["status"] = completed_status
             job["process"] = None
             self._finish(job)
 

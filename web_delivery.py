@@ -56,13 +56,24 @@ def library_items(settings):
 
 
 class Delivery:
-    def __init__(self, settings, config, directory):
+    def __init__(self, settings, config, directory, job_lookup=None):
         self.settings, self.config, self.directory = settings, config, directory
         self.pending = OrderedDict()
         self.lock = threading.Lock()
+        self.job_lookup = job_lookup
 
     def select(self, data):
         scope, identity = data.get("scope"), data.get("id", "")
+        if scope == "job" and self.job_lookup is not None:
+            job = self.job_lookup(identity)
+            if (job is None or job["action"] != "multiarch" or job["state"] != "success"
+                    or not job.get("label") or len(job.get("artifacts", [])) != 1):
+                raise BuildError("未找到可交付的多架构归档")
+            item = job["artifacts"][0]
+            if artifact_state(item)[0] != "available":
+                raise BuildError("多架构归档已移走或变更")
+            return {"format": "oci-index", "archive": item["path"], "record": item,
+                    "tag": job["label"], "platform": "linux/amd64 + linux/arm64"}
         if scope == "history":
             raw_index = data.get("file", "")
             if not raw_index.isascii() or not raw_index.isdecimal() or len(raw_index) > 3:
@@ -85,6 +96,8 @@ class Delivery:
 
     @staticmethod
     def actions(selected):
+        if selected["format"] == "oci-index":
+            return ("verify", "push")
         if selected["format"] == "cas":
             return ("verify", "save", "history", "analyze", "optimize", "flatten")
         if selected["format"] == "oci":

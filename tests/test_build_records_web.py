@@ -476,6 +476,8 @@ class WorkbenchTests(unittest.TestCase):
         self.assertTrue(archived["archived"])
         self.assertEqual(archived["state"], "success")
         self.assertEqual(archived["logs"], [])
+        self.assertEqual([item["path"] for item in archived["artifacts"]], [str(output), str(secondary)])
+        self.assertTrue(all(item["sha256"].startswith("sha256:") for item in archived["artifacts"]))
         self.assertNotIn("output", archived["form"])
         self.assertIn(b'value="2.0.0"', self.http("/reuse?id=" + identity)[2])
 
@@ -560,9 +562,16 @@ class WorkbenchTests(unittest.TestCase):
             "scope": "library", "id": item["id"], "action": "save", "output": str(target)})
         self.assertEqual(self.http("/download?id=" + job + "&file=0")[2], target.read_bytes())
 
-    def test_push_requires_fixed_single_use_confirmation_and_does_not_overwrite(self):
+    def configured_registry(self):
         class LocalRegistry(RegistryHandler):
             blobs, manifests, token_requests = {}, {}, 0
+
+            def do_GET(self):
+                if self.path == "/v2/":
+                    if self.authorized():
+                        self.reply(200, b"{}")
+                else:
+                    super().do_GET()
 
         registry = ThreadingHTTPServer(("127.0.0.1", 0), LocalRegistry)
         self.addCleanup(registry.server_close)
@@ -576,6 +585,10 @@ class WorkbenchTests(unittest.TestCase):
         config["repositories"][host] = entry
         self.workspace.config.write_text(json.dumps(config), encoding="utf-8")
         self.workspace.settings["repositories"][host] = entry
+        return host, LocalRegistry
+
+    def test_push_requires_fixed_single_use_confirmation_and_does_not_overwrite(self):
+        host, LocalRegistry = self.configured_registry()
         _, source = self.built_delivery()
         destination = host + "/p/app:delivery"
         fields = dict(source, action="push", destination=destination)
@@ -603,6 +616,22 @@ class WorkbenchTests(unittest.TestCase):
         with patch.dict(os.environ, {"PIB_WEB_TEST_PASSWORD": "secret"}):
             self.run_request("/delivery/confirm", {"token": prepare()})
         self.assertEqual(set(LocalRegistry.manifests), {"delivery", "delivery-oci"})
+
+    def test_registry_diagnostic_distinguishes_authentication_and_missing_tag(self):
+        host, remote = self.configured_registry()
+        self.assertIn("仓库诊断".encode(), self.http("/config")[2])
+        self.assertEqual(self.http("/submit/repo-test", {"host": host, "reference": "outside.example/p/app:1"})[0], 400)
+        with patch.dict(os.environ, {"PIB_WEB_TEST_PASSWORD": "incorrect"}):
+            _, identity = self.run_request("/submit/repo-test", {"host": host}, expected="failed")
+            self.assertIn("HTTP 401", "\n".join(self.workspace.jobs.snapshot(identity)["logs"]))
+        with patch.dict(os.environ, {"PIB_WEB_TEST_PASSWORD": "secret"}):
+            self.run_job("repo-test", {"host": host})
+            reference = host + "/p/app:missing"
+            _, identity = self.run_request("/submit/repo-test", {"host": host, "reference": reference}, expected="failed")
+            self.assertIn("HTTP 404", "\n".join(self.workspace.jobs.snapshot(identity)["logs"]))
+            remote.manifests["missing"] = b'{"schemaVersion":2,"config":{},"layers":[]}'
+            _, identity = self.run_job("repo-test", {"host": host, "reference": reference})
+            self.assertIn("镜像元数据可读取", "\n".join(self.workspace.jobs.snapshot(identity)["logs"]))
 
     def confirmation_token(self, result):
         status, _, page = result
@@ -718,7 +747,8 @@ class WorkbenchTests(unittest.TestCase):
 
             def do_GET(self):
                 requests.append(self.path)
-                body = {"/artifactory/repo/image/1/manifest.json": manifest,
+                body = {"/artifactory/api/system/ping": b"OK",
+                        "/artifactory/repo/image/1/manifest.json": manifest,
                         "/artifactory/repo/image/1/sha256__" + digest: data}.get(self.path)
                 expected = "Basic " + base64.b64encode(b"test:secret").decode("ascii")
                 self.send_response(401 if self.headers.get("Authorization") != expected else (200 if body else 404))
@@ -734,7 +764,9 @@ class WorkbenchTests(unittest.TestCase):
         self.addCleanup(remote.shutdown)
         host = "127.0.0.1:{}".format(remote.server_port)
         config = json.loads(self.workspace.config.read_text(encoding="utf-8"))
-        config["repositories"][host] = {"source": "artifactory", "username": "test", "passwordEnv": "PIB_PROFILE_TEST"}
+        config["repositories"][host] = {"source": "artifactory", "username": "test",
+                                        "passwordEnv": "PIB_PROFILE_TEST", "insecureHttp": True}
+        self.workspace.settings["repositories"][host] = config["repositories"][host]
         original = json.dumps(config).encode()
         self.workspace.config.write_bytes(original)
         fields = {"mode": "new", "name": "remote", "flavor": "tomcat", "baseImage": host + "/repo/image:1",
@@ -743,6 +775,11 @@ class WorkbenchTests(unittest.TestCase):
             self.run_request("/profile/test", fields)
         self.assertEqual(requests, ["/artifactory/repo/image/1/manifest.json",
                                     "/artifactory/repo/image/1/sha256__" + digest])
+        requests.clear()
+        with patch.dict(os.environ, {"PIB_PROFILE_TEST": "secret"}):
+            self.run_job("repo-test", {"host": host})
+            self.run_job("repo-test", {"host": host, "reference": host + "/repo/image:1"})
+        self.assertEqual(requests, ["/artifactory/api/system/ping", "/artifactory/repo/image/1/manifest.json"])
         self.assertEqual(self.workspace.config.read_bytes(), original)
 
     def test_archive_analysis_history_optimization_flatten_and_logs(self):
@@ -815,12 +852,28 @@ class WorkbenchTests(unittest.TestCase):
             status, raw = self.upload_package(Path(path).name, Path(path).read_bytes(), kind=arch)
             self.assertEqual(status, 200, raw)
             tokens[arch + "-upload"] = json.loads(raw)["token"]
-        self.run_job("multiarch", dict(tokens, tag="multi:1", output=str(output), epoch="100"))
+        _, multi_job = self.run_job("multiarch", dict(tokens, tag="multi:1", output=str(output), epoch="100"))
         self.assertFalse(self.workspace.uploads.entries)
         import tarfile
         with tarfile.open(output, "r:") as bundle:
             index = json.load(bundle.extractfile("index.json"))
         self.assertEqual({item["platform"]["architecture"] for item in index["manifests"]}, {"amd64", "arm64"})
+        with self.workspace.jobs.condition:
+            del self.workspace.jobs.jobs[multi_job]
+        artifact = output.read_bytes()
+        download = "/download?id=" + multi_job + "&file=0"
+        self.assertEqual(self.http(download)[2], artifact)
+        self.assertIn("校验并推送多架构镜像".encode(), self.http("/job?id=" + multi_job)[2])
+        output.write_bytes(b"x" + artifact[1:])
+        self.assertEqual(self.http(download)[0], 409)
+        output.write_bytes(artifact)
+        host, remote = self.configured_registry()
+        fields = {"scope": "job", "id": multi_job, "action": "push", "destination": host + "/p/app:multi"}
+        token = self.confirmation_token(self.http("/delivery/prepare", fields))
+        with patch.dict(os.environ, {"PIB_WEB_TEST_PASSWORD": "secret"}):
+            self.run_request("/delivery/confirm", {"token": token})
+        published = json.loads(remote.manifests["multi"])
+        self.assertEqual([item["platform"]["architecture"] for item in published["manifests"]], ["amd64", "arm64"])
         replacement = self.root / "replacement.oci.tar"
         (context / "Dockerfile").write_text("FROM scratch\nLABEL replaced=yes\n", encoding="utf-8")
         self.run_job("build", {"context": str(context), "output": str(replacement), "tag": "multi:1",
