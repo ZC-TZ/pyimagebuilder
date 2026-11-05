@@ -142,6 +142,8 @@ def _workbench_page(workspace, title, body, fast_script=False, active=None, job_
     head = '<script defer src="{}/{}"></script>'.format(workspace.prefix, script) if script else ""
     if "data-path-mode=" in body:
         head += '<script defer src="{}/paths.js"></script>'.format(workspace.prefix)
+    if title == "构建与打包":
+        head += '<script defer src="{}/build-modes.js"></script>'.format(workspace.prefix)
     if title == "最近任务":
         head += '<script defer src="{}/tasks.js"></script>'.format(workspace.prefix)
     return document(title, '<section class="records">{}</section>'.format(body),
@@ -239,7 +241,7 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                                           len(rows) > end, workspace=workspace), html=True)
 
         def _get_workbench(self, route, query):
-            from web_workbench import FAST_SCRIPT, JOB_SCRIPT, SPACE_KINDS, STATES, download, send_artifact
+            from web_workbench import BUILD_MODES_SCRIPT, FAST_SCRIPT, JOB_SCRIPT, SPACE_KINDS, STATES, download, send_artifact
             views = {"/workbench": ("构建与打包", workspace.builds),
                      "/config": ("配置概览", workspace.configuration)}
             if route == "/download" and len(query) <= 200:
@@ -311,6 +313,8 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                     return self.wfile.write(body)
                 if route == "/fast.js" and not query:
                     return self._reply(200, FAST_SCRIPT, content_type="application/javascript")
+                if route == "/build-modes.js" and not query:
+                    return self._reply(200, BUILD_MODES_SCRIPT, content_type="application/javascript")
                 if route == "/job.js" and not query:
                     return self._reply(200, JOB_SCRIPT, content_type="application/javascript")
                 if route == "/paths.js" and not query:

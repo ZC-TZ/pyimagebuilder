@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import sys
+from collections import Counter
 from functools import partial
 from html import escape
 from pathlib import Path
@@ -17,7 +18,7 @@ from web_delivery import DELIVERY_ACTIONS, Delivery, library_items
 from web_jobs import FORMATS, LABELS, PLATFORMS, Jobs, _path, command_for, fast_plan, path_value
 from web_maintenance import (PROFILE_FIELDS, _revision, cache_fingerprint, cache_plan, cache_root, candidate_profile,
                              image_store_root, old_image_rows, save_profile)
-from web_ui import HERO, icon
+from web_ui import icon
 from web_uploads import FastUploads
 from web_paths import check_oci_platform
 
@@ -32,6 +33,36 @@ UPLOAD_FIELDS = {"fast": {"package": "package"}, "build": {"dockerfile": "docker
                  "inspect": {"archive": "archive"}, "verify": {"archive": "archive"},
                  "rootfs-export": {"archive": "archive"}, "rootfs-import": {"archive": "rootfs"},
                  "multiarch": {"amd64": "archive", "arm64": "archive"}}
+
+BUILD_MODES_SCRIPT = r"""
+(() => {
+  const navigation = document.querySelector('[data-build-modes]');
+  if (!navigation) return;
+  const links = Array.from(navigation.querySelectorAll('a'));
+  const panels = new Map(links.map(link => [link.hash, document.getElementById(link.hash.slice(1))]));
+  if (Array.from(panels.values()).some(panel => !panel)) return;
+  const fallback = '#' + navigation.dataset.buildModes;
+  function select(focus) {
+    const hash = panels.has(location.hash) ? location.hash : fallback;
+    for (const link of links) {
+      const selected = link.hash === hash;
+      panels.get(link.hash).hidden = !selected;
+      if (selected) link.setAttribute('aria-current', 'true');
+      else link.removeAttribute('aria-current');
+    }
+    if (focus) panels.get(hash).querySelector('h2').focus();
+  }
+  navigation.addEventListener('click', event => {
+    const link = event.target.closest('a');
+    if (!link || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    if (location.hash !== link.hash) history.pushState(null, '', link.hash);
+    select(true);
+  });
+  window.addEventListener('hashchange', () => select(false));
+  select(false);
+})();
+"""
 
 FAST_SCRIPT = r"""
 (() => {
@@ -245,12 +276,18 @@ def _change_field():
 def _section(title, body, anchor="", primary=False, description=""):
     attrs = (' id="{}"'.format(_e(anchor)) if anchor else "") + (' class="primary-panel"' if primary else "")
     description = '<p class="section-copy">{}</p>'.format(_e(description)) if description else ""
-    return '<article{}><h2>{}</h2>{}{}</article>'.format(attrs, title, description, body)
+    return '<article{}><h2{}>{}</h2>{}{}</article>'.format(
+        attrs, ' tabindex="-1"' if anchor else "", title, description, body)
 
 
 def _pairs(values):
     return "<dl>" + "".join("<dt>{}</dt><dd><code>{}</code></dd>".format(label, _e(value))
                             for label, value in values) + "</dl>"
+
+
+def _tool_group(title, description, body):
+    return ('<details class="tool-group"><summary><strong>{}</strong><small>{}</small></summary>'
+            '<div class="tool-group-body">{}</div></details>').format(title, description, body)
 
 
 def _job_state(state):
@@ -327,22 +364,30 @@ class Workbench:
         else:
             fast = ('<p class="muted">新增 Tomcat 或 TongWeb 模板后，即可打包 WAR 或 dist.zip。</p>'
                     '<a class="button primary" href="{}/profile">新增 Fast 模板</a>').format(self.prefix)
-        ordinary = context + dockerfile + field("base-tar", "基础镜像 tar（可选）") + \
-            field("tag", "镜像标签", "hisq_back:1.0.0", True) + destination + platform + formats + \
-            field("target", "目标阶段（可选）") + _check("offline", "仅使用本地基础镜像", draft.get("offline")) + \
-            _check("pull", "刷新基础镜像", draft.get("pull")) + _check("no-cache", "禁用构建缓存", draft.get("no-cache"))
+        ordinary = (context + dockerfile + field("tag", "镜像标签", "hisq_back:1.0.0", True) +
+                    platform + formats + destination)
+        checks = (_check("offline", "仅使用本地基础镜像", draft.get("offline")) +
+                  _check("pull", "刷新基础镜像", draft.get("pull")) +
+                  _check("no-cache", "禁用构建缓存", draft.get("no-cache")))
         if sys.platform == "linux":
-            ordinary += _check("run", "允许执行可信 Dockerfile 的 RUN", draft.get("run"))
-        ordinary += ('<details class="advanced"{}><summary>高级构建选项</summary>'.format(
-                     " open" if draft.get("input-lock") else "") +
+            checks += _check("run", "允许执行可信 Dockerfile 的 RUN", draft.get("run"))
+        show_advanced = any(draft.get(key) for key in ("base-tar", "base-map", "target", "epoch", "input-lock",
+                                                       "offline", "pull", "no-cache", "run", "attest"))
+        ordinary += ('<details class="advanced"{}><summary>高级构建选项</summary><div class="advanced-grid">'
+                     '<fieldset><legend>基础镜像与执行</legend>'.format(" open" if show_advanced else "") +
+                     field("base-tar", "基础镜像 tar（可选）") +
                      field("base-map", "基础镜像映射 JSON") +
+                     field("target", "目标阶段（可选）") +
+                     '<div class="build-checks">' + checks + '</div></fieldset>' +
+                     '<fieldset><legend>可复现与封闭构建</legend>' +
                      field("epoch", "可复现时间戳（Unix 秒）") +
                      field("input-lock", "封闭构建输入锁 JSON") +
                      field("lock-output", "生成输入锁的输出路径", "/data/images/input-lock.json") +
-                     '<p class="muted">生成输入锁时须填可复现时间戳，JSON 须写到构建上下文之外。</p>' +
+                     '<p class="muted">生成输入锁时须填时间戳，输出路径须位于上下文之外。</p></fieldset>' +
+                     '<fieldset class="build-params"><legend>构建参数与签名</legend>' +
                      '<label>构建参数（每行 NAME=VALUE，不填凭据）<textarea name="build-args" rows="3"></textarea></label>' +
                      _check("attest", "生成 SBOM 和 provenance", draft.get("attest")) +
-                     field("sign-key", "本机签名私钥路径（可选）") + "</details>")
+                     field("sign-key", "本机签名私钥路径（可选）") + "</fieldset></div></details>")
         lock_button = ('<button type="submit" class="secondary" formnovalidate '
                        'formaction="{}/submit/lock-inputs">生成输入锁</button>').format(self.prefix)
         if action == "fast":
@@ -359,16 +404,19 @@ class Workbench:
                               _path_field("arm64", "arm64 OCI tar", required=True, upload="arm64") +
                               _input("tag", "多平台镜像标签", "", True) + destination +
                               _input("epoch", "可复现时间戳（可选）"))
-        hero = ('<div class="hero"><div><h2>准备交付镜像</h2>'
-                '<p>已有 WAR 或 dist.zip 用快速打包。有 Dockerfile 则直接构建。</p>'
-                '<nav class="shortcuts" aria-label="构建方式"><a class="button primary compact" href="#fast">快速打包 {}</a>'
-                '<a class="button compact" href="#dockerfile">Dockerfile 构建</a>'
-                '<a class="button compact" href="#multiarch">合并 OCI</a></nav></div>{}</div>').format(icon("arrow"), HERO)
-        checks = self.form("check", context + dockerfile + platform)
-        return "".join((hero, _section("快速打包", fast, "fast", True, "选择应用包和模板，预览输出后提交。"),
+        modes = (("fast", "package", "快速打包", "WAR 或 dist.zip"),
+                 ("dockerfile", "build", "Dockerfile 构建", "从项目目录生成镜像"),
+                 ("check", "check", "静态检查", "检查 Dockerfile 和构建输入"),
+                 ("multiarch", "images", "合并 OCI", "合并 amd64 与 arm64 归档"))
+        navigation = ('<nav class="build-modes" aria-label="构建方式" data-build-modes="{}">{}</nav>').format(
+            "fast" if self.profiles else "dockerfile",
+            "".join('<a href="#{}"><span class="mode-icon">{}</span><span><strong>{}</strong><small>{}</small></span></a>'.format(
+                key, icon(symbol), label, summary) for key, symbol, label, summary in modes))
+        return "".join((navigation, _section("快速打包", fast, "fast", True, "选择应用包和模板，预览输出后提交。"),
                         _section("Dockerfile 构建", self.form("build", ordinary, secondary=lock_button), "dockerfile",
-                                 description="从本机项目目录构建镜像；高级选项可按需展开。"),
-                        _section("静态检查 Dockerfile", checks, description="检查 Dockerfile 和构建输入。"),
+                                 description="填写构建上下文、镜像标签和输出路径。可在高级选项中指定基础镜像和输入锁。"),
+                        _section("静态检查 Dockerfile", self.form("check", context + dockerfile + platform), "check",
+                                 description="检查 Dockerfile 和构建输入。"),
                         _section("多架构 OCI 合并", multiarch, "multiarch",
                                  description="使用已有的 amd64 和 arm64 OCI 归档，生成一个多平台产物。")))
 
@@ -401,28 +449,33 @@ class Workbench:
             _select("platform", "筛选平台", ("",) + PLATFORMS, platform_filter, {"": "全部"}),
             _select("source", "筛选来源", ("", "local", "registry", "artifactory", "archive"), source_filter,
                     {"": "全部", "archive": "未标注来源的归档"}))
-        tools = "".join((
-            _section("拉取基础镜像", self.form("pull", reference + platform + _select("source", "来源", source))),
-            self.repository_diagnostics(),
-            _section("交付验签", '<a class="button" href="{}/attest">打开验签工具</a>'.format(self.prefix)),
-            _section("导入 Docker tar", self.form("load", archive + tag + platform)),
+        registry_tools = _tool_group("仓库", "拉取镜像、测试连接",
+            _section("拉取基础镜像", self.form("pull", reference + platform + _select("source", "来源", source))) +
+            self.repository_diagnostics())
+        archive_tools = _tool_group("镜像归档", "导入、导出、查看和验签",
+            _section("导入 Docker tar", self.form("load", archive + tag + platform)) +
             _section("从镜像库导出 tar", self.form("save", reference + platform +
-                     _select("source", "来源", source + ("local",)) + _path_field("output", "输出 tar 路径", required=True, mode="output"))),
-            _section("检查现有 Docker tar", self.form("inspect", archive + tag) + self.form("verify", archive + tag)),
+                     _select("source", "来源", source + ("local",)) + output)) +
+            _section("检查现有 Docker tar", self.form("inspect", archive + tag) + self.form("verify", archive + tag)) +
+            _section("交付验签", '<a class="button" href="{}/attest">打开验签工具</a>'.format(self.prefix)))
+        rootfs_tools = _tool_group("rootfs 文件系统", "导出文件系统、从 rootfs 创建镜像",
             _section("导出 rootfs", self.form("rootfs-export", archive + tag + platform + output),
-                     description="从 Docker 或 OCI 镜像归档导出合并后的文件系统。需要 docker load 时，先用下方工具生成 Docker 镜像 tar。"),
+                     description="从 Docker 或 OCI 镜像归档导出合并后的文件系统。需要 docker load 时，先用下方工具生成 Docker 镜像 tar。") +
             _section("从 rootfs 创建镜像", self.form("rootfs-import", rootfs +
                      _input("tag", "新镜像标签", "example/app:1.0.0", True) + platform +
                      _select("format", "归档格式", ("docker", "oci"), "docker") +
-                     _input("epoch", "可复现时间戳（可选）") + _change_field() + output)),
-            _section("磁盘占用", self.form("df", "")),
+                     _input("epoch", "可复现时间戳（可选）") + _change_field() + output)))
+        maintenance = _tool_group("本地维护", "查看磁盘占用、删除镜像引用",
+            _section("磁盘占用", self.form("df", "")) +
             _section("删除本地镜像引用", self.form("remove", reference + platform +
                      _select("source", "来源", source + ("local",)) +
-                     _input("confirm", "再次输入完整镜像引用", "", True)))))
+                     _input("confirm", "再次输入完整镜像引用", "", True))))
         overview = _section("镜像列表", '<p class="muted">显示 {} / {} 条 · <code>{}</code></p>'.format(
             len(items), len(result["images"]), _e(result["image_store"])) + filters)
-        tools = '<details class="toolbox"><summary>镜像库工具：拉取、导入、导出、检查</summary><div class="toolbox-body">{}</div></details>'.format(tools)
-        return overview + tools + ("".join(items) or '<p class="empty">没有符合条件的镜像。</p>')
+        tools = ('<details class="toolbox"><summary>镜像库工具</summary><div class="toolbox-body">{}'
+                 '</div></details>').format(registry_tools + archive_tools + rootfs_tools + maintenance)
+        results = '<div class="image-results">{}</div>'.format("".join(items)) if items else '<p class="empty">没有符合条件的镜像。</p>'
+        return overview + tools + results
 
     def delivery_link(self, scope, identity, index=None):
         params = {"scope": scope, "id": identity}
@@ -687,8 +740,14 @@ class Workbench:
         jobs = self.jobs.snapshot()
         active = {item["id"] for item in jobs}
         jobs += [self._archived(item) for item in self.jobs.journal.recent() if item["id"] not in active]
-        jobs = [job for job in jobs if job["action"] in LABELS and (not state or job["state"] == state) and
+        jobs = [job for job in jobs if job["action"] in LABELS]
+        totals = Counter(job["state"] for job in jobs)
+        jobs = [job for job in jobs if (not state or job["state"] == state) and
                 (not search or search.casefold() in (job["label"] + " " + LABELS[job["action"]]).casefold())]
+        stats = '<dl class="task-stats" aria-label="最近任务概况">{}</dl>'.format("".join(
+            '<div><dt>{}</dt><dd>{}</dd></div>'.format(label, count)
+            for label, count in (("最近任务", sum(totals.values())), ("排队或运行中", totals["queued"] + totals["running"]),
+                                 ("成功", totals["success"]), ("失败", totals["failed"]))))
 
         def elapsed(job):
             seconds = job.get("elapsed")
@@ -696,8 +755,8 @@ class Workbench:
                 return ""
             return '<small>耗时 {:02d}:{:02d}:{:02d}</small>'.format(seconds // 3600, seconds // 60 % 60, seconds % 60)
 
-        rows = "".join(('<li class="job-row"><div>{} <strong>{}</strong><code>{}</code></div>'
-                        '{} <a class="button compact" href="{}/job?{}">查看任务</a></li>').format(
+        rows = "".join(('<li class="job-row"><div class="job-ident"><div>{} <strong>{}</strong></div><code>{}</code></div>'
+                        '<div class="actions">{} <a class="button compact" href="{}/job?{}">查看任务</a></div></li>').format(
                             _job_state(job["state"]), LABELS[job["action"]],
                             _e(job["label"] or job.get("updated", "")), elapsed(job), self.prefix,
                             urlencode({"id": job["id"]})) for job in jobs)
@@ -708,6 +767,7 @@ class Workbench:
         else:
             body = ('<div class="empty"><p>还没有网页任务。</p>'
                     '<a class="button primary" href="{}/workbench">去构建</a></div>').format(self.prefix)
+        body = stats + body
         if fragment:
             return body
         query = _e(urlencode({"state": state, "search": search}))
@@ -715,7 +775,7 @@ class Workbench:
             self.prefix, _select("state", "状态", ("",) + tuple(STATES), state, {"": "全部", **STATES}),
             _input("search", "项目、标签或任务类型", value=search)))
         return _section("任务列表", filters +
-                        '<div data-task-feed="{}/jobs-fragment?{}">{}</div><small id="task-feed-status"></small>'.format(
+                        '<div data-task-feed="{}/jobs-fragment?{}">{}</div><small id="task-feed-status" role="status"></small>'.format(
                             self.prefix, query, body))
 
     def _archived(self, item):
@@ -772,26 +832,29 @@ class Workbench:
 
     def job_page(self, job):
         running = job["state"] in ("queued", "running")
-        content = '<div id="job-details">{}</div><p class="muted" id="job-status">{}</p>'.format(
-            self.job_details(job), _e(job["status"]))
+        summary = ('<div id="job-details">{}</div><div class="job-stage">'
+                   '<small>任务状态</small><p id="job-status">{}</p></div>').format(
+                        self.job_details(job), _e(job["status"]))
+        content = _section(LABELS[job["action"]], summary)
         if not job.get("archived"):
             query = urlencode({"id": job["id"]})
             lines = "".join('<span>{}</span>'.format(_e(line)) for line in job["logs"])
             omitted = job["log_end"] - len(job["logs"])
-            content += ('<div class="actions"><h2>任务日志</h2>'
+            content += ('<article class="log-panel"><header class="log-toolbar"><div><h2>任务日志</h2>'
+                        '<small id="job-follow" role="status"></small></div><div class="actions log-actions">'
                         '<button type="button" class="secondary" id="job-latest" hidden>跳到最新</button>'
-                        '<small class="muted" id="job-follow" role="status"></small></div>'
+                        '<a id="job-export"{5} class="button compact" href="{0}/job-log?{1}">导出当前日志</a></div></header>'
                         '<pre id="job-output" tabindex="0" aria-label="任务日志" data-url="{0}/job-progress?{1}" '
                         'data-after="{2}" data-running="{3}">{4}</pre>'
-                        '<p id="job-export"{5}><a class="button compact" href="{0}/job-log?{1}">导出当前日志</a>'
-                        '　<small>分享前请检查命令输出。</small></p>'
-                        '<p class="muted" id="job-poll-status" role="status" hidden></p>'
-                        '<p class="muted"{6}>前 <span id="job-log-omitted">{7}</span> 条日志已移出窗口。</p>').format(
+                        '<footer class="log-notes"><p class="muted" id="job-poll-status" role="status" hidden></p>'
+                        '<p class="muted"{6}>前 <span id="job-log-omitted">{7}</span> 条日志已移出窗口。</p>'
+                        '<small>分享日志前请检查命令输出。</small></footer>').format(
                             self.prefix, query, job["log_end"], int(running), lines, "" if lines else " hidden",
                             "" if omitted else " hidden", omitted)
             if running:
                 content += '<noscript><p><a href="{}/job?{}">刷新任务状态和日志</a></p></noscript>'.format(self.prefix, query)
-        return _section(LABELS[job["action"]], content)
+            content += "</article>"
+        return content
 
     def job_progress(self, job, after):
         end = job.get("log_end", 0)
