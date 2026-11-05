@@ -83,6 +83,15 @@ Python 官方明确指出，多线程进程中的 fork 不安全；Python 3.12 �
 
 共享锁保护合作进程的操作顺序，不能抵御另一个进程绕过工具直接替换文件。构建期间仍须保持输入稳定；恶意并发修改宿主目录不在支持范围。
 
+输出回滚同时核对登记的设备号、inode/file ID 和节点类型，检测到同名路径已被另一文件、
+目录或链接替换时保留该节点，继续回收其他自有产物和恢复 CAS ref。
+`publish_new_file` 将发布时的身份传给当前上下文的内外层事务，避免返回后再登记时认领替换文件；
+无硬链接复制失败及临时副本清理失败也采用同一检查。登记和回滚不额外读取整包内容。
+
+写入、硬链接数或 ctime 变化不等于文件对象被替换，因此不拿这些字段作删除身份。
+文件系统不能提供有效标识时，工具保留节点并明确报告无法安全清理。
+这不提供检查与 unlink 之间的 OS 级原子隔离，也不把同一 inode 的就地改写识别为另一份发布。
+
 ## 6. 验证方法
 
 无需 Docker 的专项测试：
@@ -90,6 +99,7 @@ Python 官方明确指出，多线程进程中的 fork 不安全；Python 3.12 �
 ```text
 python -m unittest discover -s tests -p test_concurrency_lifecycle.py -v
 python -m unittest discover -s tests -p test_run_parent_cleanup.py -v
+python -m unittest discover -s tests -p test_publication_ownership.py -v
 ```
 
 它们使用真实线程、锁、Future、文件和管道；网络及 Linux 系统调用使用本地替身，不代表生产服务或真实 namespace 验收。
