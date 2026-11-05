@@ -891,8 +891,12 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
             len(files), len(sizes)
         ))
 
+    workspace_parent = None
+    if cas_only:
+        workspace_parent = cas_store.root.parent
+        workspace_parent.mkdir(parents=True, exist_ok=True)
     with publication_transaction(cas_store, image_reference, target_platform, "artifactory") as published, \
-            tempfile.TemporaryDirectory(prefix="artifactory_download_") as temp:
+            tempfile.TemporaryDirectory(prefix="artifactory_download_", dir=workspace_parent) as temp:
         workspace = Path(temp)
         raw_root = workspace / "registry-v2"
         archive_root = workspace / "docker-archive"
@@ -1040,7 +1044,7 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
                                       diff_id, index, len(descriptors), display,
                                       descriptor.get("digest"), progress=task.update)
                     task.current = decoded.stat().st_size
-                    cas_store.store_decoded_layer(decoded, diff_id)
+                    cas_store.store_decoded_layer(decoded, diff_id, owned=True)
                     decoded.unlink()
                     layer_paths.append(blob)
         else:

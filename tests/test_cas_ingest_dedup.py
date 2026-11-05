@@ -1,15 +1,18 @@
 """验证 CAS 去重不能用旧 blob 代替本次输入字节的校验。"""
 
 import gzip
+import errno
 import hashlib
 import io
 import json
+import os
 import sys
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import cas_store
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
@@ -71,6 +74,39 @@ class CASIngestDedupTests(unittest.TestCase):
                     store._put_stream(io.BytesIO(incoming), digest(raw), len(raw))
                 self.assertEqual(target.read_bytes(), raw)
         self.assertEqual(list(store.blobs.glob("*.part")), [])
+
+    def test_owned_layer_reuses_file_and_survives_temporary_source_cleanup(self):
+        store = CASStore(self.root / "store")
+        source = self.root / "decoded.tar"
+        raw = layer(b"owned decoded content")
+        source.write_bytes(raw)
+        target = store.store_decoded_layer(source, digest(raw), owned=True)
+        self.assertTrue(os.path.samefile(source, target))
+        source.unlink()
+        self.assertEqual(target.read_bytes(), raw)
+        copied = self.root / "ordinary.tar"
+        copied.write_bytes(raw)
+        other = CASStore(self.root / "other-store").store_decoded_layer(copied, digest(raw))
+        copied.write_bytes(b"changed by caller")
+        self.assertEqual(other.read_bytes(), raw)
+
+    def test_owned_layer_falls_back_across_filesystems_and_rejects_corruption(self):
+        store = CASStore(self.root / "store")
+        source = self.root / "decoded.tar"
+        raw = layer(b"valid decoded content")
+        source.write_bytes(raw)
+        with patch.object(cas_store.os, "link", side_effect=OSError(errno.EXDEV, "cross-device")):
+            target = store.store_decoded_layer(source, digest(raw), owned=True)
+        self.assertFalse(os.path.samefile(source, target))
+        self.assertEqual(target.read_bytes(), raw)
+        source.write_bytes(layer(b"wrong decoded content"))
+        with self.assertRaises(ArchiveError):
+            store.store_decoded_layer(source, digest(raw), owned=True)
+        self.assertEqual(target.read_bytes(), raw)
+        source.write_bytes(raw)
+        target.write_bytes(b"corrupt CAS")
+        with self.assertRaises(ArchiveError):
+            store.store_decoded_layer(source, digest(raw), owned=True)
 
     def test_existing_blob_does_not_hide_incoming_read_failure(self):
         store = CASStore(self.root / "store")

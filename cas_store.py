@@ -19,18 +19,19 @@ import zlib
 from pathlib import Path
 
 from compat import is_linked_directory, unlink_missing
-from file_resources import fdopen_owned
+from file_resources import fdopen_owned, open_regular_file
+from cache_identity import file_identity, stat_identity
 from progress.layers import LayerProgress
 from errors import ArchiveError, BuildError
 from image_reader import (MAX_JSON, BaseImage, ImageArchiveReader, archive_members, digest_hex,
                           image_history, parse_image_json, read_image_json_file, same_json_value, sha256_file,
-                          verify_layer_tar)
+                          verified_layer_identity, verify_layer_tar)
 from image_writer import ImageArchiveWriter
 from oci_writer import OCIImageWriter, CONFIG_TYPE, LAYER_TYPE, MANIFEST_TYPE
 from platforms import architecture, normalize_platform
 from settings import cache_directory, load_settings
 from store_lock import file_lock
-from file_publish import publication_transaction
+from file_publish import LINK_FALLBACK, publication_transaction
 
 
 SCHEMA_VERSION = 1
@@ -158,13 +159,52 @@ class CASStore:
         self._put_stream(io.BytesIO(raw), digest, len(raw))
         return digest
 
-    def store_decoded_layer(self, path, diff_id):
-        """校验并保存拉取阶段已解压的层，避免随后构建再次解压。"""
+    def store_decoded_layer(self, path, diff_id, *, owned=False):
+        """校验并保存解码层。owned 仅用于下载器独占且此后只删除的临时文件。"""
         path = Path(path)
+        if owned:
+            return self._store_owned_layer(path, diff_id)
         with open(path, "rb") as stream:
             verify_layer_tar(stream, "decoded CAS layer: " + diff_id)
             stream.seek(0)
             return self._put_stream(stream, diff_id, path.stat().st_size)
+
+    def _store_owned_layer(self, path, diff_id):
+        """仅接收调用方独占且此后只会删除的临时层，同盘共享 inode 以省去复制。"""
+        target = self._blob(diff_id)
+        if path.resolve() == target.resolve():
+            raise ArchiveError("Owned layer must be a private temporary file")
+        stamp = verified_layer_identity(path, diff_id, file_identity)
+        with open_regular_file(path, writable=True) as stream:
+            if stat_identity(os.fstat(stream.fileno()))[:4] != stamp[:4]:
+                raise ArchiveError("Decoded layer changed before CAS ingestion")
+            verify_layer_tar(stream, "decoded CAS layer: " + diff_id)
+            if os.name != "nt":
+                os.fchmod(stream.fileno(), 0o600)
+            os.fsync(stream.fileno())
+            if stat_identity(os.fstat(stream.fileno()))[:4] != stamp[:4]:
+                raise ArchiveError("Decoded layer changed during CAS ingestion")
+        self.blobs.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(path, target)
+        except FileExistsError:
+            if target.is_symlink():
+                raise ArchiveError("CAS blob path is a symlink: " + diff_id)
+            verified_layer_identity(target, diff_id, file_identity)
+            return target
+        except OSError as exc:
+            if exc.errno not in LINK_FALLBACK:
+                raise
+            # 跨盘或文件系统不支持硬链接时，复用已校验的流式复制路径。
+            return self.store_decoded_layer(path, diff_id)
+        try:
+            if (target.is_symlink() or stat_identity(target.stat())[:4] != stamp[:4] or
+                    stat_identity(path.stat())[:4] != stamp[:4]):
+                raise ArchiveError("Decoded layer changed during CAS publication")
+        except BaseException:
+            unlink_missing(target)
+            raise
+        return target
 
     def _publish(self, reference, platform, source, config_digest, layers,
                  replace=False, manifest_raw=None):
@@ -637,7 +677,7 @@ class CASStore:
                                     task.update(encoded_size + copied, task.amount)
                             # 即使同 DiffID 的旧文件存在，也必须验证新解码结果，
                             # 否则仅复用旧解码层会掩盖错误的 blob→DiffID 对应关系。
-                            self.store_decoded_layer(pending, diff_id)
+                            self.store_decoded_layer(pending, diff_id, owned=True)
                             verified_indices.append(index)
                         except (OSError, EOFError, zlib.error) as exc:
                             raise ArchiveError("Cannot decode CAS base layer: " + str(exc)) from exc

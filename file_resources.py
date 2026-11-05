@@ -20,11 +20,13 @@ def fdopen_owned(descriptor, *args, **kwargs):
         raise
 
 
-def open_regular_file(path):
+def open_regular_file(path, *, writable=False):
+    """按普通文件接管句柄；writable 供独占临时文件在发布前刷盘。"""
     if not stat.S_ISREG(path.lstat().st_mode):
         raise OSError("Artifact is not a regular file")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
-    stream = fdopen_owned(os.open(str(path), flags), "rb")
+    flags = os.O_RDWR if writable else os.O_RDONLY
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    stream = fdopen_owned(os.open(str(path), flags), "r+b" if writable else "rb")
     try:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise OSError("Artifact is not a regular file")

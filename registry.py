@@ -468,8 +468,11 @@ def pull(reference, output, username=None, password=None, ca_file=None,
     if second is not None:
         second.parent.mkdir(parents=True, exist_ok=True)
     stored_reference = cas_reference or client.reference.full
+    workspace_parent = cas_store.root.parent if cas_only else None
+    if workspace_parent is not None:
+        workspace_parent.mkdir(parents=True, exist_ok=True)
     with publication_transaction(cas_store, stored_reference, target_platform, "registry") as published, \
-            tempfile.TemporaryDirectory(prefix="pyimagebuilder-pull-") as temporary:
+            tempfile.TemporaryDirectory(prefix="pyimagebuilder-pull-", dir=workspace_parent) as temporary:
         workspace = Path(temporary)
         with reporter.timed("Registry auth and manifest") if reporter is not None else nullcontext():
             manifest, manifest_digest = _selected_manifest(client, target_platform)
@@ -573,7 +576,7 @@ def pull(reference, output, username=None, password=None, ca_file=None,
             storing = LayerProgress("store", len(layers), reporter, source="registry", image=reference)
             for number, (layer, diff_id) in enumerate(zip(layers, diff_ids), 1):
                 with storing.layer(number, diff_id) as task:
-                    cas_store.store_decoded_layer(layer, diff_id)
+                    cas_store.store_decoded_layer(layer, diff_id, owned=True)
                     task.current = layer.stat().st_size
             raw_layers = [workspace / ("download-{}.blob".format(index))
                           if descriptor["mediaType"] != LAYER_TYPE else layers[index]

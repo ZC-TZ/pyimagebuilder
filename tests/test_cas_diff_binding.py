@@ -130,8 +130,8 @@ class CASDiffBindingTests(unittest.TestCase):
             imported(root, store, raw)
             original = store.store_decoded_layer
 
-            def accept_then_delete(path, diff_id):
-                result = original(path, diff_id)
+            def accept_then_delete(path, diff_id, **options):
+                result = original(path, diff_id, **options)
                 store.remove_ref("example/app:1", "linux/amd64", "artifactory")
                 return result
 
@@ -148,8 +148,8 @@ class CASDiffBindingTests(unittest.TestCase):
             original = store.store_decoded_layer
             winner = []
 
-            def accept_then_replace(path, diff_id):
-                result = original(path, diff_id)
+            def accept_then_replace(path, diff_id, **options):
+                result = original(path, diff_id, **options)
                 winner.append(imported(root, store, layer(b"new"), reference="example/winner:1"))
                 value = dict(winner[-1], reference="example/app:1")
                 with store.ref_lock("example/app:1", "linux/amd64", "artifactory"):
