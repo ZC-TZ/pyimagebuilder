@@ -111,6 +111,7 @@ button.danger:hover{background:#fce6eb}
 .path-dialog li>button{width:100%;justify-content:start;text-align:left;overflow-wrap:anywhere}
 .path-dialog button:disabled{opacity:.5;cursor:default}
 .form-footer{flex:1 0 100%;padding-top:12px;margin-top:3px;border-top:1px solid #edf1f7;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.form-feedback{color:#912f43}.form-feedback:empty{display:none}
 .field-wide{flex-basis:100%}
 .advanced,.toolbox{flex:1 0 100%;min-width:0;border:1px solid var(--line);border-radius:10px;background:#f8faff}
 .advanced{padding:10px 13px}

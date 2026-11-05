@@ -910,8 +910,19 @@ class WorkbenchTests(unittest.TestCase):
             self.assertEqual(self.http("/download?id=" + identity + "&file=0")[2], original)
             reuse = self.http("/reuse?id=" + identity)[2]
             self.assertIn(str(lock).encode(), reuse)
+            self.assertIn(('name="input-lock-job" value="' + identity + '"').encode(), reuse)
             self.assertNotIn(b"NOTE=web-lock", reuse)
-            self.run_job("build", dict(fields, output=str(output), **{"input-lock": str(lock)}))
+            locked = dict(fields, **{"input-lock": str(lock), "input-lock-job": identity})
+            self.run_job("build", dict(locked, output=str(output)))
+            rejected = self.root / "replaced-lock.tar"
+            try:
+                lock.write_bytes(original + b" ")
+                self.assertEqual(json.loads(lock.read_bytes()), json.loads(original))
+                _, rejected_job = self.run_request("/submit/build", dict(locked, output=str(rejected)), expected="failed")
+                self.assertIn("Input lock SHA-256", "\n".join(self.workspace.jobs.snapshot(rejected_job)["logs"]))
+                self.assertFalse(rejected.exists())
+            finally:
+                lock.write_bytes(original)
         from image_cli import inspect_archive
         self.assertEqual(inspect_archive(output)["config"]["Labels"]["test"], "web-lock")
         self.assertTrue(Path(str(output) + ".hermetic.json").is_file())

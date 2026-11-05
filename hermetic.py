@@ -234,7 +234,7 @@ def _copy_base(base_tar, base_map, root):
 
 def build_locked(lock_path, dockerfile, context, base_tar, base_map, tag, output, *,
                  target_platform="linux/amd64", target_stage=None, image_format="docker",
-                 oci_output=None, source_date_epoch=0, build_args=None):
+                 oci_output=None, source_date_epoch=0, build_args=None, expected_lock_digest=None):
     """从通过锁文件校验的输入快照构建镜像。
 
     暂存前和发布前均核对原始输入；构建使用暂存副本，避免普通文件修改悄悄改变结果。
@@ -258,7 +258,10 @@ def build_locked(lock_path, dockerfile, context, base_tar, base_map, tag, output
     if not lock_path.is_file():
         raise BuildError("Input lock not found: " + str(lock_path))
     try:
-        expected = json.loads(lock_path.read_text(encoding="utf-8"))
+        raw_lock = lock_path.read_bytes()
+        if expected_lock_digest is not None and "sha256:" + hashlib.sha256(raw_lock).hexdigest() != expected_lock_digest:
+            raise BuildError("Input lock SHA-256 does not match the selected task")
+        expected = json.loads(raw_lock.decode("utf-8"))
     except (OSError, ValueError) as exc:
         raise BuildError("Invalid input lock: " + str(exc)) from exc
     actual = make_lock(dockerfile, context, base_tar, base_map, tag=tag,

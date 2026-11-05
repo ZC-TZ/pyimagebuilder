@@ -255,6 +255,7 @@ def main(argv=None):
                         help="Build only from a verified local input lock and snapshot; rejects RUN")
     parser.add_argument("--input-lock", type=Path,
                         help="Input lock created by hermetic.py; required with --hermetic")
+    parser.add_argument("--input-lock-digest", help=argparse.SUPPRESS)
     parser.add_argument("--wsl", action="store_true", help="On Windows, run this Python builder inside WSL")
     parser.add_argument("--wsl-distro", help="Optional WSL distribution name")
     parser.add_argument("--wsl-user", help="WSL account for RUN; rootless defaults to distribution's non-root user")
@@ -303,7 +304,7 @@ def main(argv=None):
                     raise BuildError("--hermetic requires an explicit --source-date-epoch")
                 if args.hermetic and args.input_lock is None:
                     raise BuildError("--hermetic requires --input-lock")
-                if args.input_lock is not None and not args.hermetic:
+                if (args.input_lock is not None or args.input_lock_digest is not None) and not args.hermetic:
                     raise BuildError("--input-lock requires --hermetic")
                 args.source_date_epoch = parse_epoch(args.source_date_epoch if args.source_date_epoch is not None
                                                      else os.environ.get("SOURCE_DATE_EPOCH", "0"))
@@ -335,7 +336,8 @@ def main(argv=None):
                         args.input_lock, args.dockerfile, args.context, args.base_tar, args.base_map,
                         args.tag, args.output, target_platform=args.platform, target_stage=args.target,
                         image_format=args.format, oci_output=args.oci_output,
-                        source_date_epoch=args.source_date_epoch, build_args=parsed_args)
+                        source_date_epoch=args.source_date_epoch, build_args=parsed_args,
+                        expected_lock_digest=args.input_lock_digest)
                     published.extend(_build_products(args))
                     published.append(report)
                     digest, size = _archive_digest(result, reporter)

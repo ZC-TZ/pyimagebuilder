@@ -20,16 +20,16 @@ MAX_JOB_BYTES = 512 * 1024
 FORM_FIELDS = {
     "fast": ("package", "project", "version", "profile", "output", "platform", "format"),
     "build": ("context", "dockerfile", "base-tar", "tag", "output", "platform", "format",
-              "target", "offline", "pull", "no-cache", "run", "base-map", "epoch", "input-lock", "attest"),
+              "target", "offline", "pull", "no-cache", "run", "base-map", "epoch", "input-lock", "input-lock-job", "attest"),
 }
 STATES = ("queued", "running", "success", "failed", "cancelled")
 
 
 def form_snapshot(action, data):
-    if action == "lock-inputs":
-        action = "build"
-    return {key: data[key] for key in FORM_FIELDS.get(action, ())
-            if isinstance(data.get(key), str) and len(data[key]) <= 4096}
+    fields = FORM_FIELDS.get("build" if action == "lock-inputs" else action, ())
+    return {key: data[key] for key in fields
+            if isinstance(data.get(key), str) and len(data[key]) <= 4096
+            and (action != "lock-inputs" or key != "input-lock-job")}
 
 
 def task_artifact_suffixes(action):

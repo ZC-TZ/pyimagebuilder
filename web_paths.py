@@ -314,6 +314,8 @@ PATH_SCRIPT = r"""
   }
   for (const form of forms) {
     let submitting = false;
+    const feedback = form.querySelector('[data-lock-feedback]');
+    if (feedback) form.addEventListener('input', () => { feedback.textContent = ''; });
     form.addEventListener('submit', event => {
       const invalidFile = Array.from(form.querySelectorAll('[data-upload-kind] input:not([type])'))
         .find(input => input.validity.customError);
@@ -325,6 +327,26 @@ PATH_SCRIPT = r"""
         event.preventDefault();
         invalidFile.reportValidity();
         return;
+      }
+      if (event.submitter && event.submitter.hasAttribute('data-lock-submit')) {
+        const values = form.elements;
+        const fields = [
+          [values.context, '请填写构建上下文目录。', value => !!value.trim()],
+          [values.dockerfile, '请重新选择 Dockerfile。', () => values.dockerfile.validity.valid],
+          [values.tag, '请填写镜像标签。', value => !!value.trim()],
+          [values.epoch, '请填写非负整数形式的时间戳。', value => /^[0-9]+$/.test(value.trim())],
+          [values['lock-output'], '请填写输入锁的 .json 输出路径。', value => /\.json$/i.test(value)]
+        ];
+        const invalid = fields.find(([field, message, valid]) => !valid(field.value));
+        if (invalid) {
+          event.preventDefault();
+          const [field, message] = invalid;
+          const advanced = field.closest('details');
+          if (advanced) advanced.open = true;
+          feedback.textContent = message;
+          field.focus();
+          return;
+        }
       }
       submitting = true;
     });

@@ -3,6 +3,7 @@
 import socket
 import sys
 import json
+import time
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -196,6 +197,30 @@ def make_server(directory, port=8765, limit=None, workspace=None):
         def _json(self, status, value):
             return self._reply(status, json.dumps(value, ensure_ascii=True), content_type="application/json")
 
+        def _reject_unread_post(self, status, message):
+            """短暂排空小请求体，避免 Windows 在响应读出前重置连接。"""
+            lengths = self.headers.get_all("Content-Length") or []
+            if (self.headers.get("Transfer-Encoding") is None and len(lengths) == 1 and
+                    lengths[0].isascii() and lengths[0].isdecimal() and len(lengths[0]) <= 5):
+                remaining = int(lengths[0])
+                if 0 < remaining <= 32768:
+                    deadline = time.monotonic() + 0.25
+                    try:
+                        while remaining:
+                            timeout = deadline - time.monotonic()
+                            if timeout <= 0:
+                                break
+                            self.request.settimeout(timeout)
+                            block = self.rfile.read1(remaining)
+                            if not block:
+                                break
+                            remaining -= len(block)
+                    except (ConnectionError, socket.timeout):
+                        pass
+                    finally:
+                        self.request.settimeout(5)
+            return self._reply(status, message)
+
         def _host(self):
             port = self.server.server_port
             allowed = {"127.0.0.1:{}".format(port), "localhost:{}".format(port)}
@@ -372,9 +397,10 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                         if action == "lock-inputs":
                             action = "build"
                             draft = {key: value for key, value in draft.items()
-                                     if key not in ("run", "pull", "attest", "input-lock")}
+                                     if key not in ("run", "pull", "attest", "input-lock", "input-lock-job")}
                             if job["state"] == "success" and job.get("artifacts"):
                                 draft["input-lock"] = job["artifacts"][0]["path"]
+                                draft["input-lock-job"] = job["id"]
                         return self._reply(200, _workbench_page(workspace, "复用构建参数",
                                            workspace.builds(action, draft), fast_script=action == "fast"), html=True)
                     return self._reply(200, _workbench_page(workspace, "任务详情", workspace.job_page(job),
@@ -386,13 +412,15 @@ def make_server(directory, port=8765, limit=None, workspace=None):
 
         def do_POST(self):
             if workspace is None:
-                return self._reply(501, "Read-only ledger")
+                return self._reject_unread_post(501, "Read-only ledger")
             from web_workbench import form_data, session_route
             host = self._host()
             if host is None or self.headers.get_all("Origin") != ["http://" + host]:
-                return self._reply(403, "Invalid request origin")
+                return self._reject_unread_post(403, "Invalid request origin")
             path, _, query = self.path.partition("?")
             route = session_route(path, workspace.prefix)
+            if route is None:
+                return self._reject_unread_post(404, "Not found")
             if route in ("/browse-path", "/choose-output") and not query:
                 from web_paths import browse, selected_output
                 try:

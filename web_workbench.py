@@ -388,8 +388,9 @@ class Workbench:
                      '<label>构建参数（每行 NAME=VALUE，不填凭据）<textarea name="build-args" rows="3"></textarea></label>' +
                      _check("attest", "生成 SBOM 和 provenance", draft.get("attest")) +
                      field("sign-key", "本机签名私钥路径（可选）") + "</fieldset></div></details>")
-        lock_button = ('<button type="submit" class="secondary" formnovalidate '
-                       'formaction="{}/submit/lock-inputs">生成输入锁</button>').format(self.prefix)
+        lock_button = ('<button type="submit" class="secondary" formnovalidate data-lock-submit '
+                       'formaction="{}/submit/lock-inputs">生成输入锁</button>'
+                       '<small class="form-feedback" data-lock-feedback role="status"></small>').format(self.prefix)
         if action == "fast":
             return _section("复用快速打包参数", fast)
         if action == "build":
@@ -399,6 +400,9 @@ class Workbench:
                 ordinary += '<input type="hidden" name="require-dockerfile" value="1">'
             if draft.get("input-lock"):
                 note += '<p class="muted">如原任务使用了构建参数，请按原值重新填写。</p>'
+            if draft.get("input-lock-job"):
+                note += '<p class="muted">构建时将核对原任务登记的输入锁摘要。要使用另一份锁，请从构建页重新选择。</p>'
+                ordinary += '<input type="hidden" name="input-lock-job" value="{}">'.format(_e(draft["input-lock-job"]))
             return _section("复用 Dockerfile 构建参数", note + self.form("build", ordinary, secondary=lock_button))
         multiarch = self.form("multiarch", _path_field("amd64", "amd64 OCI tar", required=True, upload="amd64") +
                               _path_field("arm64", "arm64 OCI tar", required=True, upload="arm64") +
@@ -834,7 +838,7 @@ class Workbench:
         running = job["state"] in ("queued", "running")
         summary = ('<div id="job-details">{}</div><div class="job-stage">'
                    '<small>任务状态</small><p id="job-status">{}</p></div>').format(
-                        self.job_details(job), _e(job["status"]))
+                        self.job_details(job), _e(job["status"] or STATES[job["state"]]))
         content = _section(LABELS[job["action"]], summary)
         if not job.get("archived"):
             query = urlencode({"id": job["id"]})
@@ -859,7 +863,7 @@ class Workbench:
     def job_progress(self, job, after):
         end = job.get("log_end", 0)
         start = end - len(job["logs"])
-        return {"details": self.job_details(job), "status": job["status"],
+        return {"details": self.job_details(job), "status": job["status"] or STATES[job["state"]],
                 "running": job["state"] in ("queued", "running"), "archived": bool(job.get("archived")),
                 "start": start, "end": end, "lines": job["logs"][max(0, after - start):]}
 
@@ -908,6 +912,13 @@ class Workbench:
         if action in ("build", "lock-inputs") and data.get("require-dockerfile") == "1":
             path_value(effective, "dockerfile", required=True)
         args, outputs = command_for(action, effective, self.config_arg, self.profiles, paths.get("package"))
+        if action == "build" and data.get("input-lock-job"):
+            path_value(effective, "input-lock", required=True)
+            source = self.get_job(data["input-lock-job"])
+            if (source is None or source["action"] != "lock-inputs" or source["state"] != "success" or
+                    len(source.get("artifacts", [])) != 1):
+                raise BuildError("无法读取原任务登记的输入锁摘要")
+            args.append("--input-lock-digest=" + source["artifacts"][0]["sha256"])
         if any(path.parent in output.parents for path in paths.values() for output in outputs):
             raise BuildError("输出路径不能位于文件暂存目录内")
         delivery = action in ("multiarch", "lock-inputs")
