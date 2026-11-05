@@ -3,7 +3,6 @@
 import hashlib
 import json
 import os
-import shutil
 import sys
 import tarfile
 import tempfile
@@ -11,14 +10,14 @@ from pathlib import Path
 
 from cas_store import CASStore
 from errors import BuildError
+from file_publish import publication_transaction
 from image_cli import (_select_tag, history_archive, load_archive, tag_archive,
                        verify_archive)
-from image_reader import ImageArchiveReader
+from image_reader import ImageArchiveReader, parse_image_json
 from oci_writer import OCIImageWriter
 from registry import parse_reference, push, push_index
 from rootfs_archive import export_rootfs, flatten_image
 from settings import cache_directory, load_settings, repository_settings
-from web_artifacts import verified_artifact
 from web_jobs import file_stamp, open_artifact
 
 
@@ -33,25 +32,33 @@ def push_destination(settings, value):
     return reference.full
 
 
-def _stamp(path):
-    with open_artifact(path) as stream:
-        return file_stamp(os.fstat(stream.fileno()))
-
-
-def _check_source(plan, path):
+def _snapshot_archive(plan, path, snapshot):
+    """验证实际写入私有快照的字节，后续操作始终从该快照读取。"""
     item = plan.get("record")
-    if item is not None:
-        print("正在校验历史归档 SHA-256…", flush=True)
-        state, stream = verified_artifact(item)
-        if stream is None:
-            raise BuildError("历史归档无法通过摘要校验：" + state)
-        with stream:
-            stamp = file_stamp(os.fstat(stream.fileno()))
-    else:
-        stamp = tuple(plan["stamp"])
-    if _stamp(path) != stamp:
-        raise BuildError("源归档已变更，请重新选择")
-    return stamp
+    expected_digest = item["sha256"] if item is not None else plan.get("digest")
+    digest = hashlib.sha256() if expected_digest is not None else None
+    if digest is not None:
+        print("正在校验源归档 SHA-256…", flush=True)
+    with open_artifact(path) as source, snapshot.open("xb") as target:
+        stamp = file_stamp(os.fstat(source.fileno()))
+        size = stamp[2]
+        changed = size != item["bytes"] if item is not None else stamp != tuple(plan["stamp"])
+        if changed:
+            raise BuildError("源归档已变更，请重新选择")
+        remaining = size
+        while remaining:
+            block = source.read(min(remaining, 4 * 1024 * 1024))
+            if not block:
+                raise BuildError("源归档在读取期间被截断")
+            if digest is not None:
+                digest.update(block)
+            target.write(block)
+            remaining -= len(block)
+        if file_stamp(os.fstat(source.fileno())) != stamp:
+            raise BuildError("源归档在读取期间被修改")
+        if digest is not None and "sha256:" + digest.hexdigest() != expected_digest:
+            raise BuildError("源归档 SHA-256 不匹配")
+    return size
 
 
 def _verify_oci(path, tag, platform):
@@ -64,44 +71,21 @@ def _verify_oci(path, tag, platform):
     return {"archive": str(path), "tag": tag, "platform": platform, "format": "oci"}
 
 
-def _deliver_index(plan, settings):
+def _deliver_index(plan, settings, snapshot):
     from multiarch import verify
-    item = plan["record"]
-    path = Path(item["path"])
     tag = plan["tag"]
     if plan["action"] == "verify":
-        _, stream = verified_artifact(item)
-        if stream is None:
-            raise BuildError("多架构归档已移走或摘要不匹配")
-        with stream:
-            verify(path, tag, fileobj=stream)
+        verify(snapshot, tag)
         return {"tag": tag, "platforms": ["linux/amd64", "linux/arm64"], "result": "校验通过"}
 
     destination = push_destination(settings, plan["destination"])
     connection = repository_settings(settings, destination)
     password = (os.environ.get(connection.get("passwordEnv", "PYIMAGEBUILDER_REGISTRY_PASSWORD"))
                 if connection.get("username") is not None else None)
-    print("正在核对多架构归档摘要…", flush=True)
-    with tempfile.TemporaryDirectory(prefix="pyimagebuilder-deliver-index-") as temporary:
-        snapshot = Path(temporary) / "multi.oci.tar"
-        digest = hashlib.sha256()
-        remaining = item["bytes"]
-        with open_artifact(path) as source, snapshot.open("xb") as target:
-            if os.fstat(source.fileno()).st_size != remaining:
-                raise BuildError("多架构归档大小已变更")
-            while remaining:
-                block = source.read(min(remaining, 4 * 1024 * 1024))
-                if not block:
-                    raise BuildError("多架构归档在读取期间被截断")
-                digest.update(block)
-                target.write(block)
-                remaining -= len(block)
-        if "sha256:" + digest.hexdigest() != item["sha256"]:
-            raise BuildError("多架构归档摘要不匹配")
-        print("正在推送 amd64 和 arm64 到 " + destination, flush=True)
-        result = push_index(snapshot, destination, connection.get("username"), password,
-                            connection.get("caFile"), connection.get("insecureHttp", False),
-                            connection.get("authHost"), overwrite=False, expected_tag=tag)
+    print("正在推送 amd64 和 arm64 到 " + destination, flush=True)
+    result = push_index(snapshot, destination, connection.get("username"), password,
+                        connection.get("caFile"), connection.get("insecureHttp", False),
+                        connection.get("authHost"), overwrite=False, expected_tag=tag)
     return {"reference": destination, "digest": result, "platforms": ["linux/amd64", "linux/arm64"]}
 
 
@@ -147,34 +131,60 @@ def execute(plan):
         if str(root) != plan["root"]:
             raise BuildError("镜像库位置已变化，请重新预览")
         return clean_old_images(root, plan["keys"], plan["fingerprint"])
-    if plan["format"] == "oci-index":
-        return _deliver_index(plan, settings)
     store = cache_directory(settings, "imageStore", None)
-    tag, platform = plan["tag"], plan["platform"]
     if plan["format"] == "cas":
-        from image_store import default_store
-        cas = CASStore(store or default_store())
+        return _deliver_cas(plan, settings, store)
+    source = Path(plan["archive"])
+    with publication_transaction() as published, \
+            tempfile.TemporaryDirectory(prefix="pyimagebuilder-deliver-") as temporary:
+        workspace = Path(temporary)
+        snapshot = workspace / "source.tar"
+        size = _snapshot_archive(plan, source, snapshot)
+        if plan["format"] == "oci-index":
+            return _deliver_index(plan, settings, snapshot)
+        result = _deliver_archive(plan, settings, store, snapshot, size, workspace)
+        if result.get("archive") == str(snapshot):
+            result["archive"] = str(source)
+        if "output" in plan:
+            published.append(Path(plan["output"]))
+        return result
+
+
+def _deliver_cas(plan, settings, store):
+    from image_store import default_store, docker_archive_tag
+    root = Path(store or default_store()).resolve()
+    if str(root) != plan["store"]:
+        raise BuildError("镜像库位置已变化，请重新选择")
+    cas = CASStore(root)
+    tag, platform, source = plan["tag"], plan["platform"], plan["source"]
+    action = plan["action"]
+    with cas.ref_lock(tag, platform, source):
+        raw = cas.snapshot_ref(tag, platform, source)
+        if raw is None or parse_image_json(raw, "CAS delivery ref").get("manifest") != plan["manifest"]:
+            raise BuildError("镜像标签已变更，请重新选择")
         if action == "verify":
-            reference = cas.resolve(tag, platform, plan["source"])
-            return {"tag": tag, "platform": platform, "source": plan["source"],
+            reference = cas.resolve(tag, platform, source)
+            return {"tag": tag, "platform": platform, "source": source,
                     "manifest": reference["manifest"], "layers": len(reference["layers"])}
         if action == "save":
-            output = cas.export_docker(tag, plan["output"], platform, plan["source"])
-            return {"tag": tag, "platform": platform, "source": plan["source"], "output": str(output)}
+            output = cas.export_docker(tag, plan["output"], platform, source)
+            return {"tag": tag, "platform": platform, "source": source, "output": str(output)}
         if action == "rootfs-export":
-            return export_rootfs(tag, plan["output"], platform=platform, store=store, kind=plan["source"])
+            return export_rootfs(tag, plan["output"], platform=platform, store=root, kind=source, stored=True)
         if action == "flatten":
-            return flatten_image(tag, plan["output"], platform=platform, store=store, kind=plan["source"],
-                                 changes=plan["changes"])
+            return flatten_image(tag, plan["output"], platform=platform, store=root, kind=source,
+                                 changes=plan["changes"], stored=True)
         if action in ("history", "analyze", "optimize"):
             with tempfile.TemporaryDirectory(prefix="pyimagebuilder-delivery-cas-") as temporary:
-                archive = cas.export_docker(tag, Path(temporary) / "source.tar", platform, plan["source"])
-                from image_store import docker_archive_tag
-                return execute(dict(plan, archive=str(archive), format="docker", tag=docker_archive_tag(tag),
-                                    stamp=_stamp(archive)))
-        raise BuildError("仅有 CAS 数据的镜像请先导出归档")
-    path = Path(plan["archive"])
-    stamp = _check_source(plan, path)
+                workspace = Path(temporary)
+                archive = cas.export_docker(tag, workspace / "source.tar", platform, source)
+                return _deliver_archive(dict(plan, format="docker", tag=docker_archive_tag(tag)),
+                                        settings, store, archive, archive.stat().st_size, workspace)
+    raise BuildError("仅有 CAS 数据的镜像请先导出归档")
+
+
+def _deliver_archive(plan, settings, store, path, size, workspace):
+    action, tag, platform = plan["action"], plan["tag"], plan["platform"]
     is_oci = plan["format"] == "oci"
     if action == "verify":
         return _verify_oci(path, tag, platform) if is_oci else verify_archive(path, tag, platform)
@@ -197,8 +207,6 @@ def execute(plan):
             _verify_oci(path, tag, platform)
         else:
             verify_archive(path, tag, platform)
-        if _stamp(path) != stamp:
-            raise BuildError("源归档已变更")
         if action == "analyze":
             return analyze_image(path, tag)
         return optimize_image(path, plan["output"], tag)
@@ -207,7 +215,7 @@ def execute(plan):
     if action == "flatten":
         result = flatten_image(path, plan["output"], tag=tag, platform=platform,
                                format="oci" if is_oci else "docker", changes=plan["changes"])
-        result.update(before_bytes=stamp[2], after_bytes=Path(plan["output"]).stat().st_size)
+        result.update(before_bytes=size, after_bytes=Path(plan["output"]).stat().st_size)
         result["saved_bytes"] = result["before_bytes"] - result["after_bytes"]
         return result
     if action == "load":
@@ -218,36 +226,24 @@ def execute(plan):
     if action == "tag" and not is_oci:
         # 当前改标签仅支持单镜像 Docker tar；先核对用户选中的平台。
         verify_archive(path, tag, platform)
-        if _stamp(path) != stamp:
-            raise BuildError("源归档已变更")
         return tag_archive(path, plan["new_tag"], plan["output"], tag)
     if action == "push":
         destination = push_destination(settings, plan["destination"])
         connection = repository_settings(settings, destination)
         password = os.environ.get(connection.get("passwordEnv", "PYIMAGEBUILDER_REGISTRY_PASSWORD"))
-        with tempfile.TemporaryDirectory(prefix="pyimagebuilder-deliver-") as temporary:
-            workspace = Path(temporary)
+        archive = path
+        if is_oci:
+            _verify_oci(path, tag, platform)
+        else:
+            print("正在为选中的标签和平台准备 OCI 归档…", flush=True)
+            _select_tag(path, tag)
+            selected = ImageArchiveReader(path, workspace / "layers").read(tag, platform)
             archive = workspace / "delivery.oci.tar"
-            if is_oci:
-                # 网络发布使用私有快照，上传中替换原路径不会改变已确认的内容。
-                with open_artifact(path) as source, archive.open("xb") as target:
-                    if file_stamp(os.fstat(source.fileno())) != stamp:
-                        raise BuildError("源归档已变更，未推送")
-                    shutil.copyfileobj(source, target, 4 * 1024 * 1024)
-                    if file_stamp(os.fstat(source.fileno())) != stamp:
-                        raise BuildError("源归档已变更，未推送")
-                _verify_oci(archive, tag, platform)
-            else:
-                print("正在为选中的标签和平台准备 OCI 归档…", flush=True)
-                _select_tag(path, tag)
-                selected = ImageArchiveReader(path, workspace / "layers").read(tag, platform)
-                OCIImageWriter().write_image(archive, selected, tag)
-            if _stamp(path) != stamp:
-                raise BuildError("源归档已变更，未推送")
-            print("正在推送到 " + destination, flush=True)
-            digest = push(archive, destination, connection.get("username"), password,
-                          connection.get("caFile"), connection.get("insecureHttp", False),
-                          connection.get("authHost"), overwrite=False)
+            OCIImageWriter().write_image(archive, selected, tag)
+        print("正在推送到 " + destination, flush=True)
+        digest = push(archive, destination, connection.get("username"), password,
+                      connection.get("caFile"), connection.get("insecureHttp", False),
+                      connection.get("authHost"), overwrite=False)
         return {"reference": destination, "digest": digest}
     raise BuildError("该归档不支持所选操作")
 

@@ -10,8 +10,10 @@ from collections import OrderedDict
 from pathlib import Path
 
 from build_records import get_build
+from cache_identity import file_identity
 from errors import BuildError
 from image_cli import _check_tag, list_images
+from image_reader import digest_hex
 from image_store import _archive_path
 from settings import cache_directory
 from web_artifacts import artifact_state
@@ -48,9 +50,16 @@ def library_items(settings):
                                 break
                         except BuildError:
                             continue
-                identity = _key([tag, platform, archive, source])
+                manifest = row.get("manifest") if not archive else None
+                if not archive:
+                    try:
+                        digest_hex(manifest)
+                    except BuildError:
+                        continue
+                identity = _key([tag, platform, archive, source, manifest])
                 items.append({"id": identity, "tag": tag, "platform": platform, "archive": archive,
-                              "source": source, "format": "docker" if archive else "cas"})
+                              "source": source, "format": "docker" if archive else "cas",
+                              "manifest": manifest, "store": result["image_store"]})
         row["delivery_items"] = items
     return result
 
@@ -114,10 +123,16 @@ class Delivery:
         if selected.get("record") is not None:
             result["record"] = {key: selected["record"][key] for key in ("path", "bytes", "sha256")}
         elif selected["archive"]:
-            with open_artifact(Path(selected["archive"])) as stream:
+            path = Path(selected["archive"])
+            with open_artifact(path) as stream:
                 result["stamp"] = file_stamp(os.fstat(stream.fileno()))
+                if os.name == "nt":
+                    identity = file_identity(path)
+                    if tuple(identity[:4]) != result["stamp"][:4]:
+                        raise BuildError("源归档已变更，请重新选择")
+                    result["digest"] = identity[-1]
         else:
-            result["source"] = selected["source"]
+            result.update(source=selected["source"], manifest=selected["manifest"], store=selected["store"])
         if action in ("tag", "save", "optimize", "flatten", "rootfs-export"):
             result["output"] = str(_target(data))
         if action == "flatten":

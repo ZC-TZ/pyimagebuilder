@@ -208,11 +208,11 @@ def prepare_rootfs(source, output):
 
 
 @contextmanager
-def open_image(source, workspace, tag=None, platform="linux/amd64", store=None, kind=None):
+def open_image(source, workspace, tag=None, platform="linux/amd64", store=None, kind=None, *, stored=False):
     """从归档或本地引用打开镜像；CAS 直接提供层，无需转换成中间 Docker tar。"""
     platform = normalize_platform(platform)
     path = Path(source)
-    if path.is_file():
+    if not stored and path.is_file():
         with tarfile.open(path, "r:*") as archive:
             members = archive_members(archive)
             is_docker = "manifest.json" in members
@@ -269,7 +269,7 @@ def _output_path(output):
 
 
 def export_rootfs(source, output, tag=None, platform="linux/amd64", store=None,
-                  kind=None, reporter=None, stdout=None):
+                  kind=None, reporter=None, stdout=None, *, stored=False):
     """导出文件系统，不携带 config/manifest/history；'-' 仅写二进制标准输出。"""
     binary = str(output) == "-"
     destination = None if binary else _output_path(output)
@@ -277,7 +277,7 @@ def export_rootfs(source, output, tag=None, platform="linux/amd64", store=None,
             tempfile.TemporaryDirectory(prefix="pyimagebuilder-rootfs-",
                                      dir=destination.parent if destination else None) as temporary:
         workspace = Path(temporary)
-        with open_image(source, workspace, tag, platform, store, kind) as (image, selected):
+        with open_image(source, workspace, tag, platform, store, kind, stored=stored) as (image, selected):
             if reporter is not None:
                 reporter.phase_start("Merge and export rootfs")
             merged = workspace / "rootfs.tar"
@@ -376,7 +376,7 @@ def _config_digest(path, format):
 
 def flatten_image(source, output, reference=None, tag=None, platform="linux/amd64",
                   store=None, kind=None, changes=None, format="docker", source_date_epoch=0,
-                  reporter=None):
+                  reporter=None, *, stored=False):
     """将现有镜像合成一层；保留运行配置，可用 --change 显式覆盖部分字段。"""
     platform, epoch = normalize_platform(platform), parse_epoch(source_date_epoch)
     instructions = parse_changes(changes)
@@ -384,7 +384,7 @@ def flatten_image(source, output, reference=None, tag=None, platform="linux/amd6
     with publication_transaction() as published, \
             tempfile.TemporaryDirectory(prefix="pyimagebuilder-flatten-", dir=destination.parent) as temporary:
         workspace = Path(temporary)
-        with open_image(source, workspace, tag, platform, store, kind) as (image, selected):
+        with open_image(source, workspace, tag, platform, store, kind, stored=stored) as (image, selected):
             output_tag = image_tag(reference or selected)
             if reporter is not None:
                 reporter.phase_start("Flatten source layers")

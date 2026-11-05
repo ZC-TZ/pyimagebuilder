@@ -146,6 +146,7 @@ def list_images(store=None):
             if not path.is_file() or digest_alias:
                 result.append({"tags": [ref["reference"]], "platform": ref["platform"],
                                "source": ref["source"], "storage": "cas",
+                               "manifest": ref.get("manifest"),
                                "archive": str(path) if path.is_file() else None,
                                "bytes": 0 if path.is_file() else
                                         sum(item["size"] for item in ref["layers"])})

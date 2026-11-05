@@ -501,6 +501,7 @@ class WorkbenchTests(unittest.TestCase):
 
     def test_history_checks_content_even_after_equal_size_replacement(self):
         import hashlib
+        import web_artifacts
         archive = self.root / "prior.tar"
         archive.write_bytes(b"original")
         record = build_records.record_build(
@@ -508,7 +509,15 @@ class WorkbenchTests(unittest.TestCase):
             digest="sha256:" + hashlib.sha256(b"original").hexdigest())
         route = "/history-download?id=" + record.stem + "&file=0"
         self.assertEqual(self.http(route)[2], b"original")
-        archive.write_bytes(b"replaced")
+        verify = web_artifacts.verified_artifact
+
+        def overwrite_after_verification(*args, **kwargs):
+            result = verify(*args, **kwargs)
+            archive.write_bytes(b"replaced")
+            return result
+
+        with patch.object(web_artifacts, "verified_artifact", overwrite_after_verification):
+            self.assertEqual(self.http(route)[2], b"original")
         self.assertEqual(self.http(route)[0], 409)
         self.assertEqual(self.http("/history-download?id=../config&file=0")[0], 404)
         archive.unlink()
@@ -554,11 +563,11 @@ class WorkbenchTests(unittest.TestCase):
         self.assertFalse(cas.has_ref(*key))
         self.assertTrue(archive.exists())
 
-    def built_delivery(self, kind="docker", suffix=""):
+    def built_delivery(self, kind="docker", suffix="", contents=b"contents for registry"):
         context = self.root / ("delivery-context" + suffix)
         context.mkdir()
         (context / "Dockerfile").write_text("FROM scratch\nCOPY contents /contents\n", encoding="utf-8")
-        (context / "contents").write_bytes(b"contents for registry")
+        (context / "contents").write_bytes(contents)
         output = self.root / ("release" + suffix + ".tar")
         self.run_job("build", {"context": str(context), "tag": "hisq_front:1.0.0", "output": str(output),
                                "offline": "1", "no-cache": "1", "format": kind})
@@ -606,6 +615,45 @@ class WorkbenchTests(unittest.TestCase):
         self.run_request("/delivery/prepare", {"scope": "library", "id": item["id"],
                          "action": "rootfs-export", "output": str(from_cas)})
         self.assertEqual(from_cas.read_bytes(), from_oci.read_bytes())
+
+    def test_delivery_reads_verified_snapshot_after_original_path_is_replaced(self):
+        import web_delivery_worker
+
+        original, source = self.built_delivery()
+        replacement, _ = self.built_delivery(suffix="-replacement", contents=b"different contents")
+        target = self.root / "snapshot-rootfs.tar"
+        plan = self.workspace.delivery.plan(dict(source, action="rootfs-export", output=str(target)))
+        copy = web_delivery_worker._snapshot_archive
+
+        def replace_after_snapshot(plan, path, snapshot):
+            size = copy(plan, path, snapshot)
+            os.replace(replacement, original)
+            return size
+
+        with patch.object(web_delivery_worker, "_snapshot_archive", replace_after_snapshot):
+            web_delivery_worker.execute(plan)
+        with tarfile.open(target) as archive:
+            self.assertEqual(archive.extractfile("contents").read(), b"contents for registry")
+
+    def test_cas_delivery_rejects_a_tag_updated_after_selection(self):
+        from cas_store import CASStore
+        from errors import BuildError
+        from web_delivery_worker import execute
+
+        _, source = self.built_delivery("oci")
+        self.run_request("/delivery/prepare", dict(source, action="load"))
+        row, = library_items(self.workspace.settings)["images"]
+        item, = row["delivery_items"]
+        selector = {"scope": "library", "id": item["id"]}
+        target = self.root / "stale-cas-export.tar"
+        plan = self.workspace.delivery.plan(dict(selector, action="save", output=str(target)))
+        replacement, _ = self.built_delivery("oci", "-replacement", b"different contents")
+        cas = CASStore(self.workspace.settings["cache"]["imageStore"])
+        cas.import_oci(replacement, item["tag"], item["platform"], "local", replace=True)
+        with self.assertRaisesRegex(BuildError, "标签已变更"):
+            execute(plan)
+        self.assertFalse(target.exists())
+        self.assertEqual(self.http("/delivery?" + urlencode(selector))[0], 400)
 
     def configured_registry(self):
         class LocalRegistry(RegistryHandler):

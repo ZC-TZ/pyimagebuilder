@@ -42,36 +42,37 @@ def artifact_state(item, *, suffixes=(".tar",)):
 
 
 def verified_artifact(item, *, suffixes=(".tar",)):
-    """核对台账摘要后复用同一个文件句柄，避免重新按路径打开另一份文件。"""
+    """下载只返回核对过摘要的快照，避免原文件在响应期间被原地改写。"""
     status, _ = artifact_state(item, suffixes=suffixes)
     if status != "available":
         return status, None
-    stream = None
+    snapshot = None
     try:
-        stream = open_artifact(Path(item["path"]))
-        start = os.fstat(stream.fileno())
-        if not stat.S_ISREG(start.st_mode) or start.st_size != item["bytes"]:
-            return "changed", None
-        digest = hashlib.sha256()
-        remaining = start.st_size
-        while remaining:
-            block = stream.read(min(4 * 1024 * 1024, remaining))
-            if not block:
+        with open_artifact(Path(item["path"])) as stream:
+            start = os.fstat(stream.fileno())
+            if not stat.S_ISREG(start.st_mode) or start.st_size != item["bytes"]:
                 return "changed", None
-            digest.update(block)
-            remaining -= len(block)
-        end = os.fstat(stream.fileno())
-        if (file_stamp(start) != file_stamp(end) or
-                not hmac.compare_digest("sha256:" + digest.hexdigest(), item["sha256"])):
-            return "changed", None
-        stream.seek(0)
-        result, stream = stream, None
+            snapshot = tempfile.TemporaryFile()
+            digest = hashlib.sha256()
+            remaining = start.st_size
+            while remaining:
+                block = stream.read(min(4 * 1024 * 1024, remaining))
+                if not block:
+                    return "changed", None
+                digest.update(block)
+                snapshot.write(block)
+                remaining -= len(block)
+            if (file_stamp(start) != file_stamp(os.fstat(stream.fileno())) or
+                    not hmac.compare_digest("sha256:" + digest.hexdigest(), item["sha256"])):
+                return "changed", None
+        snapshot.seek(0)
+        result, snapshot = snapshot, None
         return "available", result
     except (OSError, ValueError):
         return "unreadable", None
     finally:
-        if stream is not None:
-            stream.close()
+        if snapshot is not None:
+            snapshot.close()
 
 
 def _outside_managed(path, roots):
