@@ -10,6 +10,8 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, deque
+from dataclasses import fields
+from io import StringIO
 from pathlib import Path
 
 from errors import BuildError
@@ -18,6 +20,8 @@ from fast import fast_target, load_profile
 from file_resources import open_regular_file as open_artifact
 from path_policy import output_path, resolve_host_path
 from web_job_journal import JobJournal, form_snapshot
+from progress.events import BuildEvent
+from progress.renderer_plain import PlainRenderer
 
 
 LABELS = {"fast": "快速打包", "build": "Dockerfile 构建", "check": "检查 Dockerfile",
@@ -33,6 +37,24 @@ PLATFORMS = ("linux/amd64", "linux/arm64")
 FORMATS = ("docker", "oci", "both")
 LOG_LINE_CHARS = 4000
 LOG_RECORD_BYTES = 512 * 1024
+EVENT_FIELDS = frozenset(field.name for field in fields(BuildEvent))
+PHASE_NAMES = {"Resolving base image": "准备基础镜像", "Resolving base images": "准备基础镜像",
+               "Preparing application package": "准备应用包", "Preparing build": "解析构建输入",
+               "Exporting image archive": "写出镜像归档", "Verifying image archive": "校验镜像归档"}
+
+
+def _render_event(event):
+    """网页和普通控制台共用事件格式，保留层序号、字节数和耗时。"""
+    values = {key: value for key, value in event.items() if key in EVENT_FIELDS}
+    for key in ("message", "phase"):
+        if isinstance(values.get(key), str):
+            values[key] = PHASE_NAMES.get(values[key], values[key])
+    output = StringIO()
+    try:
+        PlainRenderer(output, error_stream=output).render(BuildEvent(**values))
+    except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+        return "{}: {}".format(event.get("type"), event.get("message") or event.get("phase") or "")
+    return output.getvalue().strip() or "{}: {}".format(event.get("type"), event.get("message") or "")
 
 
 def _text(data, name, default="", strip=True):
@@ -400,6 +422,7 @@ class Jobs:
             self._collect(job, process)
 
     def _collect(self, job, process):
+        active_layers = {}
         try:
             with process.stdout as stream:
                 for raw in iter(lambda: stream.readline(LOG_RECORD_BYTES), b""):
@@ -420,14 +443,33 @@ class Jobs:
                             job["metrics"] = event["web_metrics"]
                             continue
                         if isinstance(event, dict) and "type" in event and "elapsed" in event:
-                            current, total = event.get("current"), event.get("amount")
-                            message = event.get("message") or event.get("phase") or event["type"]
-                            if type(current) is int and type(total) is int and total > 0:
-                                message = "{} · {:.0%}".format(message, min(max(current, 0), total) / total)
-                            job["status"] = str(message)[:LOG_LINE_CHARS]
-                            if event["type"] in ("heartbeat", "step_progress", "layer_progress"):
+                            kind = event["type"]
+                            if kind == "heartbeat":
+                                if active_layers and isinstance(event["elapsed"], (int, float)):
+                                    label, started = min(active_layers.values(), key=lambda item: item[1])
+                                    seconds = max(0, event["elapsed"] - started)
+                                    job["status"] = "{} | {:.0f}s".format(label, seconds)[:LOG_LINE_CHARS]
                                 continue
-                            line = "{}: {}".format(event["type"], message)
+                            rendered = _render_event(event)
+                            details = event.get("details")
+                            if isinstance(details, dict) and isinstance(details.get("group_id"), str):
+                                index = details.get("layer_index")
+                                if type(index) is int:
+                                    key = (details["group_id"], index)
+                                    if kind == "layer_start" and isinstance(event["elapsed"], (int, float)):
+                                        active_layers[key] = (rendered, event["elapsed"])
+                                    elif kind in ("layer_complete", "layer_failed"):
+                                        active_layers.pop(key, None)
+                            if kind in ("phase_start", "phase_success", "step_start", "step_success"):
+                                active_layers.clear()
+                            if rendered:
+                                job["status"] = rendered.splitlines()[0][:LOG_LINE_CHARS]
+                            if kind in ("step_progress", "layer_progress", "layer_start"):
+                                continue
+                            if rendered:
+                                for entry in rendered.splitlines():
+                                    self._append_log(job, entry)
+                            continue
                         self._append_log(job, line)
         except OSError as exc:
             with self.condition:

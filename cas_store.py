@@ -386,6 +386,13 @@ class CASStore:
         source=None 时要求来源唯一；同名镜像存在多个来源时必须明确选择。
         压缩层的摘要校验不等于 DiffID 校验，解压后的内容由 open_base/export_docker 核对。
         """
+        return self._resolve(reference, platform, source, verify_layers=True)
+
+    def inspect_ref(self, reference, platform="linux/amd64", source=None):
+        """准备基础镜像引用时核对元数据与层大小，层内容由实际消费入口校验。"""
+        return self._resolve(reference, platform, source, verify_layers=False)
+
+    def _resolve(self, reference, platform, source, verify_layers):
         platform = normalize_platform(platform)
         sources = (source,) if source is not None else ("local", "registry", "artifactory")
         found = []
@@ -406,7 +413,7 @@ class CASStore:
         if len(found) != 1:
             raise BuildError("Multiple CAS sources for {}; specify --source".format(reference))
         value = found[0]
-        return self._validate_ref_blobs(value, platform)
+        return self._validate_ref_blobs(value, platform, verify_layers=verify_layers)
 
     def _validate_ref_blobs(self, value, platform, verify_layers=True):
         """核对引用与原始 manifest/config；读取镜像时还完整校验传输层摘要。
@@ -582,7 +589,7 @@ class CASStore:
         旧 ref 没有校验记录，首次使用会补验；成功后仍复用解码层。
         不生成中间 Docker save tar；不支持的压缩格式明确报错。
         """
-        value = self.resolve(reference, platform, source)
+        value = self.inspect_ref(reference, platform, source)
         try:
             config, config_raw = read_image_json_file(self._blob(value["config"]), "CAS base config")
             diff_ids = config["rootfs"]["diff_ids"]
@@ -604,6 +611,14 @@ class CASStore:
                 media_type = item["mediaType"]
                 diff_id = item["diff_id"]
                 digest_hex(diff_id)
+                blob = self._blob(item["digest"])
+                encoded_size = blob.stat().st_size
+                decoded_path = self._blob(diff_id)
+                task.amount = encoded_size
+                if decoded_path != blob:
+                    task.amount = encoded_size + decoded_path.stat().st_size if decoded_path.is_file() else None
+                if sha256_file(blob, progress=lambda count: task.update(count, task.amount)) != digest_hex(item["digest"]):
+                    raise ArchiveError("Missing or corrupt CAS blob: " + item["digest"])
                 if media_type.endswith(".tar") and item["digest"] == diff_id:
                     layer = self._blob(diff_id)
                 elif media_type.endswith("+gzip") or media_type.endswith(".gzip"):
@@ -619,7 +634,7 @@ class CASStore:
                                 for block in iter(lambda: source_stream.read(BUFFER), b""):
                                     target.write(block)
                                     copied += len(block)
-                                    task.update(copied)
+                                    task.update(encoded_size + copied, task.amount)
                             # 即使同 DiffID 的旧文件存在，也必须验证新解码结果，
                             # 否则仅复用旧解码层会掩盖错误的 blob→DiffID 对应关系。
                             self.store_decoded_layer(pending, diff_id)
@@ -628,14 +643,16 @@ class CASStore:
                             raise ArchiveError("Cannot decode CAS base layer: " + str(exc)) from exc
                         finally:
                             unlink_missing(pending)
-                    if layer.is_symlink() or sha256_file(layer) != digest_hex(diff_id):
+                    task.amount = encoded_size + layer.stat().st_size
+                    if layer.is_symlink() or sha256_file(layer, progress=lambda count: task.update(
+                            encoded_size + count, task.amount)) != digest_hex(diff_id):
                         raise ArchiveError("CAS decoded layer is corrupt: " + diff_id)
                 else:
                     raise BuildError("Unsupported CAS layer compression: " + media_type)
                 with open(layer, "rb") as checked_layer:
                     verify_layer_tar(checked_layer, "CAS base layer: " + diff_id)
                 paths.append(layer)
-                task.current = layer.stat().st_size
+                task.current = encoded_size + (layer.stat().st_size if layer != blob else 0)
         self._record_verified_diff_ids(value, verified_indices)
         image = BaseImage(config, paths, [reference],
                          {"CASManifest": value["manifest"], "Source": value["source"]},

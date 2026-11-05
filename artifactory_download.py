@@ -1072,7 +1072,7 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
                 storing.finish()
         if cas_only:
             # 保留基础镜像入口对 media type 与配置的检查；层内容已在发布前验证。
-            cas_store.open_base(image_reference, target_platform, "artifactory")
+            cas_store.inspect_ref(image_reference, target_platform, "artifactory")
             preparation.finish()
             return
         display.log("格式转换完成，耗时 {}；开始生成 Docker tar…".format(

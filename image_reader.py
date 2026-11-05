@@ -39,12 +39,16 @@ def digest_hex(value):
     return match.group(1).lower()
 
 
-def sha256_file(path):
+def sha256_file(path, progress=None):
     """分块计算文件摘要，避免把大镜像归档整体读入内存。"""
     value = hashlib.sha256()
+    processed = 0
     with open(path, "rb") as stream:
         for block in iter(lambda: stream.read(BUFFER), b""):
             value.update(block)
+            processed += len(block)
+            if progress is not None:
+                progress(processed)
     return value.hexdigest()
 
 

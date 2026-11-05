@@ -260,10 +260,40 @@ class WorkbenchTests(unittest.TestCase):
         jobs._collect(job, Mock(stdout=stream, wait=Mock(return_value=0)))
         logs = jobs.snapshot(identity)["logs"]
         self.assertEqual(len(logs), 3)
-        self.assertTrue(logs[0].startswith("step_log: 构"))
+        self.assertTrue(logs[0].startswith("> 构"))
         self.assertTrue(logs[0].endswith("…"))
         self.assertTrue(logs[1].endswith("…"))
         self.assertEqual(logs[2], "  next physical line")
+
+    def test_web_layer_logs_keep_indices_timings_and_heartbeat_status(self):
+        jobs = self.workspace.jobs
+        with jobs.condition:
+            identity = jobs.submit("build", [], [], "test")
+            jobs.queue.remove(identity)
+            job = jobs.jobs[identity]
+            job["state"] = "running"
+        details = {"group_id": "test-layer-group", "operation": "verify", "layer_index": 2, "layers_total": 21,
+                   "layers_completed": 1, "cached": True}
+        events = [
+            {"type": "layer_complete", "elapsed": 1, "duration": 0.25,
+             "current": 8 * 1024**2, "details": details},
+            {"type": "layer_start", "elapsed": 2, "details": dict(details, layer_index=3)},
+            {"type": "heartbeat", "elapsed": 7, "message": "FROM very-long-reference"},
+        ]
+        stream = io.BytesIO(b"".join(json.dumps(event).encode() + b"\n" for event in events))
+
+        def finish():
+            status = jobs.snapshot(identity)["status"]
+            self.assertIn("校验基础层 3/21", status)
+            self.assertIn("5s", status)
+            return 0
+
+        jobs._collect(job, Mock(stdout=stream, wait=finish))
+        logs = jobs.snapshot(identity)["logs"]
+        self.assertEqual(len(logs), 1)
+        self.assertIn("校验基础层 2/21", logs[0])
+        self.assertIn("8.0 MiB", logs[0])
+        self.assertIn("0.25s", logs[0])
 
     def test_progress_cannot_overwrite_cancelling_status(self):
         jobs = self.workspace.jobs

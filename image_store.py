@@ -225,7 +225,7 @@ def _pull_image_locked(cas, reference, platform, source, store, refresh, offline
         with cas.ref_lock(reference, platform, "local"):
             local = _archive_path(store, reference, platform, "local")
             if not materialize_tar and cas.has_ref(reference, platform, "local"):
-                cas.resolve(reference, platform, "local")
+                cas.inspect_ref(reference, platform, "local")
                 return _cas_source(store, reference, platform, "local"), False
             if not local.is_file() and cas.has_ref(reference, platform, "local"):
                 cas.export_docker(reference, local, platform, "local")
@@ -235,7 +235,7 @@ def _pull_image_locked(cas, reference, platform, source, store, refresh, offline
                     cas.import_docker(local, reference, platform, "local")
                 return (local if materialize_tar else _cas_source(store, reference, platform, "local")), False
     if not materialize_tar and not refresh and cas.has_ref(reference, platform, source):
-        cas.resolve(reference, platform, source)
+        cas.inspect_ref(reference, platform, source)
         return _cas_source(store, reference, platform, source), False
     if not archive.is_file() and not refresh and cas.has_ref(reference, platform, source):
         cas.export_docker(reference, archive, platform, source)
@@ -298,7 +298,7 @@ def _pull_image_locked(cas, reference, platform, source, store, refresh, offline
                                   **options)
                 raw_imported = "cas_store" in parameters
             if native_cas_only:
-                cas.resolve(reference, platform, source)
+                cas.inspect_ref(reference, platform, source)
             else:
                 _require_base_tag(pending, archive_tag)
                 _check_archive_platform(pending, reference, platform)

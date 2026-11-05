@@ -18,6 +18,8 @@ import registry
 from builder import build
 from cas_store import CASStore
 from image_reader import ImageArchiveReader
+from image_store import pull_image
+from errors import ArchiveError
 from progress import LayerProgress, make_reporter
 from progress.events import BuildEvent
 from progress.renderer_tty import TTYRenderer, terminal_width
@@ -197,6 +199,43 @@ class LayerProgressTests(unittest.TestCase):
             build(dockerfile, root, source, None, "example/app:1", root / "out.tar", reporter=reporter)
             stages = [e["details"]["operation"] for e in self.events(stream) if e["type"] == "layers_complete"]
             self.assertEqual(stages, ["read", "index"])
+
+    def test_base_reference_lookup_defers_layer_scan_until_consumption(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = CASStore(root / "store")
+            files = fixture(3)
+
+            def transfer(_opener, _url, name, directory, _size, _limiter, stats, _display):
+                (directory / name).write_bytes(files[name])
+                stats.add(len(files[name]))
+
+            with patch.object(artifacts, "probe_file_sizes", return_value={n: len(b) for n, b in files.items()}), \
+                    patch.object(artifacts, "download_one", side_effect=transfer), \
+                    patch.object(CASStore, "open_base", side_effect=AssertionError("eager layer scan")):
+                artifacts.download_and_pack(object(), "https://example.test/", list(files), root / "unused.tar",
+                    2, "example.test/repo/base:1", cas_store=store, cas_only=True)
+            value = store.resolve("example.test/repo/base:1", source="artifactory")
+            layers = {store._blob(item["digest"]) for item in value["layers"]}
+            checked = []
+            from image_reader import sha256_file
+
+            def metadata_only(path):
+                self.assertNotIn(Path(path), layers)
+                checked.append(Path(path))
+                return sha256_file(path)
+
+            with patch("cas_store.sha256_file", side_effect=metadata_only):
+                selected, downloaded = pull_image("example.test/repo/base:1", source="artifactory",
+                    store=root / "store", materialize_tar=False, offline=True)
+            self.assertFalse(downloaded)
+            self.assertEqual(selected["type"], "cas")
+            self.assertTrue(checked)
+            blob = next(iter(layers))
+            raw = blob.read_bytes()
+            blob.write_bytes(bytes([raw[0] ^ 1]) + raw[1:])
+            with self.assertRaisesRegex(ArchiveError, "corrupt CAS blob"):
+                store.open_base("example.test/repo/base:1", source="artifactory")
 
 
 if __name__ == "__main__":

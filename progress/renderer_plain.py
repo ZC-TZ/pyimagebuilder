@@ -9,8 +9,9 @@ from .layers import LAYER_EVENTS, format_layer_event
 
 class PlainRenderer(Renderer):
     """把构建事件渲染为适合重定向保存的日志行。"""
-    def __init__(self, stream=None, quiet=False, verbose=False):
+    def __init__(self, stream=None, quiet=False, verbose=False, error_stream=None):
         self.stream = stream or sys.stdout
+        self.error_stream = error_stream or sys.stderr
         self.quiet = quiet
         self.verbose = verbose
 
@@ -54,10 +55,10 @@ class PlainRenderer(Renderer):
                 event.message, event.line or "?", event.duration or 0))
         elif kind == "build_failed":
             label = " at step {}/{}".format(event.step, event.total) if event.step else ""
-            print("Build failed{}: {}".format(label, event.message), file=sys.stderr, flush=True)
+            print("Build failed{}: {}".format(label, event.message), file=self.error_stream, flush=True)
             if event.line:
-                print("Dockerfile:{}".format(event.line), file=sys.stderr, flush=True)
-            print("Duration: {:.2f}s".format(event.duration or 0), file=sys.stderr, flush=True)
+                print("Dockerfile:{}".format(event.line), file=self.error_stream, flush=True)
+            print("Duration: {:.2f}s".format(event.duration or 0), file=self.error_stream, flush=True)
         elif kind == "build_success":
             summary = event.details
             self._line("Build succeeded")
