@@ -243,24 +243,32 @@ def remove_image(reference, store=None, platform="linux/amd64", source=None):
         raise BuildError("Multiple stored sources for {}; specify --source".format(reference))
     kind, _ = matches[0]
     with cas.ref_lock(reference, platform, kind):
-        # 来源选择后可能发生更新；持锁重新确认本次实际删除的对象。
-        archive = _archive_path(root, reference, platform, kind)
-        has_archive = archive.is_file()
-        if has_archive:
-            _check_archive_platform(archive, reference, platform)
-        elif not cas.has_ref(reference, platform, kind):
-            raise BuildError("Image not present in PyImageBuilder store: " + reference)
-        if cas.has_ref(reference, platform, kind):
-            cas.resolve(reference, platform, kind)
-        previous_ref = cas.snapshot_ref(reference, platform, kind)
-        try:
-            cas.remove_ref(reference, platform, kind)
-            if has_archive:
-                archive.unlink()
-        except BaseException:
-            cas.restore_ref(reference, platform, kind, previous_ref)
-            raise
+        _remove_image_locked(root, cas, reference, platform, kind)
     return {"removed": reference, "platform": platform, "source": kind}
+
+
+def _prepare_image_removal(root, cas, reference, platform, kind):
+    archive = _archive_path(root, reference, platform, kind)
+    has_archive = archive.is_file()
+    if has_archive:
+        _check_archive_platform(archive, reference, platform)
+    elif not cas.has_ref(reference, platform, kind):
+        raise BuildError("Image not present in PyImageBuilder store: " + reference)
+    if cas.has_ref(reference, platform, kind):
+        cas.resolve(reference, platform, kind)
+    return archive if has_archive else None, cas.snapshot_ref(reference, platform, kind)
+
+
+def _remove_image_locked(root, cas, reference, platform, kind, prepared=None):
+    archive, previous_ref = prepared if prepared is not None else _prepare_image_removal(
+        root, cas, reference, platform, kind)
+    try:
+        cas.remove_ref(reference, platform, kind)
+        if archive is not None:
+            archive.unlink()
+    except BaseException:
+        cas.restore_ref(reference, platform, kind, previous_ref)
+        raise
 
 
 def prune_images(store=None, older_than_days=None, dry_run=False):

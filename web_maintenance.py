@@ -5,7 +5,8 @@ import json
 import os
 import stat
 import tempfile
-from contextlib import contextmanager
+import time
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
@@ -179,3 +180,70 @@ def clean_cache(root, days, expected):
         for filename, _, _, _ in plan:
             Path(filename).unlink()
     return {"deleted": len(plan), "bytes": sum(row[2] for row in plan), "cache": str(root)}
+
+
+def image_store_root(settings):
+    from image_store import default_store
+    return Path(cache_directory(settings, "imageStore", None) or default_store()).resolve()
+
+
+def _image_snapshot(root, cas, key):
+    from cache_identity import file_identity
+    from image_store import _archive_path
+    archive = _archive_path(root, *key)
+    ref = cas._ref(*key)
+    nodes = []
+    for path in (archive, ref):
+        try:
+            meta = path.lstat()
+        except FileNotFoundError:
+            nodes.append(None)
+            continue
+        if not stat.S_ISREG(meta.st_mode):
+            raise BuildError("镜像候选项已变更：" + str(path))
+        nodes.append(file_identity(path))
+    if not any(nodes):
+        raise BuildError("镜像候选项已不存在")
+    return [nodes, nodes[0][2] if nodes[0] is not None else 0]
+
+
+def old_image_rows(root, candidates, days, limit=20):
+    from cas_store import CASStore
+    from image_store import _archive_path
+    cas = CASStore(root)
+    paths = {item["path"] for item in candidates}
+    threshold = int((time.time() - days * 86400) * 10 ** 9)
+    rows = []
+    seen = set()
+    for ref in cas.list_refs():
+        if not all(isinstance(ref.get(key), str) for key in ("reference", "platform", "source")):
+            continue
+        key = (ref["reference"], ref["platform"], ref["source"])
+        if key not in seen and (str(_archive_path(root, *key)) in paths or str(cas._ref(*key)) in paths):
+            seen.add(key)
+            snapshot = _image_snapshot(root, cas, key)
+            identity = snapshot[0][0] or snapshot[0][1]
+            if identity[3] >= threshold:
+                continue
+            rows.append({"key": key, "snapshot": snapshot})
+            if len(rows) == limit:
+                break
+    return rows
+
+
+def clean_old_images(root, keys, expected):
+    from cas_store import CASStore
+    from image_cli import _prepare_image_removal, _remove_image_locked
+    cas = CASStore(root)
+    keys = sorted(tuple(key) for key in keys)
+    with ExitStack() as locks:
+        for key in keys:
+            locks.enter_context(cas.ref_lock(*key))
+        snapshots = [_image_snapshot(root, cas, key) for key in keys]
+        if cache_fingerprint(snapshots) != expected:
+            raise BuildError("选中的镜像已变化，未删除任何镜像，请重新预览")
+        prepared = [_prepare_image_removal(root, cas, *key) for key in keys]
+        for key, removal in zip(keys, prepared):
+            _remove_image_locked(root, cas, *key, prepared=removal)
+            print("已删除 {} · {} · {}".format(*key), flush=True)
+    return {"deleted": len(keys), "bytes": sum(snapshot[1] for snapshot in snapshots)}

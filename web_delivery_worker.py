@@ -106,6 +106,12 @@ def _deliver_index(plan, settings):
 
 def execute(plan):
     action = plan["action"]
+    if action == "attest-verify":
+        from attest import verify_bundle
+        inputs = {name.replace("-", "_"): path for name, path in plan["inputs"].items()}
+        verify_bundle(inputs["public_key"], inputs["provenance"], inputs["envelope"], inputs["sbom"],
+                      inputs.get("docker_archive"), inputs.get("oci_archive"))
+        return {"签名": "有效", "镜像归档摘要": "匹配", "SBOM 摘要": "匹配"}
     if action == "multiarch":
         from multiarch import combine
         archives = plan["archives"]
@@ -125,6 +131,12 @@ def execute(plan):
         if str(root) != plan["cache"]:
             raise BuildError("缓存目录已变化，请重新预览")
         return clean_cache(root, plan["days"], plan["fingerprint"])
+    if action == "image-clean":
+        from web_maintenance import clean_old_images, image_store_root
+        root = image_store_root(settings)
+        if str(root) != plan["root"]:
+            raise BuildError("镜像库位置已变化，请重新预览")
+        return clean_old_images(root, plan["keys"], plan["fingerprint"])
     if plan["format"] == "oci-index":
         return _deliver_index(plan, settings)
     store = cache_directory(settings, "imageStore", None)
@@ -238,7 +250,7 @@ def main():
             metrics["large_layers"] = result["large_layers"][:50]
         if metrics:
             print(json.dumps({"web_metrics": metrics}))
-        print(json.dumps(result, ensure_ascii=plan["action"] != "repo-test", indent=2))
+        print(json.dumps(result, ensure_ascii=plan["action"] not in ("repo-test", "attest-verify"), indent=2))
         return 0
     except (BuildError, OSError, ValueError, KeyError, TypeError, RuntimeError, tarfile.TarError) as exc:
         print("交付任务失败：{}".format(exc), file=sys.stderr)

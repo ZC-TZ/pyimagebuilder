@@ -101,7 +101,39 @@ PAGES = {
     "配置概览": ("config", "管理 Fast 模板，查看仓库类型和本机运行路径。"),
     "Fast 模板管理": ("config", "编辑模板后可先测试基础镜像，再预览并保存。"),
     "配置变更预览": ("config", ""),
+    "交付验签": ("images", "使用可信公钥核对签名、SBOM 和镜像归档。"),
 }
+
+TASKS_SCRIPT = r"""
+(() => {
+  const list = document.querySelector('[data-task-feed]');
+  if (!list) return;
+  const status = document.getElementById('task-feed-status');
+  let last = list.innerHTML;
+  async function update() {
+    if (!document.hidden) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      try {
+        const response = await fetch(list.dataset.taskFeed, {signal: controller.signal});
+        if (!response.ok) throw new Error('Cannot refresh tasks');
+        const html = await response.text();
+        if (html !== last && !list.contains(document.activeElement)) {
+          list.innerHTML = html;
+          last = html;
+        }
+        status.textContent = '';
+      } catch (error) {
+        status.textContent = '暂时无法刷新任务列表，正在重试。';
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    setTimeout(update, 3000);
+  }
+  setTimeout(update, 3000);
+})();
+"""
 
 
 def _workbench_page(workspace, title, body, fast_script=False, active=None, job_script=False):
@@ -110,6 +142,8 @@ def _workbench_page(workspace, title, body, fast_script=False, active=None, job_
     head = '<script defer src="{}/{}"></script>'.format(workspace.prefix, script) if script else ""
     if "data-path-mode=" in body:
         head += '<script defer src="{}/paths.js"></script>'.format(workspace.prefix)
+    if title == "最近任务":
+        head += '<script defer src="{}/tasks.js"></script>'.format(workspace.prefix)
     return document(title, '<section class="records">{}</section>'.format(body),
                     workspace.nav(default_active if active is None else active), description, head)
 
@@ -205,8 +239,8 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                                           len(rows) > end, workspace=workspace), html=True)
 
         def _get_workbench(self, route, query):
-            from web_workbench import FAST_SCRIPT, JOB_SCRIPT, SPACE_KINDS, download, send_artifact
-            views = {"/workbench": ("构建与打包", workspace.builds), "/jobs": ("最近任务", workspace.tasks),
+            from web_workbench import FAST_SCRIPT, JOB_SCRIPT, SPACE_KINDS, STATES, download, send_artifact
+            views = {"/workbench": ("构建与打包", workspace.builds),
                      "/config": ("配置概览", workspace.configuration)}
             if route == "/download" and len(query) <= 200:
                 try:
@@ -236,6 +270,20 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                 with stream:
                     return send_artifact(self, stream, Path(item["path"]).name, item["bytes"])
             try:
+                if route == "/tasks.js" and not query:
+                    return self._reply(200, TASKS_SCRIPT, content_type="application/javascript")
+                if route in ("/jobs", "/jobs-fragment") and len(query) <= 2048:
+                    fields = parse_qs(query, keep_blank_values=True)
+                    if set(fields) - {"state", "search"} or any(len(values) != 1 for values in fields.values()):
+                        raise ValueError("无效的任务筛选参数")
+                    state, = fields.get("state", [""])
+                    search, = fields.get("search", [""])
+                    if (state and state not in STATES) or len(search) > 160:
+                        raise ValueError("无效的任务筛选条件")
+                    if route == "/jobs-fragment":
+                        return self._reply(200, workspace.tasks(state, search, fragment=True), html=True)
+                    return self._reply(200, _workbench_page(workspace, "最近任务",
+                                       workspace.tasks(state, search)), html=True)
                 if route == "/job-progress" and len(query) <= 100:
                     fields = parse_qs(query, keep_blank_values=True)
                     if set(fields) != {"id", "after"} or any(len(values) != 1 for values in fields.values()):
@@ -287,6 +335,13 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                     return self._reply(200, _workbench_page(workspace, "产物操作",
                                        workspace.delivery_page(data),
                                        active={"history": "history", "job": "jobs"}.get(data.get("scope"), "images")), html=True)
+                if route == "/attest" and len(query) <= 256:
+                    fields = parse_qs(query, keep_blank_values=True)
+                    if any(len(values) != 1 for values in fields.values()) or set(fields) - {"job", "scope", "id", "file"}:
+                        raise ValueError("无效的验签产物选择")
+                    data = {key: values[0] for key, values in fields.items()}
+                    return self._reply(200, _workbench_page(workspace, "交付验签",
+                                       workspace.attestation_page(data), active="jobs" if "job" in data else None), html=True)
                 if route == "/space" and len(query) <= 100:
                     fields = parse_qs(query)
                     kind, = fields.get("kind", [None])
@@ -408,6 +463,8 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                                            active=("jobs" if plan["format"] == "oci-index" else
                                                    "history" if "record" in plan else "images")), html=True)
                     identity = workspace.submit_delivery(plan)
+                elif route == "/image-clean/confirm" and not query:
+                    identity = workspace.confirm_image_cleanup(form_data(self))
                 elif route == "/delivery/confirm" and not query:
                     fields = form_data(self)
                     if set(fields) != {"token"}:

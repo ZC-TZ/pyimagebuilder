@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from collections import OrderedDict, deque
 from pathlib import Path
@@ -25,7 +26,8 @@ LABELS = {"fast": "快速打包", "build": "Dockerfile 构建", "check": "检查
           "remove": "删除镜像引用", "tag": "改标签并另存", "push": "推送镜像",
           "history": "镜像层历史", "analyze": "分析镜像层", "optimize": "优化镜像",
           "flatten": "扁平化镜像", "multiarch": "合并多架构归档",
-          "cache-clean": "清理过期构建缓存", "profile-test": "测试 Fast 基础镜像", "repo-test": "仓库诊断"}
+          "cache-clean": "清理过期构建缓存", "profile-test": "测试 Fast 基础镜像", "repo-test": "仓库诊断",
+          "image-clean": "批量清理旧镜像", "attest-verify": "校验交付签名"}
 PLATFORMS = ("linux/amd64", "linux/arm64")
 FORMATS = ("docker", "oci", "both")
 LOG_LINE_CHARS = 4000
@@ -278,7 +280,9 @@ class Jobs:
         with self.condition:
             def view(job):
                 snapshot = {key: list(value) if key in ("logs", "files", "artifacts") else value
-                            for key, value in job.items() if key not in ("args", "process", "outputs", "cleanup")}
+                            for key, value in job.items() if key not in ("args", "process", "outputs", "cleanup", "started")}
+                if job["state"] == "running":
+                    snapshot["elapsed"] = int(time.monotonic() - job.get("started", time.monotonic()))
                 if job["state"] == "running" and job.get("interrupt"):
                     snapshot["status"] = "正在取消"
                 return snapshot
@@ -326,6 +330,7 @@ class Jobs:
                     return
                 job = self.jobs[self.queue.popleft()]
                 job["state"] = "running"
+                job["started"] = time.monotonic()
                 self._save(job)
                 options = {"start_new_session": True} if os.name == "posix" else {
                     "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
@@ -411,6 +416,8 @@ class Jobs:
             self._finish(job)
 
     def _finish(self, job):
+        if "started" in job:
+            job["elapsed"] = int(time.monotonic() - job.pop("started"))
         cleanup = job.pop("cleanup", None)
         if cleanup is not None:
             try:

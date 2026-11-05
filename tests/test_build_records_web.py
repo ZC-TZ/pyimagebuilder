@@ -193,6 +193,23 @@ class WorkbenchTests(unittest.TestCase):
         output.write_bytes(b"not the registered file")
         self.assertEqual(self.http(download)[0], 409)
 
+    def test_task_filter_fragment_updates_elapsed_and_terminal_state(self):
+        jobs = self.workspace.jobs
+        with jobs.condition:
+            identity = jobs.submit("build", [], [], "sample:1")
+            jobs.queue.remove(identity)
+            job = jobs.jobs[identity]
+            job.update(state="running", started=time.monotonic() - 65)
+        page = self.http("/jobs?state=running&search=sample")[2]
+        self.assertIn(b"/tasks.js", page)
+        self.assertRegex(page, rb"00:01:[0-5][0-9]")
+        with jobs.condition:
+            job["state"] = "success"
+            jobs._finish(job)
+        self.assertNotIn(b"sample:1", self.http("/jobs-fragment?state=running")[2])
+        self.assertIn(b"sample:1", self.http("/jobs-fragment?state=success")[2])
+        self.assertGreaterEqual(jobs.journal.read(identity)["elapsed"], 65)
+
     def test_job_progress_returns_only_new_lines_even_after_log_rotation(self):
         jobs = self.workspace.jobs
         with jobs.condition:
@@ -514,6 +531,28 @@ class WorkbenchTests(unittest.TestCase):
         self.assertTrue(cached.is_file())
         self.assertTrue(delivery.is_file())
 
+    def test_image_cleanup_requires_selection_and_rejects_changed_ref(self):
+        from image_store import _archive_path
+        from cas_store import CASStore
+        archive, _ = self.built_delivery()
+        self.run_job("load", {"archive": str(archive)})
+        root = self.workspace.settings["cache"]["imageStore"]
+        key = ("hisq_front:1.0.0", "linux/amd64", "local")
+        stored = _archive_path(root, *key)
+        cas = CASStore(root)
+        os.utime(stored, (1000, 1000))
+        token = self.confirmation_token(self.http("/space?kind=images&days=30"))
+        self.assertEqual(self.http("/image-clean/confirm", {"token": token})[0], 400)
+        ref = cas._ref(*key)
+        ref.write_bytes(ref.read_bytes() + b" ")
+        self.run_request("/image-clean/confirm", {"token": token, "pick-0": "1"}, expected="failed")
+        self.assertTrue(stored.is_file())
+        token = self.confirmation_token(self.http("/space?kind=images&days=30"))
+        self.run_request("/image-clean/confirm", {"token": token, "pick-0": "1"})
+        self.assertFalse(stored.exists())
+        self.assertFalse(cas.has_ref(*key))
+        self.assertTrue(archive.exists())
+
     def built_delivery(self, kind="docker", suffix=""):
         context = self.root / ("delivery-context" + suffix)
         context.mkdir()
@@ -823,6 +862,15 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(len(job["files"]), 4)
         self.assertNotIn("sign-key", job["form"])
         self.assertNotIn("build-args", job["form"])
+        self.assertIn(b"/attest?job=", self.http("/job?id=" + identity)[2])
+        self.assertIn(str(archive).encode(), self.http("/attest?job=" + identity)[2])
+        proof = {"public-key": str(self.root / "signing.pub"), "docker-archive": str(archive),
+                 "provenance": str(archive) + ".provenance.json", "envelope": str(archive) + ".dsse.json",
+                 "sbom": str(archive) + ".spdx.json"}
+        _, verified = self.run_job("attest-verify", proof)
+        self.assertIn("SBOM 摘要", "\n".join(self.workspace.jobs.snapshot(verified)["logs"]))
+        archive.write_bytes(archive.read_bytes() + b"changed")
+        self.run_request("/submit/attest-verify", proof, expected="failed")
         (context / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
         archives = {}
         for arch in ("amd64", "arm64"):

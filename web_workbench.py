@@ -14,8 +14,9 @@ from errors import BuildError
 from web_artifacts import artifact_state, space_report, verified_artifact
 from web_job_journal import form_snapshot
 from web_delivery import DELIVERY_ACTIONS, Delivery, library_items
-from web_jobs import FORMATS, LABELS, PLATFORMS, Jobs, command_for, fast_plan, path_value
-from web_maintenance import PROFILE_FIELDS, _revision, cache_fingerprint, cache_plan, cache_root, candidate_profile, save_profile
+from web_jobs import FORMATS, LABELS, PLATFORMS, Jobs, _path, command_for, fast_plan, path_value
+from web_maintenance import (PROFILE_FIELDS, _revision, cache_fingerprint, cache_plan, cache_root, candidate_profile,
+                             image_store_root, old_image_rows, save_profile)
 from web_ui import HERO, icon
 from web_uploads import FastUploads
 from web_paths import check_oci_platform
@@ -383,6 +384,7 @@ class Workbench:
         tools = "".join((
             _section("拉取基础镜像", self.form("pull", reference + platform + _select("source", "来源", source))),
             self.repository_diagnostics(),
+            _section("交付验签", '<a class="button" href="{}/attest">打开验签工具</a>'.format(self.prefix)),
             _section("导入 Docker tar", self.form("load", archive + tag + platform)),
             _section("从镜像库导出 tar", self.form("save", reference + platform +
                      _select("source", "来源", source + ("local",)) + _path_field("output", "输出 tar 路径", required=True, mode="output"))),
@@ -422,7 +424,40 @@ class Workbench:
             buttons.append(_section(DELIVERY_ACTIONS[action],
                 '<form class="job-form" action="{}/delivery/prepare" method="post">{}<button>{}</button></form>'.format(
                     self.prefix, content, "预览推送" if action == "push" else DELIVERY_ACTIONS[action])))
+        if item["format"] in ("docker", "oci"):
+            buttons.append(_section("交付验签", '<a class="button" href="{}/attest?{}">校验签名和产物摘要</a>'.format(
+                self.prefix, _e(urlencode({key: data[key] for key in ("scope", "id", "file") if key in data})))))
         return _section("所选产物", _pairs(fields)) + '<div class="operation-grid">{}</div>'.format("".join(buttons))
+
+    def attestation_page(self, data):
+        fields = (("public-key", "可信公钥"), ("provenance", "Provenance"), ("envelope", "DSSE 签名"),
+                  ("sbom", "SPDX SBOM"), ("docker-archive", "Docker tar"), ("oci-archive", "OCI tar"))
+        preset = {}
+        if data.get("job"):
+            job = self.get_job(data["job"])
+            if job is None or job["state"] != "success" or job["action"] != "build":
+                raise BuildError("未找到已完成的签名构建任务")
+            for item in job.get("artifacts", []):
+                for suffix, name in ((".provenance.json", "provenance"), (".dsse.json", "envelope"),
+                                     (".spdx.json", "sbom")):
+                    if item["path"].lower().endswith(suffix):
+                        preset[name] = item["path"]
+            archives = [item["path"] for item in job.get("artifacts", []) if item["path"].lower().endswith(".tar")]
+            format_ = job.get("form", {}).get("format", "docker")
+            archive_fields = (("docker-archive", "oci-archive") if format_ == "both" else
+                              ("oci-archive" if format_ == "oci" else "docker-archive",))
+            if len(archive_fields) == len(archives):
+                preset.update(zip(archive_fields, archives))
+        elif data:
+            item = self.delivery.select(data)
+            if item["format"] not in ("docker", "oci"):
+                raise BuildError("请选择需要验签的 Docker 或 OCI 归档")
+            preset[item["format"] + "-archive"] = item["archive"]
+        inputs = "".join(_path_field(name, label, required=not name.endswith("-archive"), value=preset.get(name, ""))
+                         for name, label in fields)
+        return _section("签名与产物校验",
+                        "<p>请选择从可信渠道获得的公钥。若签名覆盖 Docker 和 OCI 两份归档，请同时提供。</p>"
+                        + self.form("attest-verify", inputs, "开始验签"))
 
     def push_confirmation(self, plan):
         token = self.delivery.offer(plan)
@@ -450,6 +485,18 @@ class Workbench:
         usage, candidates, estimate, summary = space_report(
             self.settings, self.directory, None if kind == "cache" else kind, days)
         confirmation = ""
+        if kind == "images" and candidates:
+            root = image_store_root(self.settings)
+            rows = old_image_rows(root, candidates, days)
+            if rows:
+                token = self.delivery.offer({"action": "image-clean", "root": str(root), "rows": rows,
+                    "config": str(self.config_arg) if self.config_arg is not None else None})
+                choices = "".join(_check("pick-{}".format(index),
+                    _e(" · ".join(row["key"]) + " · " + _size_label(row["snapshot"][1])))
+                    for index, row in enumerate(rows))
+                confirmation = ('<p>最多显示 20 个可确认的镜像。确认后删除勾选的引用和归档，共享层单独预览。</p>'
+                    '<form method="post" action="{}/image-clean/confirm"><input type="hidden" name="token" value="{}">'
+                    '{}<button class="danger">确认删除选中的镜像</button></form>').format(self.prefix, token, choices)
         if kind == "cache":
             from cache_activity import cache_activity
             root = cache_root(self.settings)
@@ -487,6 +534,28 @@ class Workbench:
                 details += "<p>没有符合条件的文件。</p>"
             forms += _section(SPACE_KINDS[kind], details + "<p>实际释放量受共享层和硬链接影响。</p>" + confirmation)
         return forms
+
+    def confirm_image_cleanup(self, fields):
+        def enqueue(plan):
+            selected = []
+            for name, value in fields.items():
+                if name == "token":
+                    continue
+                index = name[5:] if name.startswith("pick-") else ""
+                if value != "1" or not index.isascii() or not index.isdecimal() or len(index) > 2:
+                    raise BuildError("无效的镜像选择")
+                index = int(index)
+                if not 0 <= index < len(plan["rows"]) or name != "pick-{}".format(index):
+                    raise BuildError("无效的镜像选择")
+                selected.append(plan["rows"][index])
+            if not selected:
+                raise BuildError("请至少勾选一个镜像")
+            selected.sort(key=lambda row: row["key"])
+            return self.submit_delivery({"action": "image-clean", "root": plan["root"], "config": plan["config"],
+                "keys": [row["key"] for row in selected],
+                "fingerprint": cache_fingerprint([row["snapshot"] for row in selected])})
+
+        return self.delivery.confirm(fields.get("token"), "image-clean", enqueue)
 
     def configuration(self):
         cache = self.settings.get("cache", {})
@@ -584,19 +653,40 @@ class Workbench:
         return self.submit_delivery({"action": "profile-test", "config": str(self.config),
                                      "form": data, "platform": platform, "label": data.get("name", "")})
 
-    def tasks(self):
+    def tasks(self, state="", search="", fragment=False):
         jobs = self.jobs.snapshot()
         active = {item["id"] for item in jobs}
         jobs += [self._archived(item) for item in self.jobs.journal.recent() if item["id"] not in active]
-        if not jobs:
-            return ('<div class="empty"><p>还没有网页任务。</p>'
-                    '<a class="button primary" href="{}/workbench">去构建</a></div>').format(self.prefix)
+        jobs = [job for job in jobs if job["action"] in LABELS and (not state or job["state"] == state) and
+                (not search or search.casefold() in (job["label"] + " " + LABELS[job["action"]]).casefold())]
+
+        def elapsed(job):
+            seconds = job.get("elapsed")
+            if seconds is None:
+                return ""
+            return '<small>耗时 {:02d}:{:02d}:{:02d}</small>'.format(seconds // 3600, seconds // 60 % 60, seconds % 60)
+
         rows = "".join(('<li class="job-row"><div>{} <strong>{}</strong><code>{}</code></div>'
-                        '<a class="button compact" href="{}/job?{}">查看任务</a></li>').format(
+                        '{} <a class="button compact" href="{}/job?{}">查看任务</a></li>').format(
                             _job_state(job["state"]), LABELS[job["action"]],
-                            _e(job["label"] or job.get("updated", "")), self.prefix,
-                            urlencode({"id": job["id"]})) for job in jobs if job["action"] in LABELS)
-        return _section("任务列表", '<ul class="job-list">{}</ul>'.format(rows))
+                            _e(job["label"] or job.get("updated", "")), elapsed(job), self.prefix,
+                            urlencode({"id": job["id"]})) for job in jobs)
+        if rows:
+            body = '<ul class="job-list">{}</ul>'.format(rows)
+        elif state or search:
+            body = '<p class="muted">没有符合条件的网页任务。</p>'
+        else:
+            body = ('<div class="empty"><p>还没有网页任务。</p>'
+                    '<a class="button primary" href="{}/workbench">去构建</a></div>').format(self.prefix)
+        if fragment:
+            return body
+        query = _e(urlencode({"state": state, "search": search}))
+        filters = ('<form method="get" action="{}/jobs">{}{}<button>筛选</button></form>'.format(
+            self.prefix, _select("state", "状态", ("",) + tuple(STATES), state, {"": "全部", **STATES}),
+            _input("search", "项目、标签或任务类型", value=search)))
+        return _section("任务列表", filters +
+                        '<div data-task-feed="{}/jobs-fragment?{}">{}</div><small id="task-feed-status"></small>'.format(
+                            self.prefix, query, body))
 
     def _archived(self, item):
         state = "unknown" if item["state"] in ("queued", "running") else item["state"]
@@ -640,6 +730,10 @@ class Workbench:
                 and artifact_state(artifacts[0])[0] == "available"):
             content += '<p><a class="button compact" href="{}/delivery?{}">校验并推送多架构镜像</a></p>'.format(
                 self.prefix, _e(urlencode({"scope": "job", "id": identity})))
+        if state == "success" and job["action"] == "build" and any(
+                item["path"].lower().endswith(".dsse.json") for item in artifacts):
+            content += '<p><a class="button compact" href="{}/attest?{}">校验交付签名</a></p>'.format(
+                self.prefix, _e(urlencode({"job": identity})))
         if job.get("archived"):
             content += "<p>历史任务保存结果和产物记录，原始日志保留在运行任务的会话中。</p>"
         return content
@@ -698,6 +792,18 @@ class Workbench:
             raise
 
     def _submit(self, action, data, paths, cleanup):
+        if action == "attest-verify":
+            inputs = {}
+            for name in ("public-key", "provenance", "envelope", "sbom", "docker-archive", "oci-archive"):
+                value = path_value(data, name, required=not name.endswith("-archive"))
+                if value:
+                    path = _path(value)
+                    if not path.is_file():
+                        raise BuildError("验签输入不是现有文件：" + name)
+                    inputs[name] = str(path)
+            if "docker-archive" not in inputs and "oci-archive" not in inputs:
+                raise BuildError("请提供签名覆盖的镜像归档")
+            return self.submit_delivery({"action": action, "inputs": inputs})
         if action == "repo-test":
             from web_repository import diagnostic_plan
             plan = diagnostic_plan(self.settings, data.get("host", ""), data.get("reference", "").strip())

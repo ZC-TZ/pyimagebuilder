@@ -58,6 +58,8 @@ class JobJournal:
                 "updated": datetime.now(timezone.utc).isoformat(timespec="seconds")}
         if "code" in job:
             item["code"] = job["code"]
+        if "elapsed" in job:
+            item["elapsed"] = job["elapsed"]
         if job["state"] == "success" and job.get("artifacts"):
             item["artifacts"] = artifact_records(job["artifacts"])
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -86,6 +88,8 @@ class JobJournal:
                     not isinstance(item.get("form"), dict)):
                 return None
             item["form"] = form_snapshot(item["action"], item["form"])
+            if type(item.get("elapsed")) is not int or item["elapsed"] < 0:
+                item.pop("elapsed", None)
             item["artifacts"] = artifact_records(item.get("artifacts")) if item["state"] == "success" else []
             return item
         except (OSError, ValueError, RecursionError):
