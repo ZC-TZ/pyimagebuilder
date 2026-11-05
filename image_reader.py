@@ -28,7 +28,7 @@ SHA256 = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
 # 旧条目只识别首个 tar 头，未证明成员负载完整；首次复用需重新验证。
 # 版本 3 将可信身份绑定到实际读取的归档句柄，排除读取中换源产生的旧条目。
 # 版本 4 在首次验证时同时预检权限/属主/xattr，旧结构校验凭据不能代替它。
-BASE_CACHE_VERSION = 5
+BASE_CACHE_VERSION = 6
 
 
 def digest_hex(value):
@@ -46,6 +46,19 @@ def sha256_file(path):
         for block in iter(lambda: stream.read(BUFFER), b""):
             value.update(block)
     return value.hexdigest()
+
+
+def verified_layer_identity(path, expected, identity):
+    """把待登记的缓存文件身份与最终路径上实际验证过的内容绑定。"""
+    stamp = identity(path)
+    digest = stamp[-1]
+    if not isinstance(digest, str):
+        digest = "sha256:" + sha256_file(path)
+        if identity(path) != stamp:
+            raise ArchiveError("Layer file changed while binding cache identity")
+    if digest != expected:
+        raise ArchiveError("Layer DiffID changed before cache publication")
+    return stamp
 
 
 def outer_name(name):
@@ -370,9 +383,7 @@ class ImageArchiveReader:
                     if os.path.exists(pending):
                         os.unlink(pending)
         self._check_source_unchanged()
-        layer_identity = self._identity(layer)
-        if isinstance(layer_identity[-1], str) and layer_identity[-1] != expected:
-            raise ArchiveError("Base layer DiffID changed before cache publication")
+        layer_identity = verified_layer_identity(layer, expected, self._identity)
         entry = {"version": BASE_CACHE_VERSION,
                  "source": getattr(self, "_source_identity", None) or self._identity(self.path),
                  "layer": layer_identity,

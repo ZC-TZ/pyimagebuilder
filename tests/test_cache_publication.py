@@ -17,6 +17,7 @@ import cache as cache_module
 import image_reader
 from builder import build
 from cache import LayerCache
+from cache_identity import stat_identity
 from errors import ArchiveError, BuildError
 from image_reader import ImageArchiveReader, sha256_file
 from rootfs import RootFSIndex
@@ -32,6 +33,33 @@ def make_layer(path, payload):
 
 
 class CachePublicationTests(unittest.TestCase):
+    def test_replacement_after_layer_move_cannot_publish_trusted_metadata(self):
+        for kind in ("instruction", "base"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / "source.tar"
+                digest = make_layer(source, b"old")
+                changed = root / "changed.tar"
+                make_layer(changed, b"new")
+                store = root / "cache"
+                replace = os.replace
+                fixture = LayerCache(store) if kind == "instruction" else ImageArchiveReader(
+                    make_base(root), root / "workspace", store)
+
+                def swap_after_publish(source, target):
+                    replace(source, target)
+                    if Path(target).parent == store / "layers":
+                        Path(target).write_bytes(changed.read_bytes())
+
+                with patch("os.replace", swap_after_publish), \
+                        patch.object(fixture, "_identity", side_effect=lambda path: stat_identity(path.stat())):
+                    with self.assertRaisesRegex(ArchiveError, "DiffID changed"):
+                        if kind == "instruction":
+                            fixture.store("key", digest, source)
+                        else:
+                            fixture.read("example/base:1")
+                self.assertEqual(list(store.rglob("*.json")), [])
+
     def test_instruction_copy_rejects_source_changed_after_initial_hash(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

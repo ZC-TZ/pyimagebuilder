@@ -15,7 +15,7 @@ from file_resources import fdopen_owned
 from cache_identity import file_identity
 from store_lock import file_lock
 from path_policy import cache_entry_key
-from image_reader import digest_hex, sha256_file, verify_layer_tar
+from image_reader import digest_hex, sha256_file, verified_layer_identity, verify_layer_tar
 
 
 # 旧 RUN 层可能依赖宿主组、错误的附加组或被 umask 削减的 /tmp 权限。
@@ -34,7 +34,8 @@ from image_reader import digest_hex, sha256_file, verify_layer_tar
 # 版本 22 排除 Windows 旧文件身份误命中后，依据错误基础 rootfs 生成的后续层。
 # 版本 23 排除多阶段 RUN 共用物化目录后，读取前一阶段残留内容生成的层及后续结果。
 # 版本 25 排除 Windows 同一 ChangeTime 内误命中的基础层衍生结果。
-CACHE_VERSION = 25
+# 版本 26 排除最终层路径被换写后，仍登记错误文件身份的结果。
+CACHE_VERSION = 26
 
 
 def cache_key(*values):
@@ -108,6 +109,8 @@ class LayerCache:
                     return None
                 with open(path, "rb") as checked_layer:
                     verify_layer_tar(checked_layer, "instruction cache layer")
+                if self._identity(path) != signature:
+                    return None
                 if not self.verify:
                     metadata["file_identity"] = signature
                     descriptor, pending = tempfile.mkstemp(prefix="entry-", suffix=".part", dir=self.entries)
@@ -159,11 +162,9 @@ class LayerCache:
                 finally:
                     if os.path.exists(temporary):
                         os.unlink(temporary)
-            signature = self._identity(target)
-            if os.name == "nt" and signature[-1] != diff_id:
-                raise BuildError("Generated layer DiffID changed before cache publication")
+            signature = verified_layer_identity(target, diff_id, self._identity)
             metadata = {"version": CACHE_VERSION, "key": key, "empty": False,
-                        "diff_id": diff_id, "size": target.stat().st_size,
+                        "diff_id": diff_id, "size": signature[2],
                         "file_identity": signature}
         descriptor, temporary = tempfile.mkstemp(prefix="entry-", suffix=".part", dir=self.entries)
         try:
