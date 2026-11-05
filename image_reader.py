@@ -28,7 +28,7 @@ SHA256 = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
 # 旧条目只识别首个 tar 头，未证明成员负载完整；首次复用需重新验证。
 # 版本 3 将可信身份绑定到实际读取的归档句柄，排除读取中换源产生的旧条目。
 # 版本 4 在首次验证时同时预检权限/属主/xattr，旧结构校验凭据不能代替它。
-BASE_CACHE_VERSION = 4
+BASE_CACHE_VERSION = 5
 
 
 def digest_hex(value):
@@ -287,22 +287,25 @@ class ImageArchiveReader:
 
     def _check_source_unchanged(self):
         """归档身份取自已打开的文件，后续路径变化不能授权复用旧层。"""
-        expected = getattr(self, "_source_identity", None)
-        if expected is not None and self._identity(self.path) != expected:
+        expected = getattr(self, "_source_stamp", None)
+        if expected is not None and file_identity(self.path, content=False) != expected:
             raise ArchiveError("Base image archive changed while reading; retry with a stable archive")
 
     @contextmanager
     def _open_archive(self):
         with open(self.path, "rb") as source:
-            self._source_identity = self._identity(self.path)
+            self._source_stamp = file_identity(self.path, content=False)
+            self._source_identity = self._identity(self.path) if self.trusted_layer_store is not None else None
             # Windows 部分 Python 版本的 stat/fstat 对 ctime 定义不同。
             # 设备、inode、大小及 mtime 绑定实际句柄，ctime 使用路径侧的一致语义。
-            if self._stat_identity(os.fstat(source.fileno()))[:4] != self._source_identity[:4]:
+            if self._stat_identity(os.fstat(source.fileno()))[:4] != self._source_stamp[:4]:
                 raise ArchiveError("Base image archive changed while opening")
             self._check_source_unchanged()
             with tarfile.open(fileobj=source, mode="r:*") as archive:
                 yield archive
             self._check_source_unchanged()
+            if self._source_identity is not None and self._identity(self.path) != self._source_identity:
+                raise ArchiveError("Base image archive content changed while reading; retry with a stable archive")
 
     def _cached_layer(self, name, expected):
         if self.trusted_layer_store is None:
@@ -323,9 +326,10 @@ class ImageArchiveReader:
             entry = json.loads(metadata.read_text(encoding="utf-8"))
             if (entry.get("version") == BASE_CACHE_VERSION and
                     entry.get("source") == (getattr(self, "_source_identity", None) or self._identity(self.path)) and
-                    entry.get("layer") == self._identity(layer) and
                     entry.get("diff_id") == expected):
-                return layer, (layer, metadata)
+                identity = self._identity(layer)
+                if entry.get("layer") == identity and (not isinstance(identity[-1], str) or identity[-1] == expected):
+                    return layer, (layer, metadata)
         except (OSError, ValueError, AttributeError):
             pass
         return None, (layer, metadata)
@@ -366,9 +370,12 @@ class ImageArchiveReader:
                     if os.path.exists(pending):
                         os.unlink(pending)
         self._check_source_unchanged()
+        layer_identity = self._identity(layer)
+        if isinstance(layer_identity[-1], str) and layer_identity[-1] != expected:
+            raise ArchiveError("Base layer DiffID changed before cache publication")
         entry = {"version": BASE_CACHE_VERSION,
                  "source": getattr(self, "_source_identity", None) or self._identity(self.path),
-                 "layer": self._identity(layer),
+                 "layer": layer_identity,
                  "diff_id": expected}
         descriptor, pending = tempfile.mkstemp(prefix="base-entry-", suffix=".part", dir=metadata.parent)
         try:

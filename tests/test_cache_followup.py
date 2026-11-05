@@ -42,7 +42,8 @@ class CacheFollowupTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-    def test_restored_mtime_cannot_authorize_changed_instruction_layer(self):
+    @patch.object(cache_identity, "_windows_change_time", return_value=12345)
+    def test_restored_mtime_cannot_authorize_changed_instruction_layer(self, _change_time):
         source = self.root / "layer.tar"
         layer_file(source, {"payload": b"old"})
         cache = LayerCache(self.root / "cache")
@@ -55,7 +56,8 @@ class CacheFollowupTests(unittest.TestCase):
         cache.store("key", digest, source)
         self.assertEqual(sha256_file(cache.lookup("key").path), digest[7:])
 
-    def test_restored_mtime_cannot_authorize_changed_base_archive(self):
+    @patch.object(cache_identity, "_windows_change_time", return_value=12345)
+    def test_restored_mtime_cannot_authorize_changed_base_archive(self, _change_time):
         archive = make_base(self.root)
         directory = self.root / "base-cache"
         ImageArchiveReader(archive, self.root / "first", directory).read("example/base:1")
@@ -68,7 +70,8 @@ class CacheFollowupTests(unittest.TestCase):
         with self.assertRaisesRegex(ArchiveError, "DiffID mismatch"):
             ImageArchiveReader(archive, self.root / "second", directory).read("example/base:1")
 
-    def test_restored_mtime_cannot_authorize_changed_decoded_base_layer(self):
+    @patch.object(cache_identity, "_windows_change_time", return_value=12345)
+    def test_restored_mtime_cannot_authorize_changed_decoded_base_layer(self, _change_time):
         archive = make_base(self.root)
         directory = self.root / "base-cache"
         image = ImageArchiveReader(archive, self.root / "first", directory).read("example/base:1")

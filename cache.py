@@ -33,7 +33,8 @@ from image_reader import digest_hex, sha256_file, verify_layer_tar
 # 版本 21 排除旧 URL 文件名解析与 RUN rootfs 链接跳转语义生成的结果。
 # 版本 22 排除 Windows 旧文件身份误命中后，依据错误基础 rootfs 生成的后续层。
 # 版本 23 排除多阶段 RUN 共用物化目录后，读取前一阶段残留内容生成的层及后续结果。
-CACHE_VERSION = 24
+# 版本 25 排除 Windows 同一 ChangeTime 内误命中的基础层衍生结果。
+CACHE_VERSION = 25
 
 
 def cache_key(*values):
@@ -72,7 +73,7 @@ class LayerCache:
     def lookup(self, key):
         """返回有效缓存结果；元数据过期、缺失或内容损坏时返回 None。
 
-        默认模式下，文件身份全部匹配时可跳过完整哈希；Windows 额外检查 ChangeTime。
+        默认模式下，Linux 文件身份匹配时可跳过完整哈希；Windows 身份含内容摘要。
         文件身份变化或 verify=True 时重新核对 DiffID 与 tar 格式。
         这只适用于可信本地缓存，不能抵御同时修改内容和缓存元数据的攻击者。
         """
@@ -99,6 +100,9 @@ class LayerCache:
             if path.is_symlink() or not path.is_file() or path.stat().st_size != metadata["size"]:
                 return None
             signature = self._identity(path)
+            windows_digest = signature[-1] if os.name == "nt" else None
+            if windows_digest is not None and windows_digest != "sha256:" + digest:
+                return None
             if self.verify or metadata.get("file_identity") != signature:
                 if sha256_file(path) != digest:
                     return None
@@ -155,9 +159,12 @@ class LayerCache:
                 finally:
                     if os.path.exists(temporary):
                         os.unlink(temporary)
+            signature = self._identity(target)
+            if os.name == "nt" and signature[-1] != diff_id:
+                raise BuildError("Generated layer DiffID changed before cache publication")
             metadata = {"version": CACHE_VERSION, "key": key, "empty": False,
                         "diff_id": diff_id, "size": target.stat().st_size,
-                        "file_identity": self._identity(target)}
+                        "file_identity": signature}
         descriptor, temporary = tempfile.mkstemp(prefix="entry-", suffix=".part", dir=self.entries)
         try:
             with fdopen_owned(descriptor, "w", encoding="utf-8") as output:

@@ -43,11 +43,11 @@ def _windows_change_time(stream):
     return None
 
 
-def file_identity(path):
+def file_identity(path, *, content=True):
     """构造缓存身份；Windows 不能仅凭创建时间和可恢复的 mtime 判定未变化。
 
-    支持 ChangeTime 的文件系统仍保留快速命中；无法取得时用内容摘要兜底。
-    这不是防篡改证明，调用方仍需保证可信缓存和稳定输入。
+    Windows 同一时间粒度内的写入可能得到相同 ChangeTime。持久身份使用内容摘要；
+    已在读取前后核对内容的调用方可用 ChangeTime 做过程中的轻量检查。
     """
     path = Path(path)
     identity = stat_identity(path.stat())
@@ -57,13 +57,16 @@ def file_identity(path):
         if stat_identity(os.fstat(stream.fileno()))[:4] != identity[:4]:
             raise OSError("File changed while inspecting cache identity: " + str(path))
         changed = _windows_change_time(stream)
-        if changed is None:
+        if content or changed is None:
             digest = hashlib.sha256()
             for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
                 digest.update(block)
             token = "sha256:" + digest.hexdigest()
         else:
             token = "windows-change:" + str(changed)
+        if (stat_identity(os.fstat(stream.fileno()))[:4] != identity[:4] or
+                _windows_change_time(stream) != changed):
+            raise OSError("File changed while inspecting cache identity: " + str(path))
     if stat_identity(path.stat())[:4] != identity[:4]:
         raise OSError("File changed while inspecting cache identity: " + str(path))
     return identity + [token]
