@@ -99,6 +99,11 @@ Artifactory 供构建使用的 CAS-only 拉取会先取 manifest/config，再把
 准备跨度包含与下载重叠的部分，不能与下载耗时直接相加；判断总收益请看总耗时和剩余等待。
 原有独立 Docker tar 转换路径继续显示 `Convert Artifactory layers`。
 
+独立 Artifactory 下载生成 Docker tar 时，会在私有临时归档完成后显示
+「正在校验 Docker 镜像归档…」，核对实际归档的配置、层摘要和 tar 结构，再发布最终路径。
+这次检查计入原打包耗时；失败时删除临时归档并恢复旧 CAS 引用。
+Fast 使用 CAS 的构建路径不增加中间 tar。
+
 CAS 的 `FROM` 读取会在每层完成结构验证后，立即用同一份成员信息建立文件索引。
 因此「校验基础层」和「应用基础层」事件可交错，前者的耗时也包含内部索引回调；
 评估这一段请使用 `Read and index base CAS` 的总耗时，不要把嵌套的层耗时再相加。

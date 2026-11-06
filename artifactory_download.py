@@ -42,10 +42,11 @@ from compat import unlink_missing, is_linked_directory
 from file_resources import fdopen_owned
 from task_resources import cancel_pending_on_error
 from file_publish import publication_transaction, publish_new_file
-from path_policy import archive_path, host_components, output_path
+from path_policy import archive_path, host_components, host_path_aliases, output_path
 from errors import ArchiveError, BuildError
 from progress.layers import LayerProgress
 from image_reader import DigestReader, read_image_json_file, verify_layer_tar
+from image_writer import ImageArchiveWriter
 from reproducible import TAR_COPY_BUFFER
 from network_tls import RepositoryHTTPSHandler, https_origin, tls_context, tls_options
 
@@ -460,6 +461,21 @@ def verify_registry_blob(path: Path, digest: str, description: str) -> None:
         ))
 
 
+def _read_config_blob(path, entry):
+    """将摘要校验绑定到实际解析的原始字节，不再分次验证、解析和复制配置。"""
+    try:
+        config, raw = read_image_json_file(path, "镜像 config blob")
+    except ArchiveError as exc:
+        raise RuntimeError("镜像 config blob 不是有效 JSON：{}".format(exc)) from exc
+    expected = parse_sha256_digest(entry.get("digest"), "config.digest")
+    actual = hashlib.sha256(raw).hexdigest()
+    if actual != expected:
+        raise RuntimeError("镜像 config blob 摘要校验失败：期望 {}，实际 {}".format(expected, actual))
+    if entry.get("size") is not None and (type(entry["size"]) is not int or entry["size"] != len(raw)):
+        raise RuntimeError("镜像 config blob size mismatch")
+    return config, raw
+
+
 def materialize_layer(blob: Path, target: Path, media_type: str,
                       expected_diff_id: str, index: int, total: int,
                       display: ProgressDisplay, expected_blob_digest=None, progress=None) -> str:
@@ -548,14 +564,13 @@ def convert_registry_to_docker_archive(raw_root: Path, archive_root: Path,
     config_digest = config_entry["digest"]
     config_hex = parse_sha256_digest(config_digest, "config.digest")
     config_blob = find_blob(raw_root, config_digest, "config.digest")
-    verify_registry_blob(config_blob, config_digest, "config blob")
-    config = load_json_object(config_blob, "镜像 config blob")
+    config, config_raw = _read_config_blob(config_blob, config_entry)
     diff_ids = config.get("rootfs", {}).get("diff_ids") if isinstance(config.get("rootfs"), dict) else None
     if not isinstance(diff_ids, list) or len(diff_ids) != len(layers):
         raise RuntimeError("config.rootfs.diff_ids 数量与 manifest.layers 不一致")
 
     config_name = config_hex + ".json"
-    shutil.copyfile(str(config_blob), str(archive_root / config_name))
+    (archive_root / config_name).write_bytes(config_raw)
     layer_paths = []
     parent_chain = None
 
@@ -605,8 +620,8 @@ def convert_registry_to_docker_archive(raw_root: Path, archive_root: Path,
     return [archive_root / name for name in layer_paths]
 
 
-def pack_files(root: Path, output: Path, display: ProgressDisplay) -> float:
-    """写入独占临时 tar，并显示进度；通过公共发布器交付到新目标。"""
+def pack_files(root: Path, output: Path, display: ProgressDisplay, expected_tag=None) -> float:
+    """写入私有 tar；镜像调用方提供标签时，完整校验实际归档后才发布。"""
     output = output_path(output)
     root = Path(root).resolve()
     def collect(directory):
@@ -662,6 +677,9 @@ def pack_files(root: Path, output: Path, display: ProgressDisplay) -> float:
             reporter.join()
             if report_errors:
                 raise BuildError("Artifactory pack progress failed") from report_errors[0]
+            if expected_tag is not None:
+                display.log("正在校验 Docker 镜像归档…")
+                ImageArchiveWriter().verify(part_output, expected_tag)
             publish_new_file(part_output, output)
             published.append(output)
         finally:
@@ -862,8 +880,7 @@ def _cas_download_metadata(opener, directory_url, files, raw_root, sizes, limite
     config_name = _blob_artifact_name(files, config_entry.get("digest"), "config.digest")
     fetch(config_name)
     config_path = raw_root.joinpath(*config_name.split("/"))
-    verify_registry_blob(config_path, config_entry.get("digest"), "镜像 config blob")
-    config = load_json_object(config_path, "镜像 config blob")
+    config, _ = _read_config_blob(config_path, config_entry)
     rootfs = config.get("rootfs")
     diff_ids = rootfs.get("diff_ids") if isinstance(rootfs, dict) else None
     if not isinstance(diff_ids, list) or len(diff_ids) != len(descriptors):
@@ -899,6 +916,26 @@ def _prepare_downloaded_cas_layer(index, descriptor, diff_id, blob, workspace, s
     return started, time.monotonic()
 
 
+def _download_file_names(files):
+    """在探测和并发写入前统一规划路径，拒绝重复、别名和文件/父目录冲突。"""
+    planned, seen = [], set()
+    for name in files:
+        normalized = archive_path(name, allow_root=False)
+        host_components(normalized.split("/"))
+        if normalized in seen:
+            raise BuildError("Duplicate Artifactory artifact path: " + normalized)
+        seen.add(normalized)
+        planned.append(normalized)
+    if not planned:
+        raise BuildError("Artifactory artifact list is empty")
+    host_path_aliases(planned)
+    for name in planned:
+        parts = name.split("/")
+        if any("/".join(parts[:index]) in seen for index in range(1, len(parts))):
+            raise BuildError("Artifactory file/directory conflict: " + name)
+    return planned
+
+
 def download_and_pack(opener, directory_url: str, files: List[str], output: Path,
                       workers: int, image_reference: str, reporter=None,
                       cas_store=None, target_platform="linux/amd64", cas_only=False) -> None:
@@ -910,6 +947,7 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
     """
     if cas_only and cas_store is None:
         raise RuntimeError("CAS-only download requires a CAS store")
+    files = _download_file_names(files)
     output.parent.mkdir(parents=True, exist_ok=True)
     if reporter is None:
         display = ProgressDisplay()
@@ -1159,7 +1197,7 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
             return
         display.log("格式转换完成，耗时 {}；开始生成 Docker tar…".format(
             format_duration(conversion_elapsed)))
-        pack_elapsed = pack_files(archive_root, output, display)
+        pack_elapsed = pack_files(archive_root, output, display, image_reference)
         published.append(output)
         if reporter is not None:
             reporter.record_timing("Pack Artifactory base archive", pack_elapsed)
