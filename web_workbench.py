@@ -973,7 +973,7 @@ def form_data(handler):
     size = int(lengths[0])
     if size > 32768 or handler.headers.get("Transfer-Encoding") is not None:
         raise ValueError("Invalid form length")
-    raw = handler.rfile.read(size)
+    raw = getattr(handler, "_request_body", handler.rfile).read(size)
     if len(raw) != size:
         raise ValueError("Incomplete form")
     values = parse_qs(raw.decode("utf-8"), keep_blank_values=True)

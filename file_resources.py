@@ -2,6 +2,26 @@
 
 import os
 import stat
+from contextlib import contextmanager
+
+
+@contextmanager
+def cleanup_on_exit(cleanup):
+    """始终尝试收尾；已有失败时保留原异常，正常退出时报告收尾失败。
+
+    cleanup 只能释放调用方拥有的资源。不能用 sys.exc_info 判断当前操作是否失败，
+    因为调用方可能在处理其他异常时正常进入此作用域。
+    """
+    try:
+        yield
+    except BaseException:
+        try:
+            cleanup()
+        except BaseException:
+            pass  # 校验失败、读写错误和 KeyboardInterrupt 的优先级高于收尾错误。
+        raise
+    else:
+        cleanup()
 
 
 def fdopen_owned(descriptor, *args, **kwargs):

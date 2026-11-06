@@ -19,7 +19,7 @@ import zlib
 from pathlib import Path
 
 from compat import is_linked_directory, unlink_missing
-from file_resources import fdopen_owned, open_regular_file
+from file_resources import cleanup_on_exit, fdopen_owned, open_regular_file
 from cache_identity import FileIdentityChanged, file_identity, stat_identity
 from progress.layers import LayerProgress
 from errors import ArchiveError, BuildError
@@ -132,7 +132,7 @@ class CASStore:
         descriptor, pending = tempfile.mkstemp(prefix="blob-", suffix=".part", dir=target.parent)
         hasher = hashlib.sha256()
         written = 0
-        try:
+        with cleanup_on_exit(lambda: unlink_missing(pending)):
             with fdopen_owned(descriptor, "wb") as output:
                 for block in iter(lambda: stream.read(BUFFER), b""):
                     output.write(block)
@@ -143,8 +143,6 @@ class CASStore:
             if written != size or hasher.hexdigest() != expected:
                 raise ArchiveError("CAS blob size or digest mismatch: " + digest)
             self._publish_blob(Path(pending), digest, size)
-        finally:
-            unlink_missing(pending)
         return target
 
     def _publish_blob(self, pending, digest, size):
@@ -199,7 +197,7 @@ class CASStore:
         self.blobs.mkdir(parents=True, exist_ok=True)
         descriptor, pending = tempfile.mkstemp(prefix="decoded-" if decoded else "blob-",
                                               suffix=".part", dir=self.blobs)
-        try:
+        with cleanup_on_exit(lambda: unlink_missing(pending)):
             with fdopen_owned(descriptor, "wb"):
                 pass
             try:
@@ -229,8 +227,6 @@ class CASStore:
                 if stat_identity(os.fstat(stream.fileno()))[:4] != stamp[:4]:
                     raise ArchiveError("Layer/blob changed during CAS ingestion")
             return self._publish_blob(pending, digest, stamp[2])
-        finally:
-            unlink_missing(pending)
 
     def _publish(self, reference, platform, source, config_digest, layers,
                  replace=False, manifest_raw=None):
@@ -270,15 +266,12 @@ class CASStore:
         raw = _json(value)
         parse_image_json(raw, "new CAS ref")
         descriptor, pending = tempfile.mkstemp(prefix="ref-", suffix=".part", dir=self.refs)
-        try:
+        with cleanup_on_exit(lambda: unlink_missing(pending)):
             with fdopen_owned(descriptor, "wb") as output:
                 output.write(raw)
                 output.flush()
                 os.fsync(output.fileno())
             os.replace(pending, destination)
-        finally:
-            if os.path.exists(pending):
-                os.unlink(pending)
         return value
 
     def snapshot_ref(self, reference, platform, source):
@@ -305,15 +298,12 @@ class CASStore:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, pending = tempfile.mkstemp(prefix="ref-restore-", suffix=".part", dir=path.parent)
-        try:
+        with cleanup_on_exit(lambda: unlink_missing(pending)):
             with fdopen_owned(descriptor, "wb") as output:
                 output.write(raw)
                 output.flush()
                 os.fsync(output.fileno())
             os.replace(pending, path)
-        finally:
-            if os.path.exists(pending):
-                os.unlink(pending)
 
     def import_registry(self, manifest_raw, config_path, layer_paths,
                         reference, platform, source="artifactory", replace=False,
@@ -721,18 +711,17 @@ class CASStore:
                         self.blobs.mkdir(parents=True, exist_ok=True)
                         descriptor, pending = tempfile.mkstemp(prefix="decoded-", suffix=".part",
                                                                 dir=self.blobs)
-                        try:
-                            with fdopen_owned(descriptor, "wb") as target:
-                                copy_verified_gzip_blob(blob, target, item["digest"], item["size"],
-                                    progress=lambda copied: task.update(encoded_size + copied, task.amount))
-                            # 即使同 DiffID 的旧文件存在，也必须验证新解码结果，
-                            # 否则仅复用旧解码层会掩盖错误的 blob→DiffID 对应关系。
-                            self.store_decoded_layer(pending, diff_id, owned=True)
-                            verified_indices.append(index)
-                        except (OSError, EOFError, zlib.error) as exc:
-                            raise ArchiveError("Cannot decode CAS base layer: " + str(exc)) from exc
-                        finally:
-                            unlink_missing(pending)
+                        with cleanup_on_exit(lambda: unlink_missing(pending)):
+                            try:
+                                with fdopen_owned(descriptor, "wb") as target:
+                                    copy_verified_gzip_blob(blob, target, item["digest"], item["size"],
+                                        progress=lambda copied: task.update(encoded_size + copied, task.amount))
+                                # 即使同 DiffID 的旧文件存在，也必须验证新解码结果，
+                                # 否则仅复用旧解码层会掩盖错误的 blob→DiffID 对应关系。
+                                self.store_decoded_layer(pending, diff_id, owned=True)
+                                verified_indices.append(index)
+                            except (OSError, EOFError, zlib.error) as exc:
+                                raise ArchiveError("Cannot decode CAS base layer: " + str(exc)) from exc
                     task.amount = encoded_size + layer.stat().st_size
                     if layer.is_symlink() or sha256_file(layer, progress=lambda count: task.update(
                             encoded_size + count, task.amount)) != digest_hex(diff_id):

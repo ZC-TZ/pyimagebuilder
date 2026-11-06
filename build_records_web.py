@@ -17,6 +17,23 @@ from web_ui import document
 PAGE_SIZE = 25
 
 
+class _RequestBody:
+    """只统计本次 POST 已消费字节，拒绝请求时不能把完整长度再读一遍。"""
+    def __init__(self, stream):
+        self.stream = stream
+        self.received = 0
+
+    def read(self, size):
+        data = self.stream.read(size)
+        self.received += len(data)
+        return data
+
+    def read1(self, size):
+        data = self.stream.read1(size)
+        self.received += len(data)
+        return data
+
+
 def _url(project="", tag="", page=1, root="/"):
     params = {}
     if project:
@@ -181,6 +198,8 @@ def make_server(directory, port=8765, limit=None, workspace=None):
             pass  # 不记录每次筛选的项目名或镜像标签。
 
         def _reply(self, status, body, html=False, content_type=None):
+            if status >= 400 and self.command == "POST":
+                self._drain_unread_post()
             data = body.encode("utf-8", errors="xmlcharrefreplace")
             self.send_response(status)
             self.send_header("Content-Type", (content_type or ("text/html" if html else "text/plain")) + "; charset=utf-8")
@@ -198,11 +217,15 @@ def make_server(directory, port=8765, limit=None, workspace=None):
             return self._reply(status, json.dumps(value, ensure_ascii=True), content_type="application/json")
 
         def _reject_unread_post(self, status, message):
-            """短暂排空小请求体，避免 Windows 在响应读出前重置连接。"""
+            return self._reply(status, message)
+
+        def _drain_unread_post(self):
+            """有界排空剩余小请求体；所有 POST 错误响应共用，避免早退后重置连接。"""
             lengths = self.headers.get_all("Content-Length") or []
             if (self.headers.get("Transfer-Encoding") is None and len(lengths) == 1 and
-                    lengths[0].isascii() and lengths[0].isdecimal() and len(lengths[0]) <= 5):
-                remaining = int(lengths[0])
+                    lengths[0].isascii() and lengths[0].isdecimal() and len(lengths[0]) <= 10):
+                source = self._request_body
+                remaining = int(lengths[0]) - source.received
                 if 0 < remaining <= 32768:
                     deadline = time.monotonic() + 0.25
                     try:
@@ -211,15 +234,14 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                             if timeout <= 0:
                                 break
                             self.request.settimeout(timeout)
-                            block = self.rfile.read1(remaining)
+                            block = source.read1(remaining)
                             if not block:
                                 break
                             remaining -= len(block)
-                    except (ConnectionError, socket.timeout):
+                    except OSError:
                         pass
                     finally:
                         self.request.settimeout(5)
-            return self._reply(status, message)
 
         def _host(self):
             port = self.server.server_port
@@ -411,6 +433,7 @@ def make_server(directory, port=8765, limit=None, workspace=None):
             return self._reply(404, "Not found")
 
         def do_POST(self):
+            self._request_body = _RequestBody(self.rfile)
             if workspace is None:
                 return self._reject_unread_post(501, "Read-only ledger")
             from web_workbench import form_data, session_route
@@ -451,7 +474,7 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                             len(lengths[0]) > 10 or self.headers.get("Transfer-Encoding") is not None):
                         raise ValueError("无效的应用包长度")
                     architecture = kind if kind in ("amd64", "arm64") else None
-                    token = workspace.uploads.receive(self.rfile, int(lengths[0]), filename,
+                    token = workspace.uploads.receive(self._request_body, int(lengths[0]), filename,
                                                       "archive" if architecture else kind)
                     if architecture:
                         from web_paths import check_oci_platform
