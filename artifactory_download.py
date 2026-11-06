@@ -1186,7 +1186,7 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
             import_started = time.monotonic()
             cas_store.import_registry(manifest_raw, config_path, layer_paths,
                                       image_reference, target_platform, replace=True,
-                                      verified_diff_ids=True)
+                                      verified_diff_ids=True, owned_layers=cas_only)
             if reporter is not None:
                 reporter.record_timing("Import Artifactory CAS blobs", time.monotonic() - import_started)
             if not cas_only:

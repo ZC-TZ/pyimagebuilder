@@ -185,12 +185,20 @@ class CASStore:
             return self._put_stream(stream, diff_id, path.stat().st_size)
 
     def _store_owned_layer(self, path, diff_id):
+        return self._store_owned_blob(path, diff_id, decoded=True)
+
+    def _store_owned_blob(self, path, digest, size=None, decoded=False):
         """先接管到私有路径再校验，同盘移动原文件以省去复制和原路径写入窗口。"""
-        target = self._blob(diff_id)
-        if path.resolve() == target.resolve():
-            raise ArchiveError("Owned layer must be a private temporary file")
+        path = Path(path)
+        target = self._blob(digest)
+        resolved = path.resolve()
+        # open_base 会在 blobs 目录内生成私有 .part 解码文件；已发布摘要文件不能移走。
+        if (resolved == target.resolve() or
+                (resolved.parent == target.parent.resolve() and not resolved.name.endswith(".part"))):
+            raise ArchiveError("Owned layer/blob must be a private temporary file")
         self.blobs.mkdir(parents=True, exist_ok=True)
-        descriptor, pending = tempfile.mkstemp(prefix="decoded-", suffix=".part", dir=self.blobs)
+        descriptor, pending = tempfile.mkstemp(prefix="decoded-" if decoded else "blob-",
+                                              suffix=".part", dir=self.blobs)
         try:
             with fdopen_owned(descriptor, "wb"):
                 pass
@@ -199,19 +207,28 @@ class CASStore:
             except OSError as exc:
                 if exc.errno not in LINK_FALLBACK:
                     raise
-                return self.store_decoded_layer(path, diff_id)
+                if decoded:
+                    return self.store_decoded_layer(path, digest)
+                with open_regular_file(path) as stream:
+                    actual_size = os.fstat(stream.fileno()).st_size
+                    if size is not None and actual_size != size:
+                        raise ArchiveError("Registry layer descriptor size mismatch")
+                    return self._put_stream(stream, digest, actual_size)
             pending = Path(pending)
             with open_regular_file(pending, writable=True) as stream:
-                stamp = verified_layer_identity(pending, diff_id, file_identity)
+                stamp = verified_layer_identity(pending, digest, file_identity)
                 if stat_identity(os.fstat(stream.fileno()))[:4] != stamp[:4]:
-                    raise ArchiveError("Decoded layer changed before CAS ingestion")
-                verify_layer_tar(stream, "decoded CAS layer: " + diff_id)
+                    raise ArchiveError("Layer/blob changed before CAS ingestion")
+                if size is not None and stamp[2] != size:
+                    raise ArchiveError("Registry layer descriptor size mismatch")
+                if decoded:
+                    verify_layer_tar(stream, "decoded CAS layer: " + digest)
                 if os.name != "nt":
                     os.fchmod(stream.fileno(), 0o600)
                 os.fsync(stream.fileno())
                 if stat_identity(os.fstat(stream.fileno()))[:4] != stamp[:4]:
-                    raise ArchiveError("Decoded layer changed during CAS ingestion")
-            return self._publish_blob(pending, diff_id, stamp[2])
+                    raise ArchiveError("Layer/blob changed during CAS ingestion")
+            return self._publish_blob(pending, digest, stamp[2])
         finally:
             unlink_missing(pending)
 
@@ -300,15 +317,19 @@ class CASStore:
 
     def import_registry(self, manifest_raw, config_path, layer_paths,
                         reference, platform, source="artifactory", replace=False,
-                        verified_diff_ids=False):
+                        verified_diff_ids=False, *, owned_layers=False):
         """按 descriptor 摘要保存原始 Registry blob，包括 config 和层。
 
         层可以是压缩或未压缩内容；本方法不解压，也不独立核对层的 DiffID。
         verified_diff_ids=True 仅供已完成本次 blob→解码 tar 校验的内部下载器使用，
         记录可信本地校验状态；外部/低层导入默认由 open_base 首次使用时补验。
+        owned_layers 仅用于移交下载器独占的临时文件；默认复制，绝不接管用户文件。
+        同盘移交仍完整校验摘要、大小并 fsync；跨盘退回流式复制。
         """
         if type(verified_diff_ids) is not bool:
             raise ArchiveError("verified_diff_ids must be a boolean")
+        if type(owned_layers) is not bool:
+            raise ArchiveError("owned_layers must be a boolean")
         platform = normalize_platform(platform)
         try:
             manifest = parse_image_json(manifest_raw, "Registry manifest")
@@ -331,18 +352,34 @@ class CASStore:
             raise ArchiveError("Registry config descriptor size mismatch")
         if hashlib.sha256(config_raw).hexdigest() != digest_hex(config_digest):
             raise ArchiveError("Registry config descriptor digest mismatch")
-        self._put_bytes(config_raw)
-        layers = []
+        plans, sources = [], {}
         for entry, path, diff_id in zip(descriptors, layer_paths, diff_ids):
             if not isinstance(entry, dict):
                 raise ArchiveError("Invalid Registry layer descriptor")
             digest = entry.get("digest")
+            digest_hex(digest)
             digest_hex(diff_id)
             size = Path(path).stat().st_size
             if entry.get("size") is not None and entry["size"] != size:
                 raise ArchiveError("Registry layer descriptor size mismatch")
-            with open(path, "rb") as stream:
-                self._put_stream(stream, digest, size)
+            key = os.path.normcase(os.path.abspath(str(path)))
+            if owned_layers:
+                # 重复 descriptor 可引用同一下载文件。先检查全表，避免移动后第二次找不到源；
+                # 同一路径若声明不同摘要必须拒绝，不能借已入库的 blob 掩盖坏输入。
+                if key in sources and sources[key] != (digest, size):
+                    raise ArchiveError("Conflicting Registry descriptors for one layer path")
+                sources[key] = (digest, size)
+            plans.append((entry, path, diff_id, digest, size, key))
+        self._put_bytes(config_raw)
+        layers, consumed = [], set()
+        for entry, path, diff_id, digest, size, key in plans:
+            if owned_layers:
+                if key not in consumed:
+                    self._store_owned_blob(path, digest, size=size)
+                    consumed.add(key)
+            else:
+                with open(path, "rb") as stream:
+                    self._put_stream(stream, digest, size)
             with self._blob(digest).open("rb") as stream:
                 magic = stream.read(2)
             media_type = entry.get("mediaType") or ("application/vnd.oci.image.layer.v1.tar+gzip"
