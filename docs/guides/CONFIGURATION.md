@@ -73,6 +73,15 @@ python .\main.py build D:\project -t company/app:1 -o D:\images\app.tar `
 
 仓库主机名、账号和 CA 文件均需替换。`source=registry` 用于标准 Registry/Harbor；`source=artifactory` 用于本项目支持的镜像文件目录下载。`caFile` 是可选字段，配置后文件必须存在。
 
+如果服务的实际地址是 `http://`，在对应的 `repositories.<host>` 中设置 `"insecureHttp": true`；
+如果实际是 `https://`，省略该字段或设为 false，使用默认系统信任或配置企业 CA 的 `caFile`。
+`insecureHttp` 表示切换到 HTTP，不是跳过 HTTPS 证书校验。
+Fast 模板按 `baseUrl` 的显式协议下载，普通拉取和仓库诊断按仓库连接配置选择协议，
+因此这两处应与实际服务保持一致。示例配置中的 nmkf 演示已确认的 HTTP 服务；其他 HTTPS 仓库继续使用默认配置。
+
+修改 UOS 上的 `config.json` 后重启 Web 工作台。仓库诊断下拉项会显示 HTTP/HTTPS，
+任务日志会显示当前实际检查的地址；浏览器登录页能打开不代表同一地址上的 HTTPS 证书已经受 Python 信任。
+
 在运行命令的终端设置密码：
 
 ```powershell

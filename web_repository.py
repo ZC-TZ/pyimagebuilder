@@ -38,7 +38,9 @@ def _transport_error(exc):
     current = exc
     while current is not None:
         if isinstance(current, ssl.SSLCertVerificationError):
-            return BuildError("TLS 证书校验失败，请检查仓库证书和 CA 配置")
+            return BuildError("TLS 证书校验失败。若服务是 HTTPS，请配置 caFile，并核对证书主机名与有效期；"
+                              "若服务实际是 HTTP，请配置 insecureHttp=true"
+                              "（切换到 HTTP，不是跳过证书校验）")
         if isinstance(current, ssl.SSLError):
             return BuildError("TLS 连接失败，请检查 HTTPS 设置")
         if isinstance(current, socket.gaierror):
@@ -64,6 +66,9 @@ def diagnose(settings, host, reference=""):
     if username is not None and password is None:
         raise BuildError("工作台启动环境缺少配置指定的仓库密码变量")
     insecure = entry.get("insecureHttp", False)
+    scheme = "http://" if insecure else "https://"
+    origin = scheme + host
+    print("正在检查仓库：{}（{}）".format(origin, "Artifactory" if kind == "artifactory" else "Registry"), flush=True)
     try:
         if kind == "registry":
             client = RegistryClient(plan["reference"] or host + "/pyimagebuilder/probe:latest", username,
@@ -75,8 +80,6 @@ def diagnose(settings, host, reference=""):
             else:
                 status, _, raw = client.request("GET", client.origin + "/v2/", "", allowed=(200, 401, 403, 404))
         else:
-            scheme = "http://" if insecure else "https://"
-            origin = scheme + host
             target = (artifact_directory_url(scheme + plan["reference"]) + "manifest.json"
                       if reference else origin + "/artifactory/api/system/ping")
             opener = make_opener(origin, username, password, entry.get("caFile"))
@@ -86,7 +89,8 @@ def diagnose(settings, host, reference=""):
         exc.close()
         raise _http_error(exc.code, bool(reference)) from None
     except (BuildError, OSError, ValueError) as exc:
-        raise _transport_error(exc) from None
+        error = _transport_error(exc)
+        raise BuildError("{}；当前连接：{}".format(error, origin)) from None
     if status != 200:
         raise _http_error(status, bool(reference))
     if not reference and raw.lstrip().startswith(b"<"):
@@ -99,6 +103,6 @@ def diagnose(settings, host, reference=""):
                 raise BuildError("Invalid remote manifest")
         except (BuildError, RecursionError):
             raise BuildError("仓库已连通，但返回的镜像元数据格式不正确") from None
-    return {"仓库": host, "类型": kind, "镜像": plan["reference"] or "未指定",
+    return {"仓库": host, "地址": origin, "类型": kind, "镜像": plan["reference"] or "未指定",
             "结果": "镜像元数据可读取" if reference else "仓库 API 可访问",
             "范围": "只读检查，未测试推送权限"}

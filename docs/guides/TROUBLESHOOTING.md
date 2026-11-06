@@ -24,6 +24,16 @@
 
 build 出错需要更多上下文时加 `--debug`；持续集成建议 `--progress plain`。其他入口先查看其 `--help`，并非所有子命令都有同样参数。
 
+## 浏览器能打开，但仓库诊断提示 TLS 证书校验失败
+
+先从浏览器复制完整地址核对 `http://` / `https://`，不要只根据地址栏的“不安全”图标判断。
+工作台诊断默认使用 HTTPS；如果实际服务是 HTTP，需要在现有仓库项中加 `"insecureHttp": true`，
+并确认 `source` 为实际的仓库类型。Fast 模板的 `baseUrl` 也应使用实际协议；只改模板不会改变仓库诊断的协议。
+保留已有 username/passwordEnv 等字段，保存配置并重启 Web 后再检查。
+
+HTTPS 服务应保持证书校验，配置企业 CA 的 `caFile`，并核对证书主机名和有效期。
+`insecureHttp` 切换为 HTTP，不会让不受信任的 HTTPS 证书被接受。
+
 ## Invalid layer permission mode: 16877
 
 `16877` 是八进制 `040755`，包含目录类型位和 `0755` 权限。旧版把完整 st_mode 当成纯权限而拒绝，可能在基础镜像已成功下载后，于 FROM 失败。
