@@ -88,6 +88,16 @@ Artifactory 来源会显示 URL、下载文件进度、格式转换与打包状�
 `Publish Docker/OCI archive`。Publish 包含最终排他发布，以及必要的跨盘或无硬链接回退复制；
 最终整个交付文件的 SHA-256 仍单列为 `Hash final output archive`。
 这些是导出阶段内部的子项，不能再与外层导出总耗时重复相加。
+
+Artifactory 供构建使用的 CAS-only 拉取会先取 manifest/config，再把已下载的层交给
+最多两个准备线程；下载进度与层完成记录可能交错，层序号仍是 manifest 中的位置。
+例如先看到 `准备镜像层 8/22` 完成是正常的，`已完成 1/22` 才表示实际完成数量。
+所有层成功准备和所有传输 blob 入库后才发布引用；任一失败会停止后续任务并恢复旧引用。
+
+这条路径的耗时新增 `Prepare Artifactory layers (overlap)`（准备任务的墙钟跨度）、
+`Wait for Artifactory layers`（下载结束后剩余等待）和 `Import Artifactory CAS blobs`。
+准备跨度包含与下载重叠的部分，不能与下载耗时直接相加；判断总收益请看总耗时和剩余等待。
+原有独立 Docker tar 转换路径继续显示 `Convert Artifactory layers`。
 使用输出盘暂存时，Write 包含该私有归档的 fsync；它通过完整验证后才发布。
 
 Artifactory（CAS 和 Docker tar）、Registry、CAS 读取、本地 tar 读取与构建索引共用

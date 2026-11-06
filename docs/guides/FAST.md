@@ -179,6 +179,13 @@ profile → 基础镜像（本地 tar 或 Artifactory → CAS 镜像库）
 
 远端模板默认复用已经缓存的基础镜像；首次缺失才下载。普通 build 和 Fast 共用 `cache.imageStore`。构建路径直接消费 CAS，不必先包装成 base.tar。要刷新远端标签，使用 `main.py pull IMAGE --source artifactory`，并指定同一配置/镜像库。
 
+首次从 Artifactory 拉取供构建使用时，先获取 manifest/config，随后每层下载完成便开始准备，
+最多两层并行解压、校验和入库，与其余文件下载重叠；所有层成功后才发布引用。
+这一优化自动生效，不需要增加参数，也不要求清缓存。已经缓存的镜像仍直接复用。
+首次下载的收益取决于网络、CPU 和磁盘是否有余量；不会跳过摘要、tar 结构或最终归档校验。
+若大量时间花在缓存读取和导出，可把 `cache.imageStore`、`cache.layerCache` 放到空间充足的本地 SSD，
+并用相同输入对照阶段耗时；只修改缓存目录会让新目录首次使用时没有旧镜像。
+
 验证结果后交付：
 
 ```powershell

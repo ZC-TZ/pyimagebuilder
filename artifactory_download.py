@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import ExitStack
 from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 import gzip
 import hashlib
@@ -834,6 +835,70 @@ def _check_cas_layer_encoding(descriptor, blob, diff_id):
         raise BuildError("Unsupported CAS layer compression: " + media_type)
 
 
+def _blob_artifact_name(files, digest, field):
+    """在目录清单中定位 blob，供元数据预取和层就绪调度使用。"""
+    value = parse_sha256_digest(digest, field)
+    for candidate in ("sha256__" + value, "sha256_" + value, value):
+        matches = [name for name in files if PurePosixPath(name).name == candidate]
+        if len(matches) > 1:
+            raise RuntimeError("Ambiguous Artifactory blob: " + field)
+        if matches:
+            return matches[0]
+    raise RuntimeError("Missing Artifactory blob: " + field)
+
+
+def _cas_download_metadata(opener, directory_url, files, raw_root, sizes, limiter, stats, display):
+    """优先下载小型 manifest/config，让层一下载完便能核对 DiffID，不必等全镜像。"""
+    def fetch(name):
+        download_one(opener, directory_url, name, raw_root, sizes.get(name), limiter, stats, display)
+
+    if "manifest.json" not in files:
+        raise RuntimeError("Missing Artifactory manifest.json")
+    fetch("manifest.json")
+    manifest, raw = read_image_json_file(raw_root / "manifest.json", "Artifactory manifest")
+    config_entry, descriptors = manifest.get("config"), manifest.get("layers")
+    if not isinstance(config_entry, dict) or not isinstance(descriptors, list):
+        raise RuntimeError("Registry manifest 的 config/layers 格式无效")
+    config_name = _blob_artifact_name(files, config_entry.get("digest"), "config.digest")
+    fetch(config_name)
+    config_path = raw_root.joinpath(*config_name.split("/"))
+    verify_registry_blob(config_path, config_entry.get("digest"), "镜像 config blob")
+    config = load_json_object(config_path, "镜像 config blob")
+    rootfs = config.get("rootfs")
+    diff_ids = rootfs.get("diff_ids") if isinstance(rootfs, dict) else None
+    if not isinstance(diff_ids, list) or len(diff_ids) != len(descriptors):
+        raise RuntimeError("config.rootfs.diff_ids 数量与 manifest.layers 不一致")
+    names = []
+    for descriptor, diff_id in zip(descriptors, diff_ids):
+        if not isinstance(descriptor, dict):
+            raise RuntimeError("Registry manifest 的 layer descriptor 格式无效")
+        parse_sha256_digest(diff_id, "rootfs.diff_ids")
+        names.append(_blob_artifact_name(files, descriptor.get("digest"), "layer.digest"))
+    return manifest, raw, config_path, descriptors, diff_ids, names, {"manifest.json", config_name}
+
+
+def _prepare_downloaded_cas_layer(index, descriptor, diff_id, blob, workspace, store,
+                                 preparation, limiter, display):
+    """独立准备一层；文件名按 manifest 位置隔离，校验与 CAS 发布规则保持不变。"""
+    started = time.monotonic()
+    with preparation.layer(index + 1, descriptor["digest"]) as task:
+        limiter.check_cancelled()
+        _check_cas_layer_encoding(descriptor, blob, diff_id)
+        decoded = workspace / "decoded-{}.tar".format(index)
+
+        def progress(current):
+            limiter.check_cancelled()
+            task.update(current)
+
+        materialize_layer(blob, decoded, str(descriptor.get("mediaType", "")), diff_id,
+                          index + 1, preparation.total, display, descriptor["digest"], progress=progress)
+        task.current = decoded.stat().st_size
+        limiter.check_cancelled()
+        store.store_decoded_layer(decoded, diff_id, owned=True)
+        unlink_missing(decoded)
+    return started, time.monotonic()
+
+
 def download_and_pack(opener, directory_url: str, files: List[str], output: Path,
                       workers: int, image_reference: str, reporter=None,
                       cas_store=None, target_platform="linux/amd64", cas_only=False) -> None:
@@ -917,19 +982,53 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
         try:
             # 线程池按最大值创建，真正的网络并发由可动态调整的 limiter 控制。
             with ThreadPoolExecutor(max_workers=max_workers) as executor, \
-                    cancel_pending_on_error(executor, limiter.cancel) as submit:
-                pending = set()
+                    cancel_pending_on_error(executor, limiter.cancel) as submit, ExitStack() as resources:
+                prefetched, preparation_futures = set(), []
+                if cas_only:
+                    (manifest, manifest_raw, config_path, descriptors, diff_ids,
+                     layer_names, prefetched) = _cas_download_metadata(
+                        opener, directory_url, files, raw_root, sizes, limiter, stats, display)
+                    completed = len(prefetched)
+                    preparation = LayerProgress("prepare", len(descriptors), reporter, display,
+                                                source="artifactory", image=image_reference)
+                    # 解压/哈希会释放 GIL；限制为两层，避免与网络下载争抢过多磁盘带宽。
+                    converter = resources.enter_context(ThreadPoolExecutor(max_workers=2))
+                    prepare_submit = resources.enter_context(cancel_pending_on_error(converter, limiter.cancel))
+                    by_name = {}
+                    for index, name in enumerate(layer_names):
+                        by_name.setdefault(name, []).append(index)
+
+                    def prepare_ready(name):
+                        for index in by_name.get(name, ()):
+                            preparation_futures.append(prepare_submit(
+                                _prepare_downloaded_cas_layer, index, descriptors[index], diff_ids[index],
+                                raw_root.joinpath(*name.split("/")), workspace, cas_store,
+                                preparation, limiter, display))
+
+                    for name in prefetched:
+                        prepare_ready(name)
+
+                pending = {}
                 for name in ordered_files:
-                    pending.add(submit(
+                    if name in prefetched:
+                        continue
+                    pending[submit(
                         download_one, opener, directory_url, name, raw_root, sizes.get(name),
                         limiter, stats, display
-                    ))
+                    )] = name
 
                 while pending:
-                    done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                    done, _ = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
                     for future in done:
                         future.result()
+                        name = pending.pop(future)
                         completed += 1
+                        if cas_only:
+                            prepare_ready(name)
+                    # 转换错误应及时停止剩余传输，不能到整批下载结束才发现坏层。
+                    for future in preparation_futures:
+                        if future.done():
+                            future.result()
 
                     now = time.monotonic()
                     transferred = stats.snapshot()
@@ -994,46 +1093,31 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
 
                         last_adjust = now
                         last_adjust_bytes = transferred
+                download_finished = time.monotonic()
+                if cas_only:
+                    display.log("下载完成：{}，耗时 {}；层准备已与下载重叠，等待剩余任务…".format(
+                        format_size(stats.snapshot()), format_duration(download_finished - report_started)))
+                    prepared_times = [future.result() for future in as_completed(preparation_futures)]
+                    preparation.finish()
+                    preparation_finished = time.monotonic()
+                    if reporter is not None:
+                        reporter.record_timing("Wait for Artifactory layers",
+                                               preparation_finished - download_finished)
+                        reporter.record_timing("Prepare Artifactory layers (overlap)",
+                            max(item[1] for item in prepared_times) - min(item[0] for item in prepared_times)
+                            if prepared_times else 0)
+                    layer_paths = [raw_root.joinpath(*name.split("/")) for name in layer_names]
         finally:
             display.finish_line()
 
-        download_elapsed = time.monotonic() - report_started
+        download_elapsed = download_finished - report_started
         if reporter is not None:
             reporter.record_timing("Download Artifactory files", download_elapsed)
-        display.log("下载完成：{}，耗时 {}；开始{}…".format(
-            format_size(stats.snapshot()), format_duration(download_elapsed),
-            "校验并写入 CAS" if cas_only else "转换 Registry V2 格式"))
+        if not cas_only:
+            display.log("下载完成：{}，耗时 {}；开始转换 Registry V2 格式…".format(
+                format_size(stats.snapshot()), format_duration(download_elapsed)))
         conversion_started = time.monotonic()
-        if cas_only:
-            manifest, manifest_raw = read_image_json_file(raw_root / "manifest.json",
-                                                          "Artifactory manifest")
-            config_entry, descriptors = manifest.get("config"), manifest.get("layers")
-            if not isinstance(config_entry, dict) or not isinstance(descriptors, list):
-                raise RuntimeError("Registry manifest 的 config/layers 格式无效")
-            config_path = find_blob(raw_root, config_entry.get("digest"), "config.digest")
-            config = load_json_object(config_path, "镜像 config blob")
-            rootfs = config.get("rootfs")
-            diff_ids = rootfs.get("diff_ids") if isinstance(rootfs, dict) else None
-            if not isinstance(diff_ids, list) or len(diff_ids) != len(descriptors):
-                raise RuntimeError("config.rootfs.diff_ids 数量与 manifest.layers 不一致")
-            layer_paths = []
-            preparation = LayerProgress("prepare", len(descriptors), reporter, display,
-                                        source="artifactory", image=image_reference)
-            for index, (descriptor, diff_id) in enumerate(zip(descriptors, diff_ids), 1):
-                with preparation.layer(index, descriptor.get("digest", "") if isinstance(descriptor, dict) else "") as task:
-                    if not isinstance(descriptor, dict):
-                        raise RuntimeError("Registry manifest 的 layer descriptor 格式无效")
-                    blob = find_blob(raw_root, descriptor.get("digest"), "layer.digest")
-                    _check_cas_layer_encoding(descriptor, blob, diff_id)
-                    decoded = workspace / "decoded.tar"
-                    materialize_layer(blob, decoded, str(descriptor.get("mediaType", "")),
-                                      diff_id, index, len(descriptors), display,
-                                      descriptor.get("digest"), progress=task.update)
-                    task.current = decoded.stat().st_size
-                    cas_store.store_decoded_layer(decoded, diff_id, owned=True)
-                    unlink_missing(decoded)
-                    layer_paths.append(blob)
-        else:
+        if not cas_only:
             decoded_layers = convert_registry_to_docker_archive(
                 raw_root, archive_root, image_reference, display, reporter)
             if cas_store is not None:
@@ -1052,18 +1136,20 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
                         cas_store.store_decoded_layer(layer, diff_id)
                         task.current = layer.stat().st_size
         conversion_elapsed = time.monotonic() - conversion_started
-        if reporter is not None:
+        if reporter is not None and not cas_only:
             reporter.record_timing("Convert Artifactory layers", conversion_elapsed)
         if cas_store is not None:
+            import_started = time.monotonic()
             cas_store.import_registry(manifest_raw, config_path, layer_paths,
                                       image_reference, target_platform, replace=True,
                                       verified_diff_ids=True)
+            if reporter is not None:
+                reporter.record_timing("Import Artifactory CAS blobs", time.monotonic() - import_started)
             if not cas_only:
                 storing.finish()
         if cas_only:
             # 保留基础镜像入口对 media type 与配置的检查；层内容已在发布前验证。
             cas_store.inspect_ref(image_reference, target_platform, "artifactory")
-            preparation.finish()
             return
         display.log("格式转换完成，耗时 {}；开始生成 Docker tar…".format(
             format_duration(conversion_elapsed)))

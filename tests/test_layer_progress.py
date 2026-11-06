@@ -158,12 +158,26 @@ class LayerProgressTests(unittest.TestCase):
                     if mode == "json":
                         events = self.events(stream)
                         completed = [e for e in events if e["type"] == "layer_complete"]
-                        self.assertEqual(len(completed), 20 if invalid else 21)
-                        self.assertEqual([e["details"]["layer_index"] for e in completed], list(range(1, len(completed)+1)))
+                        indices = [e["details"]["layer_index"] for e in completed]
+                        if invalid:
+                            self.assertLessEqual(len(completed), 20)
+                            self.assertNotIn(21, indices)
+                        else:
+                            self.assertEqual(sorted(indices), list(range(1, 22)))
+                        self.assertEqual(len(indices), len(set(indices)))
+                        self.assertEqual([e["details"]["layers_completed"] for e in completed],
+                                         list(range(1, len(completed) + 1)))
                         self.assertEqual(sum(e["type"] == "layers_complete" for e in events), 0 if invalid else 1)
-                        self.assertEqual(sum(e["type"] == "layer_failed" for e in events), 1 if invalid else 0)
+                        failed = [e for e in events if e["type"] == "layer_failed"]
+                        if invalid:
+                            self.assertIn(21, [e["details"]["layer_index"] for e in failed])
+                        else:
+                            self.assertEqual(failed, [])
                     else:
-                        self.assertIn("准备镜像层 20/21 | 完成", stream.getvalue())
+                        if not invalid:
+                            self.assertIn("准备镜像层 20/21 | 完成", stream.getvalue())
+                        else:
+                            self.assertIn("准备镜像层 21/21 |", stream.getvalue())
                         self.assertEqual("准备镜像层完成 | 21/21 层" in stream.getvalue(), not invalid)
 
     def test_registry_download_prepare_and_store_use_same_events(self):

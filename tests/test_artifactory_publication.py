@@ -187,9 +187,11 @@ class ArtifactoryPublicationTests(unittest.TestCase):
             with self.assertRaises((BuildError, RuntimeError)):
                 download(files, root / "unused.tar", store)
             self.assertFalse(store.has_ref(REFERENCE, PLATFORM, SOURCE))
-            self.assertEqual(store._blob(digest(raw)).read_bytes(), raw)
-            # 首层虽已入库，失败镜像没有 ref；可由既有 GC 规则回收。
-            self.assertGreater(store.prune_orphans(dry_run=True)["orphan_blobs"], 0)
+            # 并发准备允许坏层先失败；已完成的有效层可留下孤儿，但不能有半成品 ref。
+            cached = store._blob(digest(raw))
+            if cached.exists():
+                self.assertEqual(cached.read_bytes(), raw)
+                self.assertGreater(store.prune_orphans(dry_run=True)["orphan_blobs"], 0)
 
     def test_archive_success_retains_identity_and_reuses_decoded_layers(self):
         with tempfile.TemporaryDirectory() as temporary:
