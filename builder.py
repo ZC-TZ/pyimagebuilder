@@ -367,9 +367,22 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                         raise BuildError("Output must differ from base archive")
                     with reporter.timed("Read and index base CAS" if is_cas else
                                         "Read and index base archive") if reporter is not None else nullcontext():
+                        rootfs = RootFSIndex()
+                        indexing = None
                         if is_cas:
                             cas = CASStore(base_path["store"])
-                            base = cas.open_base(reference, stage_platform, base_path["source"], reporter=reporter)
+
+                            def index_verified_layer(path, members, index, total, diff_id):
+                                # CAS 刚完成本层结构检查，直接消费相同 TarInfo，避免再解析大 tar。
+                                nonlocal indexing
+                                if indexing is None:
+                                    indexing = LayerProgress("index", total, reporter, source="builder", image=reference)
+                                with indexing.layer(index, diff_id) as task:
+                                    rootfs.apply_members(path, members)
+                                    task.current = path.stat().st_size
+
+                            base = cas.open_base(reference, stage_platform, base_path["source"], reporter=reporter,
+                                                 layer_consumer=index_verified_layer)
                             base_inputs[reference + "@" + stage_platform] = {
                                 "sha256": base.source_manifest["CASManifest"].split(":", 1)[1]}
                         else:
@@ -382,12 +395,14 @@ def build(dockerfile, context, base_tar, base_map, tag, output,
                                 base = reader.read(reference, stage_platform)
                             else:
                                 base = reader.read(reference, stage_platform, reporter=reporter)
-                        rootfs = RootFSIndex()
-                        indexing = LayerProgress("index", len(base.layers), reporter, source="builder", image=reference)
-                        for layer_index, layer_path in enumerate(base.layers, 1):
-                            with indexing.layer(layer_index, base.config["rootfs"]["diff_ids"][layer_index - 1]) as task:
-                                rootfs.apply_layer(layer_path)
-                                task.current = layer_path.stat().st_size
+                        if not is_cas:
+                            indexing = LayerProgress("index", len(base.layers), reporter, source="builder", image=reference)
+                            for layer_index, layer_path in enumerate(base.layers, 1):
+                                with indexing.layer(layer_index, base.config["rootfs"]["diff_ids"][layer_index - 1]) as task:
+                                    rootfs.apply_layer(layer_path)
+                                    task.current = layer_path.stat().st_size
+                        if indexing is None:  # scratch 风格的 CAS 镜像也有完整的零层完成事件。
+                            indexing = LayerProgress("index", 0, reporter, source="builder", image=reference)
                         indexing.finish()
                     layers = list(base.layers)
                     config = ImageConfig(base.config, source_date_epoch, base.original_config_bytes(),

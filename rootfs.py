@@ -165,83 +165,91 @@ class RootFSIndex:
         避免后续覆盖目标路径时错误改变旧链接的字节；链接头更新共享 inode 属性。
         """
         with tarfile.open(layer_path, "r:") as archive:
-            members = []
-            seen = set()
-            for member in archive:
-                member = normalized_metadata(member)
-                path = clean_path(member.name)
-                if path in seen:
-                    raise ArchiveError("Duplicate path in layer: " + (path or "."))
-                seen.add(path)
-                members.append((path, member))
-            # 子条目可能先于父条目出现；不能等父文件覆盖索引后才解析硬链接。
-            validate_layer_paths(members)
-            # OCI whiteout 只遮蔽下层条目，不能删除同层新增内容。
-            for path, member in members:
-                base = posixpath.basename(path)
-                parent = posixpath.dirname(path)
-                if base == ".wh..wh..opq":
-                    if parent:
-                        self._remove(parent, include=False)
-                    else:
-                        self.entries.clear()
-                elif base.startswith(".wh."):
-                    target = posixpath.join(parent, base[4:])
-                    self._remove(target)
-            for path, member in members:
-                if not path:
-                    self.root_metadata = (merge_metadata(self.root_metadata, member)
-                                          if self.root_metadata is not None else copy.copy(member))
-                    continue
-                if posixpath.basename(path).startswith(".wh."):
-                    continue
-                self._parents(path)
-                if member.isdir():
-                    old = self.entries.get(path)
-                    if old and old.kind != "dir":
-                        self._remove(path)
-                    metadata = (merge_metadata(old.metadata, member) if old and old.kind == "dir"
-                                and old.metadata is not None else copy.copy(member))
-                    entry = Entry("dir", layer=str(layer_path), member=member.name, inode=Inode(metadata))
+            self.apply_members(layer_path, archive)
+
+    def apply_members(self, layer_path, source_members):
+        """消费当次已解析成员；仍完整预检路径、权限及 whiteout/硬链接语义。
+
+        CAS 在结构验证完成后调用；普通 apply_layer 保留同一个语义处理入口。
+        成员位置和原始名称继续指向原 tar，供后续 COPY/SBOM 读取文件内容。
+        """
+        members = []
+        seen = set()
+        for member in source_members:
+            member = normalized_metadata(member)
+            path = clean_path(member.name)
+            if path in seen:
+                raise ArchiveError("Duplicate path in layer: " + (path or "."))
+            seen.add(path)
+            members.append((path, member))
+        # 子条目可能先于父条目出现；不能等父文件覆盖索引后才解析硬链接。
+        validate_layer_paths(members)
+        # OCI whiteout 只遮蔽下层条目，不能删除同层新增内容。
+        for path, member in members:
+            base = posixpath.basename(path)
+            parent = posixpath.dirname(path)
+            if base == ".wh..wh..opq":
+                if parent:
+                    self._remove(parent, include=False)
                 else:
+                    self.entries.clear()
+            elif base.startswith(".wh."):
+                target = posixpath.join(parent, base[4:])
+                self._remove(target)
+        for path, member in members:
+            if not path:
+                self.root_metadata = (merge_metadata(self.root_metadata, member)
+                                      if self.root_metadata is not None else copy.copy(member))
+                continue
+            if posixpath.basename(path).startswith(".wh."):
+                continue
+            self._parents(path)
+            if member.isdir():
+                old = self.entries.get(path)
+                if old and old.kind != "dir":
                     self._remove(path)
-                    if member.isfile():
-                        entry = Entry("file", layer=str(layer_path), member=member.name,
-                                      inode=Inode(member))
-                    elif member.issym():
-                        entry = Entry("symlink", member.linkname, str(layer_path), member.name)
-                    elif member.islnk():
-                        clean_path(member.linkname.lstrip("/"))
-                        # 整层索引完成前不固定硬链接的内容来源，
-                        # 因为目标可能是尚未出现、最终指向下层内容的另一个链接。
-                        entry = Entry("hardlink", member.linkname)
-                    else:
-                        # 导出/扁平化仍需原始 FIFO、设备节点的类型和设备号；不在宿主创建它们。
-                        entry = Entry("other", layer=str(layer_path), member=member.name)
-                self.entries[path] = entry
-            links = {path: member for path, member in members if member.islnk()}
-            targets = {path: clean_path(member.linkname.lstrip("/"))
-                       for path, member in links.items()}
-            ready, waiting = [], {}
-            for path, target in targets.items():
-                if target in links:
-                    waiting.setdefault(target, []).append(path)
+                metadata = (merge_metadata(old.metadata, member) if old and old.kind == "dir"
+                            and old.metadata is not None else copy.copy(member))
+                entry = Entry("dir", layer=str(layer_path), member=member.name, inode=Inode(metadata))
+            else:
+                self._remove(path)
+                if member.isfile():
+                    entry = Entry("file", layer=str(layer_path), member=member.name,
+                                  inode=Inode(member))
+                elif member.issym():
+                    entry = Entry("symlink", member.linkname, str(layer_path), member.name)
+                elif member.islnk():
+                    clean_path(member.linkname.lstrip("/"))
+                    # 整层索引完成前不固定硬链接的内容来源，
+                    # 因为目标可能是尚未出现、最终指向下层内容的另一个链接。
+                    entry = Entry("hardlink", member.linkname)
                 else:
-                    ready.append(path)
-            # 与物化器使用相同的依赖顺序：固定内容，同时共享可变 inode 元数据。
-            # 再次应用同一层的普通文件仍创建新 inode，不能按内容成员把旧别名合并。
-            completed = 0
-            for path in ready:
-                backing = self.entries.get(targets[path])
-                if backing is None:
-                    raise ArchiveError("Hardlink target missing in layer: " + path)
-                if backing.kind not in ("file", "hardlink") or backing.inode is None:
-                    raise ArchiveError("Hardlink target is not a file: " + path)
-                entry = self.entries[path]
-                entry.layer, entry.member, entry.inode = backing.layer, backing.member, backing.inode
-                entry.inode.apply_link(links[path])
-                completed += 1
-                ready.extend(waiting.get(path, ()))
-            if completed != len(links):
-                pending = set(links) - set(ready)
-                raise ArchiveError("Cyclic hardlink in layer: " + next(iter(pending)))
+                    # 导出/扁平化仍需原始 FIFO、设备节点的类型和设备号；不在宿主创建它们。
+                    entry = Entry("other", layer=str(layer_path), member=member.name)
+            self.entries[path] = entry
+        links = {path: member for path, member in members if member.islnk()}
+        targets = {path: clean_path(member.linkname.lstrip("/"))
+                   for path, member in links.items()}
+        ready, waiting = [], {}
+        for path, target in targets.items():
+            if target in links:
+                waiting.setdefault(target, []).append(path)
+            else:
+                ready.append(path)
+        # 与物化器使用相同的依赖顺序：固定内容，同时共享可变 inode 元数据。
+        # 再次应用同一层的普通文件仍创建新 inode，不能按内容成员把旧别名合并。
+        completed = 0
+        for path in ready:
+            backing = self.entries.get(targets[path])
+            if backing is None:
+                raise ArchiveError("Hardlink target missing in layer: " + path)
+            if backing.kind not in ("file", "hardlink") or backing.inode is None:
+                raise ArchiveError("Hardlink target is not a file: " + path)
+            entry = self.entries[path]
+            entry.layer, entry.member, entry.inode = backing.layer, backing.member, backing.inode
+            entry.inode.apply_link(links[path])
+            completed += 1
+            ready.extend(waiting.get(path, ()))
+        if completed != len(links):
+            pending = set(links) - set(ready)
+            raise ArchiveError("Cyclic hardlink in layer: " + next(iter(pending)))

@@ -26,7 +26,7 @@ from errors import ArchiveError, BuildError
 from image_reader import (MAX_JSON, BaseImage, ImageArchiveReader, archive_members, digest_hex,
                           copy_verified_gzip_blob,
                           image_history, parse_image_json, read_image_json_file, same_json_value, sha256_file,
-                          verified_layer_identity, verify_layer_tar)
+                          verified_layer_identity, verify_layer_tar, read_layer_members)
 from image_writer import ImageArchiveWriter
 from oci_writer import OCIImageWriter, CONFIG_TYPE, LAYER_TYPE, MANIFEST_TYPE
 from platforms import architecture, normalize_platform
@@ -627,12 +627,14 @@ class CASStore:
                 updated["layers"][index]["diff_id_verification_version"] = DIFF_ID_VERIFICATION_VERSION
             self._publish_ref(updated, replace=True)
 
-    def open_base(self, reference, platform="linux/amd64", source=None, reporter=None):
+    def open_base(self, reference, platform="linux/amd64", source=None, reporter=None, *, layer_consumer=None):
         """返回含配置和有序 layer.tar 路径的 BaseImage，供 builder 直接消费 CAS。
 
         缺少解码层或 blob→DiffID 校验记录时，先解压并核对本次结果，再入库。
         旧 ref 没有校验记录，首次使用会补验；成功后仍复用解码层。
         不生成中间 Docker save tar；不支持的压缩格式明确报错。
+        layer_consumer 可消费已完整校验的成员列表建立索引，避免随后重新打开并解析层。
+        回调按 manifest 顺序执行；不跳过 blob/DiffID/结构校验，不持久保存成员列表。
         """
         value = self.inspect_ref(reference, platform, source)
         try:
@@ -693,7 +695,12 @@ class CASStore:
                 else:
                     raise BuildError("Unsupported CAS layer compression: " + media_type)
                 with open(layer, "rb") as checked_layer:
-                    verify_layer_tar(checked_layer, "CAS base layer: " + diff_id)
+                    if layer_consumer is None:
+                        verify_layer_tar(checked_layer, "CAS base layer: " + diff_id)
+                    else:
+                        members = read_layer_members(checked_layer, "CAS base layer: " + diff_id)
+                        layer_consumer(layer, members, index + 1, len(value["layers"]), diff_id)
+                        del members  # 下一层解析前释放原始头；索引只保留其实际需要的元数据。
                 paths.append(layer)
                 task.current = encoded_size + (layer.stat().st_size if layer != blob else 0)
         self._record_verified_diff_ids(value, verified_indices)

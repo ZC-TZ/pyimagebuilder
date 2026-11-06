@@ -132,12 +132,13 @@ def archive_members(archive):
     return members
 
 
-def verify_layer_tar(stream, label):
-    """检查未压缩层能作为 tar 读取，且成员声明的数据没有越过 blob 边界。
+def read_layer_members(stream, label):
+    """完整校验 tar 后返回本次解析的成员，供索引消费同一份头信息。
 
     SHA-256 匹配只证明字节一致；任意垃圾数据同样可以拥有正确的 DiffID。
     在已核对摘要的可寻址流上遍历 tar 头，跳过文件负载，避免再完整读取大层。
     同时预检权限/属主/xattr 声明；不改写头或层。路径、whiteout 仍由 rootfs 消费者核对。
+    只有结束位置也通过检查才返回列表，不能把尚未完成验证的生成器交给消费者。
     """
     try:
         size = stream.seek(0, 2)
@@ -172,8 +173,14 @@ def verify_layer_tar(stream, label):
             terminal = stream.read(tarfile.BLOCKSIZE)
             if terminal and terminal != b"\0" * tarfile.BLOCKSIZE:
                 raise ArchiveError("Invalid layer tar header: " + label)
+            return archive.getmembers()  # 迭代已结束，复用 tarfile 自身列表，不再解析或复制头。
     except (tarfile.TarError, ValueError) as exc:
         raise ArchiveError("Invalid layer tar: " + label) from exc
+
+
+def verify_layer_tar(stream, label):
+    """仅验证层结构；与需要成员索引的调用方使用完全相同的校验规则。"""
+    read_layer_members(stream, label)
 
 
 def docker_manifest(value):

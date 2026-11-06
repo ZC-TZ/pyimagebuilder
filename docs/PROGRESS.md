@@ -98,6 +98,11 @@ Artifactory 供构建使用的 CAS-only 拉取会先取 manifest/config，再把
 `Wait for Artifactory layers`（下载结束后剩余等待）和 `Import Artifactory CAS blobs`。
 准备跨度包含与下载重叠的部分，不能与下载耗时直接相加；判断总收益请看总耗时和剩余等待。
 原有独立 Docker tar 转换路径继续显示 `Convert Artifactory layers`。
+
+CAS 的 `FROM` 读取会在每层完成结构验证后，立即用同一份成员信息建立文件索引。
+因此「校验基础层」和「应用基础层」事件可交错，前者的耗时也包含内部索引回调；
+评估这一段请使用 `Read and index base CAS` 的总耗时，不要把嵌套的层耗时再相加。
+这仅复用当前读取的头信息，不表示跳过缓存文件的完整摘要校验。
 使用输出盘暂存时，Write 包含该私有归档的 fsync；它通过完整验证后才发布。
 
 Artifactory（CAS 和 Docker tar）、Registry、CAS 读取、本地 tar 读取与构建索引共用
