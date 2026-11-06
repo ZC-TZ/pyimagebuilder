@@ -676,10 +676,17 @@ class Workbench:
             hosts.append(host)
         if not hosts:
             return ""
-        labels = {host: "{} · {} · {}".format(host,
-                    "HTTP" if self.settings["repositories"][host].get("insecureHttp", False) else "HTTPS",
-                    "Artifactory" if self.settings["repositories"][host].get("source") == "artifactory" else "Registry")
-                  for host in hosts}
+        from settings import repository_settings
+        labels = {}
+        for host in hosts:
+            try:
+                entry = repository_settings(self.settings, host)
+                protocol = ("HTTP" if entry.get("insecureHttp", False) else
+                            "HTTPS" if entry.get("verifyTls", True) else "HTTPS（不校验证书）")
+            except BuildError:
+                entry, protocol = self.settings["repositories"][host], "协议待明确配置"
+            labels[host] = "{} · {} · {}".format(host, protocol,
+                "Artifactory" if entry.get("source") == "artifactory" else "Registry")
         form = _select("host", "仓库", hosts, hosts[0], labels)
         form += _input("reference", "远端镜像引用（可选）", "harbor.example/project/app:1")
         return _section("仓库诊断", '<p class="muted">留空只检查仓库 API。填写镜像引用可检查标签和读取权限。'

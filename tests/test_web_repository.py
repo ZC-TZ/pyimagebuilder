@@ -53,7 +53,7 @@ class RepositoryDiagnosticTests(unittest.TestCase):
     def test_artifactory_tls_failure_does_not_fall_back_to_http_or_expose_password(self):
         host = "repository.example"
         settings = {"repositories": {host: {"source": "artifactory", "username": "test-login",
-                                            "passwordEnv": "PIB_DIAGNOSTIC_SECRET"}},
+                                            "passwordEnv": "PIB_DIAGNOSTIC_SECRET", "insecureHttp": False}},
                     "fast": {"profiles": {"test": {"baseUrl": "http://" + host + "/repo/image:1"}}}}
         output = io.StringIO()
         failure = URLError(ssl.SSLCertVerificationError("test-login:sensitive-password"))

@@ -18,6 +18,7 @@ from oci_writer import OCIImageWriter
 from registry import parse_reference, push, push_index
 from rootfs_archive import export_rootfs, flatten_image
 from settings import cache_directory, load_settings, repository_settings
+from network_tls import tls_options
 from web_jobs import file_stamp, open_artifact
 
 
@@ -85,7 +86,8 @@ def _deliver_index(plan, settings, snapshot):
     print("正在推送 amd64 和 arm64 到 " + destination, flush=True)
     result = push_index(snapshot, destination, connection.get("username"), password,
                         connection.get("caFile"), connection.get("insecureHttp", False),
-                        connection.get("authHost"), overwrite=False, expected_tag=tag)
+                        connection.get("authHost"), overwrite=False, expected_tag=tag,
+                        **tls_options(connection.get("verifyTls", True)))
     return {"reference": destination, "digest": result, "platforms": ["linux/amd64", "linux/arm64"]}
 
 
@@ -243,7 +245,8 @@ def _deliver_archive(plan, settings, store, path, size, workspace):
         print("正在推送到 " + destination, flush=True)
         digest = push(archive, destination, connection.get("username"), password,
                       connection.get("caFile"), connection.get("insecureHttp", False),
-                      connection.get("authHost"), overwrite=False)
+                      connection.get("authHost"), overwrite=False,
+                      **tls_options(connection.get("verifyTls", True)))
         return {"reference": destination, "digest": digest}
     raise BuildError("该归档不支持所选操作")
 

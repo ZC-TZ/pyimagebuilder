@@ -28,11 +28,15 @@ build 出错需要更多上下文时加 `--debug`；持续集成建议 `--progre
 
 先从浏览器复制完整地址核对 `http://` / `https://`，不要只根据地址栏的“不安全”图标判断。
 工作台诊断默认使用 HTTPS；如果实际服务是 HTTP，需要在现有仓库项中加 `"insecureHttp": true`，
-并确认 `source` 为实际的仓库类型。Fast 模板的 `baseUrl` 也应使用实际协议；只改模板不会改变仓库诊断的协议。
+并确认 `source` 为实际的仓库类型。显式仓库协议设置同时作用于 Fast、普通拉取和诊断；
+Artifactory 未设置该字段时，会从同仓库模板的唯一协议推断，协议冲突则要求明确配置。
 保留已有 username/passwordEnv 等字段，保存配置并重启 Web 后再检查。
 
 HTTPS 服务应保持证书校验，配置企业 CA 的 `caFile`，并核对证书主机名和有效期。
 `insecureHttp` 切换为 HTTP，不会让不受信任的 HTTPS 证书被接受。
+确实需要兼容无效证书时，可在该仓库配置 `"insecureHttp": false, "verifyTls": false`。
+这只关闭该仓库来源的证书校验，不会继承浏览器的证书例外，也不会影响独立 token 服务或跨来源下载。
+详见[仓库连接配置](CONFIGURATION.md#3-下载地址与鉴权)；修改后重启工作台。
 
 ## Invalid layer permission mode: 16877
 

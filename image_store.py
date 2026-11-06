@@ -24,6 +24,7 @@ from image_reader import (MAX_JSON, digest_hex, docker_manifest, outer_name, par
                           read_image_json_file, same_json_value, verify_layer_tar)
 from platforms import architecture, host_architecture, normalize_platform
 from registry import pull as registry_pull
+from network_tls import tls_options
 from settings import cache_directory, load_settings, repository_settings
 
 
@@ -171,7 +172,7 @@ def locate_archive(store, reference, platform, source=None):
 def pull_image(reference, *, platform="linux/amd64", source="registry", store=None,
                refresh=False, offline=False, username=None, password_env=None, ca_file=None,
                insecure_http=False, auth_host=None, workers=0, reporter=None,
-               artifactory_url=None, materialize_tar=True):
+               artifactory_url=None, materialize_tar=True, verify_tls=True):
     """解析或下载基础镜像，返回 (source, downloaded)。
 
     materialize_tar=True 时 source 是已校验的归档 Path；False 时是 builder 使用的 CAS 描述字典。
@@ -211,12 +212,12 @@ def pull_image(reference, *, platform="linux/amd64", source="registry", store=No
     with cas.ref_lock(reference, platform, source):
         return _pull_image_locked(cas, reference, platform, source, store, refresh, offline,
                                   username, password_env, ca_file, insecure_http, auth_host,
-                                  workers, reporter, directory_url, materialize_tar)
+                                  workers, reporter, directory_url, materialize_tar, verify_tls)
 
 
 def _pull_image_locked(cas, reference, platform, source, store, refresh, offline,
                        username, password_env, ca_file, insecure_http, auth_host,
-                       workers, reporter, directory_url, materialize_tar):
+                       workers, reporter, directory_url, materialize_tar, verify_tls=True):
     """在对应远端来源引用锁内复用镜像或下载，并在异常时恢复同一操作的快照。"""
     archive = _archive_path(store, reference, platform, source)
     archive_tag = docker_archive_tag(reference)
@@ -276,10 +277,11 @@ def _pull_image_locked(cas, reference, platform, source, store, refresh, offline
                 if native_cas_only:
                     options["cas_only"] = True
                 registry_pull(reference, pending, username, password, ca_file,
-                              insecure_http, auth_host, "docker", None, platform, **options)
+                              insecure_http, auth_host, "docker", None, platform,
+                              **dict(options, **tls_options(verify_tls)))
                 raw_imported = "cas_store" in parameters
             else:
-                opener = make_opener(directory_url, username, password, ca_file)
+                opener = make_opener(directory_url, username, password, ca_file, **tls_options(verify_tls))
                 import time
                 listing_started = time.monotonic()
                 files = list_files(opener, directory_url)
@@ -397,7 +399,7 @@ def pull_base_map(dockerfile, *, target_platform, target_stage, build_args,
                 insecure_http=insecure_http or connection.get("insecureHttp", False),
                 auth_host=auth_host if auth_host is not None else connection.get("authHost"),
                 workers=workers if workers is not None else connection.get("workers", 0),
-                reporter=reporter, materialize_tar=False)
+                reporter=reporter, materialize_tar=False, **tls_options(connection.get("verifyTls", True)))
             message = "{} base {} ({})".format("Pulled" if downloaded else "Cached",
                                                 reference, platform)
             if reporter is None:
@@ -458,7 +460,7 @@ def pull_main(argv=None):
             insecure_http=args.insecure_http or connection.get("insecureHttp", False),
             auth_host=args.auth_host or connection.get("authHost"),
             workers=args.workers if args.workers is not None else connection.get("workers", 0),
-            reporter=reporter)
+            reporter=reporter, **tls_options(connection.get("verifyTls", True)))
         reporter.log("{} image from {}".format("Pulled" if downloaded else "Cached",
                                               args.source or connection.get("source", "registry")))
         reporter.phase_success("Pulling base image")

@@ -107,7 +107,9 @@ def test_profile(path, data, platform):
         password = os.environ.get(profile["passwordEnv"]) if username is not None else None
         if username is not None and password is None:
             raise BuildError("缺少配置指定的 Artifactory 密码环境变量")
-        opener = make_opener(url, username, password, profile.get("caFile"))
+        from network_tls import tls_options
+        opener = make_opener(url, username, password, profile.get("caFile"),
+                             **tls_options(profile.get("verifyTls", True)))
 
         def read(name):
             with request(opener, url + name, timeout=15) as response:

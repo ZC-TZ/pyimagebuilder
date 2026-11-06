@@ -10,6 +10,8 @@ from urllib.parse import quote
 from artifactory_download import artifact_directory_url, make_opener, request
 from errors import BuildError
 from registry import ACCEPT_MANIFEST, MAX_JSON, RegistryClient, _json, parse_reference
+from settings import repository_settings
+from network_tls import tls_options
 
 
 def diagnostic_plan(settings, host, reference):
@@ -39,6 +41,7 @@ def _transport_error(exc):
     while current is not None:
         if isinstance(current, ssl.SSLCertVerificationError):
             return BuildError("TLS 证书校验失败。若服务是 HTTPS，请配置 caFile，并核对证书主机名与有效期；"
+                              "如需兼容无效证书，可显式配置 verifyTls=false（仅此仓库）；"
                               "若服务实际是 HTTP，请配置 insecureHttp=true"
                               "（切换到 HTTP，不是跳过证书校验）")
         if isinstance(current, ssl.SSLError):
@@ -58,7 +61,7 @@ def _transport_error(exc):
 
 def diagnose(settings, host, reference=""):
     plan = diagnostic_plan(settings, host, reference)
-    entry = settings["repositories"][host]
+    entry = repository_settings(settings, host)
     kind = entry.get("source", "registry")
     username = entry.get("username")
     default_env = "PYIMAGEBUILDER_{}_PASSWORD".format(kind.upper())
@@ -69,10 +72,13 @@ def diagnose(settings, host, reference=""):
     scheme = "http://" if insecure else "https://"
     origin = scheme + host
     print("正在检查仓库：{}（{}）".format(origin, "Artifactory" if kind == "artifactory" else "Registry"), flush=True)
+    if not insecure and entry.get("verifyTls", True) is False:
+        print("HTTPS 兼容模式：仅对此仓库关闭证书校验", flush=True)
     try:
         if kind == "registry":
             client = RegistryClient(plan["reference"] or host + "/pyimagebuilder/probe:latest", username,
-                                    password, entry.get("caFile"), insecure, entry.get("authHost"), timeout=10)
+                                    password, entry.get("caFile"), insecure, entry.get("authHost"), timeout=10,
+                                    **tls_options(entry.get("verifyTls", True)))
             if reference:
                 target = client._url("/manifests/" + quote(client.reference.version, safe=":"))
                 status, _, raw = client.request("GET", target, client._scope("pull"),
@@ -82,7 +88,8 @@ def diagnose(settings, host, reference=""):
         else:
             target = (artifact_directory_url(scheme + plan["reference"]) + "manifest.json"
                       if reference else origin + "/artifactory/api/system/ping")
-            opener = make_opener(origin, username, password, entry.get("caFile"))
+            opener = make_opener(origin, username, password, entry.get("caFile"),
+                                 **tls_options(entry.get("verifyTls", True)))
             with request(opener, target, timeout=10) as response:
                 status, raw = response.status, response.read(MAX_JSON + 1)
     except HTTPError as exc:
@@ -103,6 +110,8 @@ def diagnose(settings, host, reference=""):
                 raise BuildError("Invalid remote manifest")
         except (BuildError, RecursionError):
             raise BuildError("仓库已连通，但返回的镜像元数据格式不正确") from None
-    return {"仓库": host, "地址": origin, "类型": kind, "镜像": plan["reference"] or "未指定",
+    return {"仓库": host, "地址": origin, "类型": kind,
+            "证书校验": ("不适用（HTTP）" if insecure else "启用" if entry.get("verifyTls", True) else "关闭（仅此仓库）"),
+            "镜像": plan["reference"] or "未指定",
             "结果": "镜像元数据可读取" if reference else "仓库 API 可访问",
             "范围": "只读检查，未测试推送权限"}

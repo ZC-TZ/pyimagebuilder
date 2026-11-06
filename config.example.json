@@ -8,11 +8,13 @@
     "nmkf.zpk.abc": {
       "source": "artifactory",
       "insecureHttp": true,
+      "verifyTls": true,
       "username": "robot-account",
       "passwordEnv": "PYIMAGEBUILDER_ARTIFACTORY_PASSWORD"
     },
     "harbor.internal": {
       "source": "registry",
+      "verifyTls": true,
       "username": "robot-account",
       "passwordEnv": "PYIMAGEBUILDER_REGISTRY_PASSWORD"
     }

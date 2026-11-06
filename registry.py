@@ -34,6 +34,7 @@ from image_writer import ImageArchiveWriter
 from file_publish import publication_transaction, publish_new_file
 from task_resources import cancel_pending_on_error
 from progress.layers import LayerProgress
+from network_tls import tls_context, tls_options
 from oci_writer import (CONFIG_TYPE, INDEX_TYPE, LAYER_TYPE, MANIFEST_TYPE,
                         OCIImageWriter)
 from platforms import architecture, normalize_platform
@@ -146,7 +147,7 @@ class RegistryClient:
     不支持同一实例并发解析多个 manifest。cancel 后应为下一次操作新建实例。
     """
     def __init__(self, reference, username=None, password=None, ca_file=None,
-                 insecure_http=False, auth_host=None, timeout=60):
+                 insecure_http=False, auth_host=None, timeout=60, *, verify_tls=True):
         if (username is None) != (password is None):
             raise BuildError("Registry username and password must be provided together")
         self.reference = parse_reference(reference) if isinstance(reference, str) else reference
@@ -155,7 +156,11 @@ class RegistryClient:
         self.username = username
         self.password = password
         self.timeout = timeout
-        self.ssl_context = ssl.create_default_context(cafile=str(ca_file) if ca_file else None)
+        self.ssl_context = tls_context(ca_file, verify_tls)
+        self.verify_tls, self.ca_file = verify_tls, ca_file
+        self._verified_context = self.ssl_context if verify_tls else None
+        if not verify_tls and self.scheme == "https":
+            print("HTTPS 证书校验已关闭，仅限仓库：" + self.reference.registry, file=sys.stderr)
         self.auth_hosts = {self.reference.registry.lower()}
         if auth_host:
             self.auth_hosts.add(auth_host.lower())
@@ -185,7 +190,14 @@ class RegistryClient:
         connection_type = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
         kwargs = {"timeout": self.timeout}
         if parsed.scheme == "https":
-            kwargs["context"] = self.ssl_context
+            if parsed.scheme == self.scheme and parsed.netloc.lower() == self.reference.registry.lower():
+                kwargs["context"] = self.ssl_context
+            else:
+                # token 服务及跨来源 blob 重定向不继承仓库的证书例外。
+                with self._auth_lock:
+                    if self._verified_context is None:
+                        self._verified_context = tls_context(self.ca_file)
+                    kwargs["context"] = self._verified_context
         connection = connection_type(parsed.netloc, **kwargs)
         response = None
         try:
@@ -435,7 +447,7 @@ def _selected_manifest(client, target_platform="linux/amd64"):
 def pull(reference, output, username=None, password=None, ca_file=None,
          insecure_http=False, auth_host=None, image_format="docker", oci_output=None,
          target_platform="linux/amd64", reporter=None, workers=0, cas_store=None,
-         cas_only=False, cas_reference=None):
+         cas_only=False, cas_reference=None, verify_tls=True):
     """拉取一个目标平台，验证层并导出 Docker/OCI 归档或直接写入 CAS。
 
     并发下载后解压并核对 DiffID；按 manifest 原始顺序组装，不按完成先后排列。
@@ -444,7 +456,8 @@ def pull(reference, output, username=None, password=None, ca_file=None,
     CAS ref 更新与归档发布处于同一引用锁内，失败恢复旧 ref 并清理本次已发布产物。
     """
     target_platform = normalize_platform(target_platform)
-    client = RegistryClient(reference, username, password, ca_file, insecure_http, auth_host)
+    client = RegistryClient(reference, username, password, ca_file, insecure_http, auth_host,
+                            **tls_options(verify_tls))
     if reporter is not None:
         client.progress = reporter.progress
     output = output_path(output)
@@ -738,9 +751,10 @@ def _put_manifest(client, reference, raw, media_type):
 
 
 def push(archive_path, reference, username=None, password=None, ca_file=None,
-         insecure_http=False, auth_host=None, overwrite=False):
+         insecure_http=False, auth_host=None, overwrite=False, *, verify_tls=True):
     """上传单平台 OCI/Docker 归档，并发布 Registry manifest。"""
-    client = RegistryClient(reference, username, password, ca_file, insecure_http, auth_host)
+    client = RegistryClient(reference, username, password, ca_file, insecure_http, auth_host,
+                            **tls_options(verify_tls))
     _check_push_tag(client, overwrite)
     with tempfile.TemporaryDirectory(prefix="pyimagebuilder-push-") as temporary:
         path = _oci_archive(archive_path, Path(temporary), client.reference.full)
@@ -755,11 +769,12 @@ def push(archive_path, reference, username=None, password=None, ca_file=None,
 
 
 def push_index(archive_path, reference, username=None, password=None, ca_file=None,
-               insecure_http=False, auth_host=None, overwrite=False, *, expected_tag=None):
+               insecure_http=False, auth_host=None, overwrite=False, *, expected_tag=None, verify_tls=True):
     """上传各平台 manifest，再以一个 tag 发布多平台 OCI index。"""
     from multiarch import verify as verify_multiarch
 
-    client = RegistryClient(reference, username, password, ca_file, insecure_http, auth_host)
+    client = RegistryClient(reference, username, password, ca_file, insecure_http, auth_host,
+                            **tls_options(verify_tls))
     _check_push_tag(client, overwrite)
     try:
         with tarfile.open(archive_path, "r:") as archive:
@@ -848,13 +863,15 @@ def main(argv=None):
                   args.auth_host or connection.get("authHost"))
         if args.action == "pull":
             pull(args.reference, args.output, *common, args.format, args.oci_output,
-                 args.platform, workers=args.workers)
+                 args.platform, workers=args.workers, **tls_options(connection.get("verifyTls", True)))
             print("Pulled {} to {}".format(args.reference, args.output))
         elif args.action == "push":
-            digest = push(args.archive, args.reference, *common, args.overwrite)
+            digest = push(args.archive, args.reference, *common, args.overwrite,
+                          **tls_options(connection.get("verifyTls", True)))
             print("Pushed {} ({})".format(args.reference, digest))
         else:
-            digest = push_index(args.archive, args.reference, *common, args.overwrite)
+            digest = push_index(args.archive, args.reference, *common, args.overwrite,
+                                **tls_options(connection.get("verifyTls", True)))
             print("Pushed multi-platform {} ({})".format(args.reference, digest))
         return 0
     except (BuildError, OSError) as exc:

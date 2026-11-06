@@ -18,7 +18,8 @@ from pathlib import Path
 from builder import build
 from errors import BuildError
 from reproducible import parse_epoch
-from settings import cache_directory, config_path, load_settings, repository_settings
+from settings import cache_directory, config_path, load_settings, repository_settings, repository_url
+from network_tls import tls_options
 from compat import unlink_missing
 from file_publish import publication_transaction
 from path_policy import (archive_path as safe_archive_path, container_path, host_components,
@@ -90,17 +91,18 @@ def load_profile(config_path, profile_name=None):
         base_url = profile["baseUrl"]
         if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
             raise BuildError("baseUrl must explicitly start with http:// or https://")
-        directory_url = artifact_directory_url(base_url)
+        connection = repository_settings(settings, base_url)
+        directory_url = artifact_directory_url(repository_url(base_url, connection))
         if image_reference_from_directory(directory_url) != profile["baseImage"]:
             raise BuildError("baseUrl resolves to a different image reference than baseImage")
         profile["baseUrl"] = directory_url
-        connection = repository_settings(settings, directory_url)
         if connection and connection.get("source", "registry") != "artifactory":
             raise BuildError("Fast baseUrl repository must use source=artifactory")
         profile["username"] = connection.get("username")
         profile["passwordEnv"] = connection.get(
             "passwordEnv", "PYIMAGEBUILDER_ARTIFACTORY_PASSWORD")
         profile["downloadWorkers"] = connection.get("workers", 0)
+        profile["verifyTls"] = connection.get("verifyTls", True)
         if connection.get("caFile") is not None:
             profile["caFile"] = connection["caFile"]
         profile["imageStore"] = cache_directory(settings, "imageStore", None)
@@ -169,7 +171,8 @@ def _base_archive(profile, platform="linux/amd64", reporter=None):
         store=profile["imageStore"], username=profile.get("username"),
         password_env=profile["passwordEnv"], ca_file=profile.get("caFile"),
         workers=profile.get("downloadWorkers", 0), reporter=reporter,
-        artifactory_url=profile["baseUrl"], materialize_tar=False)
+        artifactory_url=profile["baseUrl"], materialize_tar=False,
+        **tls_options(profile.get("verifyTls", True)))
     if reporter is not None:
         reporter.log("{} base {}".format("Downloaded" if downloaded else "Cached",
                                           profile["baseImage"]))

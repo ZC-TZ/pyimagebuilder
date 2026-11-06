@@ -46,6 +46,7 @@ from errors import ArchiveError, BuildError
 from progress.layers import LayerProgress
 from image_reader import DigestReader, read_image_json_file, verify_layer_tar
 from reproducible import TAR_COPY_BUFFER
+from network_tls import RepositoryHTTPSHandler, https_origin, tls_context, tls_options
 
 
 class DirectoryLinks(html.parser.HTMLParser):
@@ -243,13 +244,17 @@ class SameOriginRedirect(HTTPRedirectHandler):
 
 
 def make_opener(base_url: str, username: Optional[str] = None,
-                password: Optional[str] = None, ca_file: Optional[Path] = None):
+                password: Optional[str] = None, ca_file: Optional[Path] = None, *, verify_tls=True):
     """创建可选 Basic 鉴权的下载器，并限制凭据只发送到已配置的 Artifactory 源。"""
     origin = _http_origin(base_url)
     if (username is None) != (password is None):
         raise ValueError("Username and password must be provided together")
-    handlers = [SameOriginRedirect(),
-                HTTPSHandler(context=ssl.create_default_context(cafile=str(ca_file) if ca_file else None))]
+    context = tls_context(ca_file, verify_tls)
+    handler = (HTTPSHandler(context=context) if verify_tls else
+               RepositoryHTTPSHandler(https_origin(base_url), context, ca_file))
+    handlers = [SameOriginRedirect(), handler]
+    if not verify_tls and urlsplit(base_url).scheme == "https":
+        print("HTTPS 证书校验已关闭，仅限仓库：" + urlsplit(base_url).netloc, file=sys.stderr)
     if username is not None:
         manager = HTTPPasswordMgrWithDefaultRealm()
         manager.add_password(None, base_url, username, password)
@@ -1095,7 +1100,8 @@ def main(argv=None) -> int:
             "passwordEnv", "PYIMAGEBUILDER_ARTIFACTORY_PASSWORD")
         password = os.environ.get(password_env)
         opener = make_opener(directory_url, args.username or connection.get("username"),
-                             password, args.ca_file or connection.get("caFile"))
+                             password, args.ca_file or connection.get("caFile"),
+                             **tls_options(connection.get("verifyTls", True)))
         print(f"制品目录：{directory_url}")
         image_reference = image_reference_from_directory(directory_url)
         print(f"镜像名称：{image_reference}")

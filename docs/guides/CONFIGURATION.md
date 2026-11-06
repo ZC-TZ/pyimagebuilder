@@ -39,7 +39,7 @@ python .\main.py build D:\project -t company/app:1 -o D:\images\app.tar `
 | 配置层级 | 支持的字段 |
 | --- | --- |
 | `cache` | `imageStore`、`layerCache` |
-| `repositories.<host>` | `source`、`username`、`passwordEnv`、`caFile`、`insecureHttp`、`workers`、`authHost` |
+| `repositories.<host>` | `source`、`username`、`passwordEnv`、`caFile`、`insecureHttp`、`verifyTls`、`workers`、`authHost` |
 | `fast` | `defaultProfile`、`profiles` |
 | `fast.profiles.<name>` | `flavor`、`baseImage`、`baseTar`、`baseUrl`、`owner`、`deployDir`、`serverConfig`、`outputDir` |
 
@@ -74,12 +74,40 @@ python .\main.py build D:\project -t company/app:1 -o D:\images\app.tar `
 仓库主机名、账号和 CA 文件均需替换。`source=registry` 用于标准 Registry/Harbor；`source=artifactory` 用于本项目支持的镜像文件目录下载。`caFile` 是可选字段，配置后文件必须存在。
 
 如果服务的实际地址是 `http://`，在对应的 `repositories.<host>` 中设置 `"insecureHttp": true`；
-如果实际是 `https://`，省略该字段或设为 false，使用默认系统信任或配置企业 CA 的 `caFile`。
+如果实际是 `https://`，设为 false，使用默认系统信任或配置企业 CA 的 `caFile`。
 `insecureHttp` 表示切换到 HTTP，不是跳过 HTTPS 证书校验。
-Fast 模板按 `baseUrl` 的显式协议下载，普通拉取和仓库诊断按仓库连接配置选择协议，
-因此这两处应与实际服务保持一致。示例配置中的 nmkf 演示已确认的 HTTP 服务；其他 HTTPS 仓库继续使用默认配置。
 
-修改 UOS 上的 `config.json` 后重启 Web 工作台。仓库诊断下拉项会显示 HTTP/HTTPS，
+| 连接方式 | `insecureHttp` | `verifyTls` | CA |
+| --- | --- | --- | --- |
+| HTTP | true | 不适用 | 不使用 |
+| HTTPS，正常校验证书（默认） | false | true 或省略 | 系统信任，或 `caFile` |
+| HTTPS，兼容无效证书 | false | false | 对该仓库不校验证书 |
+
+`verifyTls` 只接受 JSON 布尔值，不接受字符串 `"false"`。兼容模式仍使用 HTTPS 加密，
+但不验证对方身份；仅在明确需要兼容时启用，优先修复证书或配置企业 CA。
+例如浏览器已手动接受 nmkf 的无效证书，可在**现有仓库项**中设置：
+
+```json
+"nmkf.zpk.abc": {
+  "source": "artifactory",
+  "username": "实际账号",
+  "passwordEnv": "PYIMAGEBUILDER_ARTIFACTORY_PASSWORD",
+  "insecureHttp": false,
+  "verifyTls": false
+}
+```
+
+这个例外只适用于该仓库来源（协议、主机、端口），不会关闭其他仓库、跨来源 blob 下载或独立 token 服务的证书校验。
+浏览器的证书例外不会传给 Python；程序也不会在证书失败后自动降级到 HTTP。
+
+Fast、普通 build/pull、Web 模板测试与仓库诊断使用同一仓库策略。
+显式设置 `insecureHttp` 时，它优先于 Fast `baseUrl` 中的协议，地址路径和镜像引用保持不变。
+Artifactory 仓库未设置该字段时，Fast 使用选中模板的 URL；按镜像引用拉取和诊断从同仓库模板的唯一协议推断。
+若同仓库模板同时使用 HTTP 和 HTTPS，则这些无 URL 的操作会要求明确设置 `insecureHttp`；没有模板可推断时默认 HTTPS。
+独立 `artifactory_download.py` 的命令行 URL 保留显式协议；支持 `--insecure-http` 的客户端仍允许命令行切换到 HTTP。
+示例配置中的 nmkf 演示 HTTP 服务，其他 HTTPS 仓库默认严格校验证书。
+
+修改 UOS 上的 `config.json` 后重启 Web 工作台。仓库诊断下拉项会显示 HTTP/HTTPS 和证书兼容状态，
 任务日志会显示当前实际检查的地址；浏览器登录页能打开不代表同一地址上的 HTTPS 证书已经受 Python 信任。
 
 在运行命令的终端设置密码：

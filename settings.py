@@ -4,7 +4,7 @@ import json
 import os
 import re
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from errors import BuildError
 
@@ -101,7 +101,7 @@ def load_settings(candidate=None, required=False):
         if "password" in entry or "token" in entry:
             raise BuildError("Do not store passwords or tokens in config.json")
         _known_fields(entry, ("source", "username", "passwordEnv", "caFile",
-                              "insecureHttp", "workers", "authHost"), "repositories." + host)
+                              "insecureHttp", "verifyTls", "workers", "authHost"), "repositories." + host)
         for key in ("username", "authHost"):
             _optional_text(entry, key, "repositories." + host, nullable=True)
         if "passwordEnv" in entry and (not isinstance(entry["passwordEnv"], str) or
@@ -111,6 +111,8 @@ def load_settings(candidate=None, required=False):
             entry["caFile"] = _path(entry["caFile"], root, "caFile")
         if "insecureHttp" in entry and type(entry["insecureHttp"]) is not bool:
             raise BuildError("insecureHttp must be a boolean for " + host)
+        if "verifyTls" in entry and type(entry["verifyTls"]) is not bool:
+            raise BuildError("verifyTls must be a boolean for " + host)
         if "workers" in entry and (type(entry["workers"]) is not int or
                                    not 0 <= entry["workers"] <= 64):
             raise BuildError("workers must be between 0 and 64 for " + host)
@@ -141,7 +143,30 @@ def repository_settings(settings, reference):
         host = urlsplit(reference).netloc
     else:
         host = reference.split("/", 1)[0]
-    return settings.get("repositories", {}).get(host, {})
+    entry = settings.get("repositories", {}).get(host, {})
+    if entry.get("source") != "artifactory" or "insecureHttp" in entry:
+        return entry
+    # 显式 URL 保留自身协议；按镜像引用查库/诊断时，从唯一的同仓库模板协议推断。
+    # 不修改配置对象，也不在证书失败后自动降级为 HTTP。
+    urls = ([reference] if "://" in reference else
+            [profile.get("baseUrl", "") for profile in settings.get("fast", {}).get("profiles", {}).values()])
+    schemes = {urlsplit(url).scheme for url in urls
+               if isinstance(url, str) and urlsplit(url).netloc == host and
+               urlsplit(url).scheme in ("http", "https")}
+    if len(schemes) > 1:
+        raise BuildError("Conflicting HTTP/HTTPS profiles for {}; set repositories.insecureHttp explicitly".format(host))
+    return dict(entry, insecureHttp=(next(iter(schemes)) == "http")) if schemes else entry
+
+
+def repository_url(url, connection):
+    """仓库显式协议设置优先于模板 URL；路径、仓库名称与标签保持原样。"""
+    if "insecureHttp" not in connection:
+        return url
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        return url
+    return urlunsplit(("http" if connection["insecureHttp"] else "https", parsed.netloc,
+                       parsed.path, parsed.query, parsed.fragment))
 
 
 def cache_directory(settings, name, fallback):

@@ -26,6 +26,7 @@ from image_store import (_archive_path, _check_archive_platform, copy_image_arch
 from optimizer import audit_cache, cache_files, prune_cache
 from registry import RegistryClient, push
 from settings import cache_directory, load_settings, repository_settings
+from network_tls import tls_options
 
 
 def _manifest(archive):
@@ -437,10 +438,11 @@ def tag_archive(archive, new_tag, output, source_tag=None):
 
 
 def inspect_manifest(reference, username=None, password_env="PYIMAGEBUILDER_REGISTRY_PASSWORD",
-                     ca_file=None, insecure_http=False, auth_host=None):
+                     ca_file=None, insecure_http=False, auth_host=None, *, verify_tls=True):
     """只获取并验证 Registry manifest/index，不下载镜像层。"""
     password = os.environ.get(password_env)
-    client = RegistryClient(reference, username, password, ca_file, insecure_http, auth_host)
+    client = RegistryClient(reference, username, password, ca_file, insecure_http, auth_host,
+                            **tls_options(verify_tls))
     value, media_type, digest, size = client.manifest(client.reference.version)
     return {"reference": client.reference.full, "digest": digest, "media_type": media_type,
             "size": size, "manifest": value}
@@ -595,7 +597,8 @@ def main(argv=None):
                                               "passwordEnv", "PYIMAGEBUILDER_REGISTRY_PASSWORD"),
                                           args.ca_file or connection.get("caFile"),
                                           args.insecure_http or connection.get("insecureHttp", False),
-                                          args.auth_host or connection.get("authHost"))
+                                          args.auth_host or connection.get("authHost"),
+                                          **tls_options(connection.get("verifyTls", True)))
             else:
                 from registry import push_index
                 password_env = args.password_env or connection.get(
@@ -604,7 +607,8 @@ def main(argv=None):
                     args.archive, args.reference, args.username or connection.get("username"),
                     os.environ.get(password_env), args.ca_file or connection.get("caFile"),
                     args.insecure_http or connection.get("insecureHttp", False),
-                    args.auth_host or connection.get("authHost"), args.overwrite)}
+                    args.auth_host or connection.get("authHost"), args.overwrite,
+                    **tls_options(connection.get("verifyTls", True)))}
         else:
             password_env = args.password_env or connection.get(
                 "passwordEnv", "PYIMAGEBUILDER_REGISTRY_PASSWORD")
@@ -613,7 +617,8 @@ def main(argv=None):
                 args.archive, args.reference, args.username or connection.get("username"),
                 password, args.ca_file or connection.get("caFile"),
                 args.insecure_http or connection.get("insecureHttp", False),
-                args.auth_host or connection.get("authHost"), args.overwrite)}
+                args.auth_host or connection.get("authHost"), args.overwrite,
+                **tls_options(connection.get("verifyTls", True)))}
     except (ArchiveError, BuildError, OSError, tarfile.TarError, ValueError, TypeError) as exc:
         print("Image command failed: {}".format(exc), file=sys.stderr)
         return 1

@@ -179,7 +179,7 @@ Docker 归档入口共用 docker_manifest 校验 Config、Layers 与 RepoTags �
 
 ## Registry 客户端
 
-`registry.py` 通过标准库 `http.client` 实现 OCI Distribution / Docker Registry v2 的 manifest、blob、POST+PUT 上传接口。TLS 使用系统信任链或指定的私有 CA；默认拒绝 HTTP。认证支持同源 Basic 和 Bearer challenge，token realm 默认限定 Registry 主机，跨主机 token 服务需显式授权。GET blob 重定向到不同 HTTPS 主机时不会转发 Authorization。上传 Location 必须仍指向原 Registry 的同一 repository，避免把 blob 和凭据发到任意地址。
+`registry.py` 通过标准库 `http.client` 实现 OCI Distribution / Docker Registry v2 的 manifest、blob、POST+PUT 上传接口。TLS 使用系统信任链或指定的私有 CA；默认拒绝 HTTP。`network_tls.py` 集中创建独立 TLS 上下文；仓库显式 `verifyTls=false` 的兼容例外只对该来源生效，独立 token 服务和跨来源下载仍验证证书，不修改全局 SSL 设置。认证支持同源 Basic 和 Bearer challenge，token realm 默认限定 Registry 主机，跨主机 token 服务需显式授权。GET blob 重定向到不同 HTTPS 主机时不会转发 Authorization。上传 Location 必须仍指向原 Registry 的同一 repository，避免把 blob 和凭据发到任意地址。
 
 拉取优先请求 OCI/Docker schema 2 image manifest 或 index；index 选指定的 `linux/amd64` 或 `linux/arm64` 平台。每个 manifest 和 blob 做 digest/size 校验，gzip 层解压后再核对 config 的 `rootfs.diff_ids`，随后用原有 writer 输出 Docker tar、OCI tar 或两者。推送前先验证本地 OCI tar；Docker save 输入会先转换为 OCI 布局。未压缩层确定性 gzip 压缩，按 digest 查询远端已有 blob，缺失的才上传；最后 PUT 新 manifest 并校验 Registry 回传 digest。构建缓存与 Registry blob 存储分开，构建器仍可纯离线执行。
 
