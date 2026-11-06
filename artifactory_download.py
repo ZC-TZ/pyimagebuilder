@@ -1107,7 +1107,13 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
                             max(item[1] for item in prepared_times) - min(item[0] for item in prepared_times)
                             if prepared_times else 0)
                     layer_paths = [raw_root.joinpath(*name.split("/")) for name in layer_names]
-        finally:
+        except BaseException:
+            try:
+                display.finish_line()
+            except BaseException:
+                pass  # 终端断开等收尾错误不能替换下载、准备或取消的原始异常。
+            raise
+        else:
             display.finish_line()
 
         download_elapsed = download_finished - report_started

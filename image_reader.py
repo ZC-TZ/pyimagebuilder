@@ -32,6 +32,10 @@ SHA256 = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
 BASE_CACHE_VERSION = 6
 
 
+class LayerIdentityChanged(ArchiveError):
+    """校验摘要期间的文件身份改变；不能与实际 DiffID 错误混为一类。"""
+
+
 def digest_hex(value):
     """验证 sha256 摘要格式，返回不含算法前缀的十六进制值。"""
     match = SHA256.fullmatch(str(value))
@@ -106,7 +110,7 @@ def verified_layer_identity(path, expected, identity):
     if not isinstance(digest, str):
         digest = "sha256:" + sha256_file(path)
         if identity(path) != stamp:
-            raise ArchiveError("Layer file changed while binding cache identity")
+            raise LayerIdentityChanged("Layer file changed while binding cache identity")
     if digest != expected:
         raise ArchiveError("Layer DiffID changed before cache publication")
     return stamp

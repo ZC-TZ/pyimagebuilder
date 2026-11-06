@@ -20,10 +20,10 @@ from pathlib import Path
 
 from compat import is_linked_directory, unlink_missing
 from file_resources import fdopen_owned, open_regular_file
-from cache_identity import file_identity, stat_identity
+from cache_identity import FileIdentityChanged, file_identity, stat_identity
 from progress.layers import LayerProgress
 from errors import ArchiveError, BuildError
-from image_reader import (MAX_JSON, BaseImage, ImageArchiveReader, archive_members, digest_hex,
+from image_reader import (MAX_JSON, BaseImage, ImageArchiveReader, LayerIdentityChanged, archive_members, digest_hex,
                           copy_verified_gzip_blob,
                           image_history, parse_image_json, read_image_json_file, same_json_value, sha256_file,
                           verified_layer_identity, verify_layer_tar, read_layer_members)
@@ -153,9 +153,17 @@ class CASStore:
         try:
             publish_new_file(pending, target)
         except FileExistsError:
-            if target.is_symlink():
-                raise ArchiveError("CAS blob path is a symlink: " + digest)
-            identity = verified_layer_identity(target, digest, file_identity)
+            # 赢家发布后清理私有硬链接也会更新 ctime/ChangeTime。仅对身份变化重读，
+            # 每次仍完整核对内容；不能忽略变更时间，也不能把真正的摘要错误当成竞争。
+            for attempt in range(3):
+                if target.is_symlink():
+                    raise ArchiveError("CAS blob path is a symlink: " + digest)
+                try:
+                    identity = verified_layer_identity(target, digest, file_identity)
+                    break
+                except (FileIdentityChanged, LayerIdentityChanged):
+                    if attempt == 2:
+                        raise
             if identity[2] != size:
                 raise ArchiveError("CAS blob size mismatch: " + digest)
         return target

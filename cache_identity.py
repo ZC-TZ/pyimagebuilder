@@ -6,6 +6,10 @@ from functools import lru_cache
 from pathlib import Path
 
 
+class FileIdentityChanged(OSError):
+    """读取身份时文件发生变化；与普通磁盘错误分开，供限定场景重新完整核验。"""
+
+
 def stat_identity(data):
     """保留原有 stat 字段顺序，句柄与路径的绑定检查只比较前四项。"""
     return [data.st_dev, data.st_ino, data.st_size, data.st_mtime_ns, data.st_ctime_ns]
@@ -55,7 +59,7 @@ def file_identity(path, *, content=True):
         return identity
     with open(path, "rb") as stream:
         if stat_identity(os.fstat(stream.fileno()))[:4] != identity[:4]:
-            raise OSError("File changed while inspecting cache identity: " + str(path))
+            raise FileIdentityChanged("File changed while inspecting cache identity: " + str(path))
         changed = _windows_change_time(stream)
         if content or changed is None:
             digest = hashlib.sha256()
@@ -66,7 +70,7 @@ def file_identity(path, *, content=True):
             token = "windows-change:" + str(changed)
         if (stat_identity(os.fstat(stream.fileno()))[:4] != identity[:4] or
                 _windows_change_time(stream) != changed):
-            raise OSError("File changed while inspecting cache identity: " + str(path))
+            raise FileIdentityChanged("File changed while inspecting cache identity: " + str(path))
     if stat_identity(path.stat())[:4] != identity[:4]:
-        raise OSError("File changed while inspecting cache identity: " + str(path))
+        raise FileIdentityChanged("File changed while inspecting cache identity: " + str(path))
     return identity + [token]
