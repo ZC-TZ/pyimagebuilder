@@ -2,21 +2,116 @@
 
 import io
 import json
+import os
+import subprocess
+import sys
+import tempfile
 import threading
 import unittest
 from collections import deque
+from pathlib import Path
 from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 from progress import make_reporter
 from progress.events import BuildEvent
 from progress.presentation import clock, terminal_width, timing_lines
 from progress.renderer_plain import PlainRenderer
+from progress.renderer_json import JsonRenderer
 from progress.renderer_tty import TTYRenderer
 from web_jobs import Jobs
 from web_log import event_kind, log_lines, log_metadata, log_record, pull_flow, pull_view
 
 
 class LogPresentationTests(unittest.TestCase):
+    def test_real_build_succeeds_with_ascii_stdout_and_unicode_output_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            context = root / "context"
+            context.mkdir()
+            (context / "payload").write_bytes(b"application")
+            (context / "Dockerfile").write_text("FROM scratch\nCOPY payload /app/payload\n", encoding="utf-8")
+            env = dict(os.environ, PYTHONIOENCODING="ascii",
+                       PYIMAGEBUILDER_BUILD_RECORDS_DIR=str(root / "records"))
+            for mode in ("plain", "json"):
+                with self.subTest(mode=mode):
+                    target = root / ("镜像-\U0001f4e6-" + mode + ".tar")
+                    result = subprocess.run([sys.executable, "main.py", "build", str(context), "--offline",
+                                             "--no-cache", "-t", "example:1", "-o", str(target),
+                                             "--progress=" + mode], cwd=str(Path(__file__).resolve().parents[1]),
+                                            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    self.assertEqual(result.returncode, 0, result.stderr.decode("ascii", errors="replace"))
+                    text = result.stdout.decode("ascii")
+                    self.assertTrue(target.is_file())
+                    if mode == "json":
+                        final = json.loads(text.splitlines()[-1])
+                        self.assertEqual(final["type"], "build_success")
+                        self.assertEqual(final["details"]["output"], str(target))
+                    else:
+                        self.assertIn("Build succeeded", text)
+
+    def test_encoding_fallback_does_not_swallow_output_io_failures(self):
+        class Disconnected:
+            encoding = "ascii"
+
+            def write(self, value):
+                raise BrokenPipeError("output disconnected")
+
+        for renderer in (PlainRenderer(Disconnected()), JsonRenderer(Disconnected()),
+                         TTYRenderer(Disconnected(), color=False)):
+            with self.subTest(renderer=type(renderer).__name__):
+                with self.assertRaises(BrokenPipeError):
+                    renderer.render(BuildEvent("phase_start", 0, message="Preparing build"))
+
+    def test_json_roundtrip_on_strict_streams_and_line_separator_characters(self):
+        message = "准备镜像 \U0001f4e6 path-\udcff \u2028 next \u2029 end"
+        event = BuildEvent("step_log", 1, message=message, details={"path": "nested-\ud800"})
+        for encoding in ("ascii", "gbk", "utf-8"):
+            with self.subTest(encoding=encoding):
+                raw = io.BytesIO()
+                stream = io.TextIOWrapper(raw, encoding=encoding, errors="strict")
+                try:
+                    JsonRenderer(stream).render(event)
+                    stream.flush()
+                    lines = raw.getvalue().decode(encoding).splitlines()
+                    self.assertEqual(len(lines), 1)
+                    self.assertEqual(json.loads(lines[0]), event.as_dict())
+                finally:
+                    stream.close()
+
+    def test_human_logs_escape_only_characters_the_stream_cannot_encode(self):
+        for encoding in ("ascii", "gbk", "utf-8"):
+            with self.subTest(encoding=encoding):
+                raw = io.BytesIO()
+                stream = io.TextIOWrapper(raw, encoding=encoding, errors="strict")
+                try:
+                    renderer = PlainRenderer(stream, error_stream=stream)
+                    renderer.render(BuildEvent("phase_start", 0, message="Preparing build"))
+                    renderer.render(BuildEvent("build_failed", 1, message="path-\udcff \U0001f4e6"))
+                    stream.flush()
+                    text = raw.getvalue().decode(encoding)
+                    self.assertIn("Build failed", text)
+                    self.assertIn(r"path-\udcff", text)
+                    if encoding == "utf-8":
+                        self.assertIn("解析构建输入", text)
+                        self.assertIn("\U0001f4e6", text)
+                finally:
+                    stream.close()
+
+    def test_tty_fits_escaped_text_to_actual_terminal_width(self):
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="ascii", errors="strict")
+        try:
+            renderer = TTYRenderer(stream, color=False)
+            with patch("progress.renderer_tty.shutil.get_terminal_size", return_value=SimpleNamespace(columns=36)):
+                renderer.render(BuildEvent("heartbeat", 0, message="Preparing build", duration=1))
+            stream.flush()
+            text = raw.getvalue().decode("ascii").lstrip("\r")
+            self.assertLessEqual(len(text), 35)
+            self.assertEqual(renderer.width, len(text))
+        finally:
+            stream.close()
+
     def collector_job(self):
         jobs = Jobs.__new__(Jobs)
         jobs.condition = threading.Condition()

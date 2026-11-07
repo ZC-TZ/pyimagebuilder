@@ -16,5 +16,7 @@ class JsonRenderer(Renderer):
         """输出一行紧凑 JSON；quiet 模式只保留最终结果事件。"""
         if self.quiet and event.type not in ("build_success", "build_failed"):
             return
-        print(json.dumps(event.as_dict(), ensure_ascii=False, separators=(",", ":")),
+        # JSON 转义保持字段值可逆，也避免终端编码、孤立代理字符和 Unicode
+        # 行分隔符破坏输出；此策略只用于事件，不用于镜像 manifest/config。
+        print(json.dumps(event.as_dict(), ensure_ascii=True, separators=(",", ":")),
               file=self.stream, flush=True)

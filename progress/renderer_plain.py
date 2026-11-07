@@ -6,7 +6,7 @@ from .progress_bar import progress_text, size
 from .renderer_base import Renderer
 from .layers import LAYER_EVENTS, format_layer_event
 from .pull import format_pull_status
-from .presentation import phase_name, timing_lines
+from .presentation import phase_name, stream_text, timing_lines
 
 
 class PlainRenderer(Renderer):
@@ -19,10 +19,10 @@ class PlainRenderer(Renderer):
         self._last_heartbeat = None
 
     def _line(self, value):
-        print(value, file=self.stream, flush=True)
+        print(stream_text(value, self.stream), file=self.stream, flush=True)
 
     def _error_line(self, value):
-        print(value, file=self.error_stream, flush=True)
+        print(stream_text(value, self.error_stream), file=self.error_stream, flush=True)
 
     def render(self, event):
         """以稳定的逐行格式输出当前事件。"""

@@ -7,7 +7,7 @@ from .progress_bar import progress_text
 from .renderer_plain import PlainRenderer
 from .layers import format_layer_event
 from .pull import format_pull_status
-from .presentation import phase_name, terminal_width
+from .presentation import phase_name, stream_text, terminal_width
 
 
 def fit_status_line(value, columns):
@@ -70,7 +70,8 @@ class TTYRenderer(PlainRenderer):
                        progress_text(event, bar=True) if event.type == "step_progress" else (
                 "... {} ({:.1f}s)".format(phase_name(event.message), event.duration or 0)))
             columns = shutil.get_terminal_size((120, 24)).columns
-            value = fit_status_line("    " + message, columns)
+            # 转义会增加显示列数，必须在裁剪与擦除宽度计算之前完成。
+            value = fit_status_line(stream_text("    " + message, self.stream), columns)
             width = terminal_width(value)
             previous_width = min(self.width, max(1, columns - 1))
             self.stream.write("\r" + value + " " * max(0, previous_width - width))

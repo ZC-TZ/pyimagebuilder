@@ -35,6 +35,21 @@ def phase_name(value):
     return PHASE_NAMES.get(value, value)
 
 
+def stream_text(value, stream):
+    """仅转义输出编码无法表示的字符，不修改事件数据或全局流配置。
+
+    先转换再写入，避免部分输出后重试；管道断开和其他 I/O 错误仍由调用方处理。
+    """
+    encoding = getattr(stream, "encoding", None)
+    if value.isascii() or not encoding:
+        return value
+    try:
+        value.encode(encoding)
+    except UnicodeEncodeError:
+        return value.encode(encoding, errors="backslashreplace").decode(encoding)
+    return value
+
+
 def terminal_width(value):
     """按显示列计算中文和组合字符宽度，供表格与临时状态共用。"""
     return sum(0 if unicodedata.combining(char) or unicodedata.category(char) in ("Mn", "Me", "Cf")
