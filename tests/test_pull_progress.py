@@ -72,6 +72,7 @@ class PullProgressTests(unittest.TestCase):
         ready = events[-1]["details"]
         self.assertEqual(ready["store_completed"], 3)
         self.assertIsNone(reporter._pull_state)
+        self.assertIsNone(reporter._pull_since)
         self.assertFalse((self.root / "unused.tar").exists())
 
     def test_failed_reference_check_never_reports_ready_and_restores_old_ref(self):

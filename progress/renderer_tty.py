@@ -55,7 +55,8 @@ class TTYRenderer(PlainRenderer):
 
     def _clear(self):
         if self.width:
-            self.stream.write("\r" + " " * self.width + "\r")
+            columns = shutil.get_terminal_size((120, 24)).columns
+            self.stream.write("\r" + " " * min(self.width, max(1, columns - 1)) + "\r")
             self.stream.flush()
             self.width = 0
 
@@ -68,9 +69,11 @@ class TTYRenderer(PlainRenderer):
                        format_layer_event(event).strip() if event.type == "layer_progress" else
                        progress_text(event, bar=True) if event.type == "step_progress" else (
                 "... {} ({:.1f}s)".format(event.message, event.duration or 0)))
-            value = fit_status_line("    " + message, shutil.get_terminal_size((120, 24)).columns)
+            columns = shutil.get_terminal_size((120, 24)).columns
+            value = fit_status_line("    " + message, columns)
             width = terminal_width(value)
-            self.stream.write("\r" + value + " " * max(0, self.width - width))
+            previous_width = min(self.width, max(1, columns - 1))
+            self.stream.write("\r" + value + " " * max(0, previous_width - width))
             self.stream.flush()
             self.width = width
             return

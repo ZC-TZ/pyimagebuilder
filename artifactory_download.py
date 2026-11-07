@@ -39,13 +39,14 @@ from urllib.request import (Request, build_opener, HTTPBasicAuthHandler,
                             HTTPPasswordMgrWithDefaultRealm, HTTPRedirectHandler, HTTPSHandler)
 
 from compat import unlink_missing, is_linked_directory
-from file_resources import fdopen_owned
+from file_resources import cleanup_on_exit, fdopen_owned
 from task_resources import cancel_pending_on_error
 from file_publish import publication_transaction, publish_new_file
 from path_policy import archive_path, host_components, host_path_aliases, output_path
 from errors import ArchiveError, BuildError
 from progress.layers import LayerProgress
 from progress.pull import PullProgress
+from progress.renderer_tty import fit_status_line, terminal_width
 from image_reader import DigestReader, read_image_json_file, verify_layer_tar
 from image_writer import ImageArchiveWriter
 from reproducible import TAR_COPY_BUFFER
@@ -145,10 +146,14 @@ class ProgressDisplay(object):
         """刷新当前状态；终端原位更新，日志环境按行输出。"""
         with self._lock:
             if self.is_tty:
-                padding = " " * max(0, self._last_width - len(message))
+                columns = shutil.get_terminal_size((120, 24)).columns
+                message = fit_status_line(message, columns)
+                width = terminal_width(message)
+                previous_width = min(self._last_width, max(1, columns - 1))
+                padding = " " * max(0, previous_width - width)
                 sys.stdout.write("\r" + message + padding)
                 sys.stdout.flush()
-                self._last_width = len(message)
+                self._last_width = width
             else:
                 print(message, flush=True)
 
@@ -156,7 +161,8 @@ class ProgressDisplay(object):
         """输出一条不会与终端状态行重叠的日志。"""
         with self._lock:
             if self.is_tty and self._last_width:
-                sys.stdout.write("\r" + " " * self._last_width + "\r")
+                columns = shutil.get_terminal_size((120, 24)).columns
+                sys.stdout.write("\r" + " " * min(self._last_width, max(1, columns - 1)) + "\r")
             print(message, flush=True)
             self._last_width = 0
 
@@ -985,8 +991,9 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
     if cas_only:
         workspace_parent = cas_store.root.parent
         workspace_parent.mkdir(parents=True, exist_ok=True)
+    workspace_resources = ExitStack()
     with publication_transaction(cas_store, image_reference, target_platform, "artifactory") as published, \
-            ExitStack() as workspace_resources:
+            cleanup_on_exit(workspace_resources.close):
         temp = workspace_resources.enter_context(
             tempfile.TemporaryDirectory(prefix="artifactory_download_", dir=workspace_parent))
         workspace = Path(temp)

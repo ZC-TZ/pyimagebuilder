@@ -163,7 +163,7 @@ class BuildReporter:
     def phase_start(self, message):
         """标记 Dockerfile 指令以外的阶段，如下载或导出。"""
         with self.lock:
-            self._pull_state = None
+            self._pull_state = self._pull_since = None
             self.active = message
             self.active_since = time.monotonic()
             self.step = self.instruction = self.line = None
@@ -175,11 +175,12 @@ class BuildReporter:
             duration = time.monotonic() - self.active_since if self.active_since else 0
             self._emit("phase_success", message or self.active or "done", duration=round(duration, 3))
             self.active = self.active_since = None
-            self._pull_state = None
+            self._pull_state = self._pull_since = None
 
     def step_start(self, index, total, instruction, line):
         """把后续日志和进度关联到当前 Dockerfile 指令及源行号。"""
         with self.lock:
+            self._pull_state = self._pull_since = None
             self.step, self.total, self.instruction, self.line = index, total, instruction, line
             self.active = instruction
             self.active_since = time.monotonic()
@@ -191,6 +192,7 @@ class BuildReporter:
             duration = time.monotonic() - self.active_since if self.active_since else 0
             self._emit("step_success", message, duration=round(duration, 3))
             self.active = self.active_since = None
+            self._pull_state = self._pull_since = None
 
     def cache_hit(self, message="layer"):
         """报告指令复用了缓存层。"""
@@ -214,10 +216,14 @@ class BuildReporter:
     def pull_status(self, state):
         """拉取子阶段不改写外层 phase；只有引用验证成功后才退出整体拉取状态。"""
         with self.lock:
+            if self.finished:
+                return  # 已关闭报告器的迟到回调不能重新保留旧拉取状态。
             state = dict(state)
+            new_pull = (self._pull_state is None or
+                        state.get("pull_id") != self._pull_state.get("pull_id"))
             # 调度线程取得层快照后，工作线程可能先发出更新的完成事件。
             # 用组内修订号合并，不能让较早取得的快照把完成数和运行数倒退。
-            if self._pull_state is not None:
+            if not new_pull:
                 for prefix in ("prepare", "store"):
                     if (state.get(prefix + "_group") and
                             state.get(prefix + "_group") == self._pull_state.get(prefix + "_group") and
@@ -226,11 +232,13 @@ class BuildReporter:
                             name = prefix + "_" + key
                             if name in self._pull_state:
                                 state[name] = self._pull_state[name]
-            if self._pull_state is None or state["stage"] != self._pull_state["stage"]:
+            if new_pull or state["stage"] != self._pull_state["stage"]:
                 self._pull_since = time.monotonic()
             self._pull_state = None if state["stage"] == "ready" else dict(state)
             if self._pull_state is not None:
                 state = self._pull_snapshot()
+            else:
+                self._pull_since = None
             self._emit("pull_status", details=state)
 
     def _pull_snapshot(self):

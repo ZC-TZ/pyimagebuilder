@@ -1,5 +1,7 @@
 """展示基础镜像拉取的整体状态，明确网络完成与镜像可用之间的区别。"""
 
+import uuid
+
 from .progress_bar import size
 
 
@@ -47,7 +49,7 @@ class PullProgress:
         self.reporter, self.display = reporter, display
         self.preparation = None
         self.state = {"files_total": files_total, "files_completed": 0, "bytes_completed": 0,
-                      "source": "artifactory", "image": image}
+                      "source": "artifactory", "image": image, "pull_id": uuid.uuid4().hex}
 
     def update(self, stage, milestone=False, **values):
         self.state.update(values, stage=stage, milestone=milestone)
