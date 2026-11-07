@@ -172,8 +172,33 @@ li+li{margin-top:6px}
 pre{font:12px/1.6 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere;background:#152238;color:#e2ecfb;padding:12px 14px;border-radius:9px;
   max-height:460px;overflow:auto;margin:9px 0}
 #job-status{min-height:1.6em;margin:0;overflow-wrap:anywhere}
-#job-output{overflow-anchor:none;margin:0;border-radius:0;max-height:min(62vh,620px);scrollbar-color:#627795 #152238}
-#job-output>span{display:block;min-height:1.6em}
+#job-output{overflow-anchor:none;margin:0;border-radius:0;max-height:min(62vh,620px);scrollbar-color:#526781 #101b2d;
+  background:#101b2d;color:#d0dbea;padding:9px 0 14px;font-size:13px;line-height:1.8;tab-size:4}
+#job-output>span{display:grid;grid-template-columns:15ch minmax(0,1fr);gap:12px;min-height:1.8em;padding:2px 17px 2px 0;
+  border-left:3px solid transparent}
+#job-output>span::before{content:attr(data-line) "  " attr(data-time);color:#8294ad;text-align:right;white-space:pre;
+  font-weight:400;user-select:none;font-variant-numeric:tabular-nums}
+#job-output>.log-stage{color:#bed8ff;background:#1a2c46;border-left-color:#79a5ec;font-weight:650;margin-top:7px;padding-block:7px}
+#job-output>.log-success{color:#a3ddc5}
+#job-output>.log-error{color:#ffd1d1;background:#39232d;border-left-color:#e68b96;font-weight:650;padding-block:6px}
+#job-output>.log-cache{color:#eed49d}
+#job-output>.log-warning{color:#f1d3a0;background:#302a22;border-left-color:#b99c65}
+#job-output>.log-summary{color:#d9e8ff;background:#182941}
+.log-legend{display:flex;gap:11px;margin-top:6px;font-size:11px;color:var(--muted)}
+.log-legend>span::before{content:"";display:inline-block;width:6px;height:6px;border-radius:2px;margin-right:5px;background:#729cda}
+.log-legend>.legend-success::before{background:#3c9878}.log-legend>.legend-cache::before{background:#ba8b34}
+.log-legend>.legend-error::before{background:#ce6b7a}
+#job-flow:empty{display:none}.pull-flow{padding:18px 22px;border:1px solid var(--line);border-radius:var(--radius);background:#fff}
+.pull-flow header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}.pull-flow h3{margin:0;font-size:14px}
+.pull-flow header code{font-size:11px;color:var(--muted);min-width:0;overflow-wrap:anywhere}
+.pull-flow ol{list-style:none;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));padding:0;margin:18px 0;gap:12px}
+.pull-flow li{display:flex;gap:8px;align-items:center;position:relative;font-size:12px;color:#687890}
+.pull-flow li small{display:block;font-size:10px;margin-top:2px}
+.flow-dot{display:grid;place-items:center;flex:0 0 27px;height:27px;border-radius:50%;background:#edf1f7;color:#75849a;font:600 10px var(--mono)}
+.flow-done .flow-dot{background:#e3f3eb;color:#267658}.flow-active .flow-dot{background:#285ec4;color:white;box-shadow:0 0 0 4px #edf3ff}
+.pull-flow .flow-active{color:#224f9d;font-weight:700}.flow-stopped .flow-dot{background:#fbe7eb;color:#a43c54}
+.flow-metrics{display:flex;gap:10px 23px;flex-wrap:wrap;padding-top:12px;border-top:1px solid #e8edf5;color:var(--muted);font-size:11px}
+.flow-metrics strong{color:#263a55;margin:0 6px;font:600 13px var(--mono)}
 #job-output:empty::before{content:"此任务暂无日志。"}
 #job-output[data-running="1"]:empty::before{content:"等待输出…"}
 .tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
@@ -185,6 +210,8 @@ pre{font:12px/1.6 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere;backgr
   .build-modes{grid-template-columns:repeat(2,minmax(0,1fr))}.tiles{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
 }
 @media(max-width:680px){
+  .pull-flow{padding:15px}.pull-flow ol{grid-template-columns:1fr;gap:13px}
+  #job-output>span{grid-template-columns:11ch minmax(0,1fr);gap:8px;padding-right:10px;font-size:12px}
   .shell{display:block}.sidebar{position:static;height:auto;padding:12px 14px;gap:10px;overflow:visible}
   .brand{padding:0}.brand-sub{display:none}.brand-icon{height:30px;flex-basis:30px}.sidebar-foot{display:none}
   .tabs{grid-template-columns:repeat(3,minmax(0,1fr));gap:4px}.tabs a{gap:5px;padding:6px 7px;font-size:13px}.tabs .icon{width:15px;height:15px}

@@ -21,6 +21,7 @@ from web_maintenance import (PROFILE_FIELDS, _revision, cache_fingerprint, cache
 from web_ui import icon
 from web_uploads import FastUploads
 from web_paths import check_oci_platform
+from web_log import log_lines, log_metadata, pull_flow
 
 
 STATES = {"queued": "排队中", "running": "运行中", "success": "成功", "failed": "失败",
@@ -131,13 +132,16 @@ JOB_SCRIPT = r"""
   const follow = document.getElementById('job-follow');
   const details = document.getElementById('job-details');
   const status = document.getElementById('job-status');
+  const flow = document.getElementById('job-flow');
   const pollStatus = document.getElementById('job-poll-status');
   const exportLog = document.getElementById('job-export');
   const omitted = document.getElementById('job-log-omitted');
   let after = Number(output.dataset.after);
   let first = after - output.childElementCount;
   let detailsHTML = details.innerHTML;
+  let flowHTML = flow ? flow.innerHTML : '';
   let following = true;
+  let resizing = false;
 
   function showFollow() {
     const message = following ? '正在跟随最新日志' : '已暂停跟随，可继续查看上方日志';
@@ -154,8 +158,17 @@ JOB_SCRIPT = r"""
   latest.hidden = false;
   latest.addEventListener('click', jump);
   output.addEventListener('scroll', () => {
+    if (resizing) return;
     following = atBottom();
     showFollow();
+  });
+  window.addEventListener('resize', () => {
+    const resume = following;
+    resizing = true;
+    requestAnimationFrame(() => {
+      if (resume) jump();
+      resizing = false;
+    });
   });
   jump();
 
@@ -179,6 +192,10 @@ JOB_SCRIPT = r"""
         detailsHTML = next.details;
       }
       if (status.textContent !== next.status) status.textContent = next.status;
+      if (flow && typeof next.flow === 'string' && next.flow !== flowHTML) {
+        flow.innerHTML = next.flow;
+        flowHTML = next.flow;
+      }
       if (!next.archived && next.end !== after) {
         following = atBottom();
         const top = output.scrollTop;
@@ -194,9 +211,15 @@ JOB_SCRIPT = r"""
           output.firstElementChild.remove();
         }
         const fragment = document.createDocumentFragment();
-        for (const text of next.lines) {
+        const kinds = ['output', 'stage', 'success', 'error', 'cache', 'summary', 'warning'];
+        const metadata = Array.isArray(next.line_meta) ? next.line_meta : [];
+        for (let i = 0; i < next.lines.length; i++) {
           const line = document.createElement('span');
-          line.textContent = text;
+          const meta = metadata[i] || {};
+          line.className = 'log-line log-' + (kinds.includes(meta.kind) ? meta.kind : 'output');
+          line.dataset.line = String(next.end - next.lines.length + i + 1);
+          line.dataset.time = typeof meta.time === 'string' ? meta.time.slice(0, 16) : '--:--';
+          line.textContent = next.lines[i];
           fragment.appendChild(line);
         }
         output.appendChild(fragment);
@@ -852,12 +875,16 @@ class Workbench:
                    '<small>任务状态</small><p id="job-status">{}</p></div>').format(
                         self.job_details(job), _e(job["status"] or STATES[job["state"]]))
         content = _section(LABELS[job["action"]], summary)
+        content += '<div id="job-flow">{}</div>'.format(pull_flow(job))
         if not job.get("archived"):
             query = urlencode({"id": job["id"]})
-            lines = "".join('<span>{}</span>'.format(_e(line)) for line in job["logs"])
+            lines = log_lines(job)
             omitted = job["log_end"] - len(job["logs"])
             content += ('<article class="log-panel"><header class="log-toolbar"><div><h2>任务日志</h2>'
-                        '<small id="job-follow" role="status"></small></div><div class="actions log-actions">'
+                        '<small id="job-follow" role="status"></small><div class="log-legend" aria-label="日志类型">'
+                        '<span class="legend-stage">阶段</span><span class="legend-success">完成</span>'
+                        '<span class="legend-cache">缓存</span><span class="legend-error">失败</span></div></div>'
+                        '<div class="actions log-actions">'
                         '<button type="button" class="secondary" id="job-latest" hidden>跳到最新</button>'
                         '<a id="job-export"{5} class="button compact" href="{0}/job-log?{1}">导出当前日志</a></div></header>'
                         '<pre id="job-output" tabindex="0" aria-label="任务日志" data-url="{0}/job-progress?{1}" '
@@ -877,7 +904,9 @@ class Workbench:
         start = end - len(job["logs"])
         return {"details": self.job_details(job), "status": job["status"] or STATES[job["state"]],
                 "running": job["state"] in ("queued", "running"), "archived": bool(job.get("archived")),
-                "start": start, "end": end, "lines": job["logs"][max(0, after - start):]}
+                "flow": pull_flow(job), "start": start, "end": end,
+                "lines": job["logs"][max(0, after - start):],
+                "line_meta": log_metadata(job)[max(0, after - start):]}
 
     def _upload_token(self, data):
         token = data.get("package-upload", "")

@@ -4,13 +4,29 @@
 
 以下是当前 `PlainRenderer` 的输出格式示例。路径、镜像名和 digest 已缩写；RUN 和私有仓库示例展示相应事件的渲染格式，本机 Windows 环境未执行 Linux RUN 或连接内网仓库。
 
+## 日志外观与阅读方式
+
+CLI 的已知阶段名以中文显示；阶段耗时按从长到短排列，按显示列对齐中文，条形长度只相对本表最长操作，
+不代表总耗时占比。同阶段重复心跳默认最多每五秒输出一次，`--verbose` 可展开；交互终端仍原位刷新。
+JSON 事件、阶段标识、`details.timings` 的原始键不翻译，也不因普通日志降噪而减少心跳事件。
+
+Web 日志增加行号、相对任务开始的时间和事件类型配色：阶段为蓝色、完成为绿色、缓存为金色、失败为红色。
+颜色来自结构化事件类型；应用命令仅仅输出 `FAILED` 不会被当成构建失败事件。
+行号在有界日志窗口淘汰旧行后继续递增，样式元数据与文本同步淘汰；未知时间显示 `--:--`。
+暂停翻看、跳到最新以及调整窗口后的跟随行为保持可用。日志导出仍是 UTF-8 纯文本，不包含行号、时间栏或 HTML。
+这些样式元数据只保留在当前会话，不改变原有任务摘要或镜像格式。
+
+有结构化拉取快照时，Web 另显示当前基础镜像的五段流程条、文件数、层数和当前子阶段时间，
+目前用于 Artifactory 直接入 CAS 的路径。没有快照的本地构建不推测或伪造拉取进度。
+基础镜像就绪只表示基础镜像可以使用；应用镜像的任务结果仍以最终构建状态为准。
+
 ## 1. 完全命中层缓存
 
 ```text
 PyBuilder | Building demo/app:1 [linux/amd64]
-[+] Preparing build
+[+] 解析构建输入
     > Dockerfile parsed: 3 instruction(s)
-    OK Preparing build (0.00s)
+    OK 解析构建输入 (0.00s)
 [1/3] FROM example/base:1
     > Base archive: C:\images\base.tar
     OK done (0.01s)
@@ -19,10 +35,10 @@ PyBuilder | Building demo/app:1 [linux/amd64]
     OK done (0.00s)
 [3/3] ENV A=B
     OK metadata only (0.00s)
-[+] Exporting image archive
-    OK Exporting image archive (0.03s)
-[+] Verifying output digest
-    OK Verifying output digest (0.01s)
+[+] 写出镜像归档
+    OK 写出镜像归档 (0.03s)
+[+] 计算最终归档摘要
+    OK 计算最终归档摘要 (0.01s)
 Build succeeded
 Image:     demo/app:1
 Platform:  linux/amd64
@@ -49,18 +65,18 @@ RUN 的 stdout 和 stderr 都作为该步骤的 `step_log` 事件发出，JSON �
 
 ```text
 PyBuilder | Building sfcx_back:1.3.4 [linux/amd64]
-[+] Preparing application package
-    OK Preparing application package (0.01s)
-[+] Resolving base image
+[+] 准备应用包
+    OK 准备应用包 (0.01s)
+[+] 准备基础镜像
     > Using local base D:\images\tongweb.tar
-    OK Resolving base image (0.02s)
-[+] Preparing build
+    OK 准备基础镜像 (0.02s)
+[+] 解析构建输入
     > Dockerfile parsed: 3 instruction(s)
-    OK Preparing build (0.00s)
+    OK 解析构建输入 (0.00s)
 [1/3] FROM example/tongweb:11
 [2/3] COPY --chown=tongadmin:tonggrp app.war /soft/TongWeb7.0/autodeploy/sfcx.war
 [3/3] COPY --chown=tongadmin:tonggrp tongweb.xml /soft/TongWeb7.0/conf/tongweb.xml
-[+] Exporting image archive
+[+] 写出镜像归档
 ...
 Build succeeded
 Image:     sfcx_back:1.3.4
@@ -69,7 +85,7 @@ Image:     sfcx_back:1.3.4
 ## 4. 首次下载基础镜像
 
 ```text
-[+] Resolving base image
+[+] 准备基础镜像
     基础镜像 | 读取并校验 manifest/config | 本阶段 0.0s
     基础镜像 | 下载 10/24 文件，300.0 MiB/905.0 MiB | 准备 5/22 层，运行 2（与下载并行）
     OK 准备镜像层 8/22 | 完成 | 20.0 MiB | 0.50s | 已完成 6/22
@@ -80,7 +96,7 @@ Image:     sfcx_back:1.3.4
     ...
     OK 写入镜像层完成 | 22/22 层
     基础镜像已就绪 | 22/22 层 | 引用已提交并验证
-    OK Resolving base image (180.00s)
+    OK 准备基础镜像 (180.00s)
 ```
 
 以上为 Artifactory 直接入 CAS 的格式示例，数字不代表实测性能。下载文件数包含 manifest/config 等文件，
@@ -210,14 +226,14 @@ RUN 的 stdout/stderr 每次最多读取 64 KiB。普通短行保持原有输出
 ## 6. 导出大镜像
 
 ```text
-[+] Exporting image archive
+[+] 写出镜像归档
     Writing Docker layer 72% (552.0 MiB/766.0 MiB)
-    ... Exporting image archive (4.0s)
+    ... 写出镜像归档 (4.0s)
     Writing Docker layer 100% (766.0 MiB/766.0 MiB)
-    OK Exporting image archive (5.02s)
-[+] Verifying output digest
+    OK 写出镜像归档 (5.02s)
+[+] 计算最终归档摘要
     Hashing archive 100% (766.0 MiB/766.0 MiB)
-    OK Verifying output digest (0.82s)
+    OK 计算最终归档摘要 (0.82s)
 Build succeeded
 ```
 

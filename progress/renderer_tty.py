@@ -2,18 +2,12 @@
 
 import os
 import shutil
-import unicodedata
 
 from .progress_bar import progress_text
 from .renderer_plain import PlainRenderer
 from .layers import format_layer_event
 from .pull import format_pull_status
-
-
-def terminal_width(value):
-    """按终端列计算中文及组合字符的宽度，避免较短的新状态留下旧行尾。"""
-    return sum(0 if unicodedata.combining(char) or unicodedata.category(char) in ("Mn", "Me", "Cf")
-               else 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in value)
+from .presentation import phase_name, terminal_width
 
 
 def fit_status_line(value, columns):
@@ -60,6 +54,12 @@ class TTYRenderer(PlainRenderer):
             self.stream.flush()
             self.width = 0
 
+    def _error_line(self, value):
+        self._clear()
+        if self.color:
+            value = "\033[31m" + value + "\033[0m"
+        super()._error_line(value)
+
     def render(self, event):
         """刷新活动状态行，同时保留已完成事件的日志。"""
         transient_pull = event.type == "pull_status" and not event.details.get("milestone")
@@ -68,7 +68,7 @@ class TTYRenderer(PlainRenderer):
             message = (format_pull_status(pull) if pull else
                        format_layer_event(event).strip() if event.type == "layer_progress" else
                        progress_text(event, bar=True) if event.type == "step_progress" else (
-                "... {} ({:.1f}s)".format(event.message, event.duration or 0)))
+                "... {} ({:.1f}s)".format(phase_name(event.message), event.duration or 0)))
             columns = shutil.get_terminal_size((120, 24)).columns
             value = fit_status_line("    " + message, columns)
             width = terminal_width(value)

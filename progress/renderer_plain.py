@@ -6,6 +6,7 @@ from .progress_bar import progress_text, size
 from .renderer_base import Renderer
 from .layers import LAYER_EVENTS, format_layer_event
 from .pull import format_pull_status
+from .presentation import phase_name, timing_lines
 
 
 class PlainRenderer(Renderer):
@@ -15,15 +16,25 @@ class PlainRenderer(Renderer):
         self.error_stream = error_stream or sys.stderr
         self.quiet = quiet
         self.verbose = verbose
+        self._last_heartbeat = None
 
     def _line(self, value):
         print(value, file=self.stream, flush=True)
+
+    def _error_line(self, value):
+        print(value, file=self.error_stream, flush=True)
 
     def render(self, event):
         """以稳定的逐行格式输出当前事件。"""
         kind = event.type
         if self.quiet and kind not in ("build_success", "build_failed"):
             return
+        if kind in ("phase_start", "step_start") or (kind == "pull_status" and event.details.get("milestone")):
+            self._last_heartbeat = None
+        if kind == "heartbeat" and not self.verbose:
+            if self._last_heartbeat is not None and event.elapsed - self._last_heartbeat < 5:
+                return
+            self._last_heartbeat = event.elapsed
         if kind == "pull_status":
             self._line("    " + format_pull_status(event.details))
         elif kind in LAYER_EVENTS:
@@ -33,9 +44,9 @@ class PlainRenderer(Renderer):
             self._line("PyBuilder | Building {} [{}]".format(
                 event.details.get("image", "image"), event.details.get("platform", "unknown")))
         elif kind == "phase_start":
-            self._line("[+] {}".format(event.message))
+            self._line("[+] {}".format(phase_name(event.message)))
         elif kind == "phase_success":
-            self._line("    OK {} ({:.2f}s)".format(event.message or event.phase, event.duration or 0))
+            self._line("    OK {} ({:.2f}s)".format(phase_name(event.message or event.phase), event.duration or 0))
         elif kind == "step_start":
             instruction = event.instruction or ""
             if "\n" in instruction:
@@ -53,7 +64,7 @@ class PlainRenderer(Renderer):
             if event.details.get("pull"):
                 self._line("    ... " + format_pull_status(event.details["pull"]))
             else:
-                self._line("    ... {} ({:.1f}s)".format(event.message, event.duration or 0))
+                self._line("    ... {} ({:.1f}s)".format(phase_name(event.message), event.duration or 0))
         elif kind == "step_success":
             suffix = " ({:.2f}s)".format(event.duration or 0)
             self._line("    OK {}{}".format(event.message or "done", suffix))
@@ -62,10 +73,10 @@ class PlainRenderer(Renderer):
                 event.message, event.line or "?", event.duration or 0))
         elif kind == "build_failed":
             label = " at step {}/{}".format(event.step, event.total) if event.step else ""
-            print("Build failed{}: {}".format(label, event.message), file=self.error_stream, flush=True)
+            self._error_line("Build failed{}: {}".format(label, event.message))
             if event.line:
-                print("Dockerfile:{}".format(event.line), file=self.error_stream, flush=True)
-            print("Duration: {:.2f}s".format(event.duration or 0), file=self.error_stream, flush=True)
+                self._error_line("Dockerfile:{}".format(event.line))
+            self._error_line("Duration: {:.2f}s".format(event.duration or 0))
         elif kind == "build_success":
             summary = event.details
             self._line("Build succeeded")
@@ -82,11 +93,6 @@ class PlainRenderer(Renderer):
             if summary.get("timings"):
                 self._line("Stage timings (seconds):")
                 self._line("  注意：包含嵌套或并行操作，不能直接相加；总耗时以 Duration 为准。")
-                for label, seconds in summary["timings"].items():
-                    note = ""
-                    if label == "Prepare Artifactory layers (overlap)":
-                        note = "（与下载并行的墙钟跨度，不相加）"
-                    elif label == "Wait for Artifactory layers":
-                        note = "（下载结束后的剩余等待）"
-                    self._line("  {:<29} {:>8.2f} {}".format(label, seconds, note).rstrip())
+                for line in timing_lines(summary["timings"]):
+                    self._line(line)
             self._line("Duration:  {:.2f}s".format(event.duration or 0))

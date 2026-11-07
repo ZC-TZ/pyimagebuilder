@@ -23,6 +23,7 @@ from web_job_journal import JobJournal, form_snapshot
 from progress.events import BuildEvent
 from progress.renderer_plain import PlainRenderer
 from progress.pull import format_pull_status
+from web_log import event_kind, log_record, pull_view
 
 
 LABELS = {"fast": "快速打包", "build": "Dockerfile 构建", "check": "检查 Dockerfile",
@@ -39,17 +40,11 @@ FORMATS = ("docker", "oci", "both")
 LOG_LINE_CHARS = 4000
 LOG_RECORD_BYTES = 512 * 1024
 EVENT_FIELDS = frozenset(field.name for field in fields(BuildEvent))
-PHASE_NAMES = {"Resolving base image": "准备基础镜像", "Resolving base images": "准备基础镜像",
-               "Preparing application package": "准备应用包", "Preparing build": "解析构建输入",
-               "Exporting image archive": "写出镜像归档", "Verifying image archive": "校验镜像归档"}
 
 
 def _render_event(event):
     """网页和普通控制台共用事件格式，保留层序号、字节数和耗时。"""
     values = {key: value for key, value in event.items() if key in EVENT_FIELDS}
-    for key in ("message", "phase"):
-        if isinstance(values.get(key), str):
-            values[key] = PHASE_NAMES.get(values[key], values[key])
     output = StringIO()
     try:
         PlainRenderer(output, error_stream=output, verbose=True).render(BuildEvent(**values))
@@ -332,7 +327,8 @@ class Jobs:
                 del self.jobs[oldest]
             identity = uuid.uuid4().hex
             self.jobs[identity] = {"id": identity, "action": action, "args": args, "outputs": outputs,
-                                   "state": "queued", "logs": deque(maxlen=250), "log_end": 0, "files": [], "artifacts": [],
+                                   "state": "queued", "logs": deque(maxlen=250), "log_meta": deque(maxlen=250),
+                                   "log_end": 0, "files": [], "artifacts": [],
                                    "status": "", "process": None, "label": label,
                                    "form": form_snapshot(action, form or {}), "delivery": delivery,
                                    "cleanup": cleanup}
@@ -342,10 +338,15 @@ class Jobs:
             return identity
 
     @staticmethod
-    def _append_log(job, line):
+    def _append_log(job, line, kind="output", elapsed=None):
+        if "log_meta" not in job:
+            job["log_meta"] = deque(({} for _ in job["logs"]), maxlen=job["logs"].maxlen)
         if len(line) > LOG_LINE_CHARS:
             line = line[:LOG_LINE_CHARS - 1] + "…"
         job["logs"].append(line)
+        if elapsed is None and "started" in job:
+            elapsed = round(max(0, time.monotonic() - job["started"]), 3)
+        job["log_meta"].append(log_record(kind, elapsed))
         job["log_end"] += 1
 
     def _save(self, job):
@@ -354,7 +355,7 @@ class Jobs:
         except (OSError, ValueError):
             # 台账由 CLI 单独提交；可选的任务摘要写失败不能改变归档的构建结果。
             if not job.get("journal_warning"):
-                self._append_log(job, "任务摘要未能写入磁盘，关闭工作台后可能无法查看。")
+                self._append_log(job, "任务摘要未能写入磁盘，关闭工作台后可能无法查看。", "warning")
                 job["journal_warning"] = True
 
     def snapshot(self, identity=None):
@@ -362,6 +363,9 @@ class Jobs:
             def view(job):
                 snapshot = {key: list(value) if key in ("logs", "files", "artifacts") else value
                             for key, value in job.items() if key not in ("args", "process", "outputs", "cleanup", "started")}
+                snapshot["log_meta"] = [dict(item) for item in job.get("log_meta", [])]
+                if isinstance(job.get("pull"), dict):
+                    snapshot["pull"] = dict(job["pull"])
                 if job["state"] == "running":
                     snapshot["elapsed"] = int(time.monotonic() - job.get("started", time.monotonic()))
                 if job["state"] == "running" and job.get("interrupt"):
@@ -458,6 +462,9 @@ class Jobs:
                             details = event.get("details")
                             pull = details.get("pull") if isinstance(details, dict) else None
                             pull_text = _pull_text(pull)
+                            view = pull_view(details) if kind == "pull_status" else pull_view(pull)
+                            if view is not None:
+                                job["pull"] = view
                             if kind == "heartbeat":
                                 if pull_text is not None:
                                     job["status"] = pull_text[:LOG_LINE_CHARS]
@@ -486,7 +493,7 @@ class Jobs:
                                 continue
                             if rendered:
                                 for entry in rendered.splitlines():
-                                    self._append_log(job, entry)
+                                    self._append_log(job, entry, event_kind(event), event.get("elapsed"))
                             continue
                         self._append_log(job, line)
         except OSError as exc:
@@ -516,7 +523,7 @@ class Jobs:
                     artifacts.append({"path": str(path), "bytes": stamp[2], "sha256": "sha256:" + digest.hexdigest()})
                 except OSError as exc:
                     with self.condition:
-                        self._append_log(job, "未能登记产物 {}：{}".format(path.name, exc))
+                        self._append_log(job, "未能登记产物 {}：{}".format(path.name, exc), "warning")
         with self.condition:
             job["state"] = "success" if code == 0 else ("cancelled" if job.get("interrupt") else "failed")
             job["code"] = code
@@ -533,5 +540,5 @@ class Jobs:
             try:
                 cleanup()
             except OSError as exc:
-                self._append_log(job, "未能清理暂存文件：{}".format(exc))
+                self._append_log(job, "未能清理暂存文件：{}".format(exc), "warning")
         self._save(job)

@@ -315,6 +315,41 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(result["state"], "cancelled")
         self.assertNotEqual(result["status"], "正在取消")
 
+    def test_styled_log_metadata_is_incremental_and_export_stays_plain_text(self):
+        jobs = self.workspace.jobs
+        with jobs.condition:
+            identity = jobs.submit("build", [], [], "style-test")
+            jobs.queue.remove(identity)
+            job = jobs.jobs[identity]
+            job["state"] = "running"
+            for index in range(255):
+                jobs._append_log(job, "line " + str(index), "stage" if index % 2 else "success", index)
+        snapshot = jobs.snapshot(identity)
+        self.assertEqual(len(snapshot["logs"]), 250)
+        self.assertEqual(snapshot["log_meta"][0]["elapsed"], 5)
+        snapshot["log_meta"][0]["kind"] = "error"
+        self.assertEqual(jobs.snapshot(identity)["log_meta"][0]["kind"], "stage")
+        endpoint = "/job-progress?id=" + identity + "&after=253"
+        response = json.loads(self.http(endpoint)[2])
+        self.assertEqual(response["lines"], ["line 253", "line 254"])
+        self.assertEqual([entry["kind"] for entry in response["line_meta"]], ["stage", "success"])
+        raw = self.http("/job-log?id=" + identity)[2].decode("utf-8")
+        self.assertEqual(raw, "\n".join(jobs.snapshot(identity)["logs"]) + "\n")
+        self.assertNotIn("log-line", raw)
+
+    def test_pull_flow_is_exposed_without_mutating_live_snapshot(self):
+        jobs = self.workspace.jobs
+        with jobs.condition:
+            identity = jobs.submit("build", [], [], "flow-test")
+            jobs.queue.remove(identity)
+            job = jobs.jobs[identity]
+            job.update(state="running", pull={"stage": "waiting", "prepare_total": 22, "prepare_completed": 19})
+        snapshot = jobs.snapshot(identity)
+        snapshot["pull"]["prepare_completed"] = 22
+        progress = self.workspace.job_progress(jobs.snapshot(identity), 0)
+        self.assertIn("19/22", progress["flow"])
+        self.assertEqual(progress["line_meta"], [])
+
     def test_parallel_pull_status_uses_aggregate_counts_without_log_flood(self):
         jobs = self.workspace.jobs
         with jobs.condition:
