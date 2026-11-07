@@ -45,6 +45,7 @@ from file_publish import publication_transaction, publish_new_file
 from path_policy import archive_path, host_components, host_path_aliases, output_path
 from errors import ArchiveError, BuildError
 from progress.layers import LayerProgress
+from progress.pull import PullProgress
 from image_reader import DigestReader, read_image_json_file, verify_layer_tar
 from image_writer import ImageArchiveWriter
 from reproducible import TAR_COPY_BUFFER
@@ -985,11 +986,14 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
         workspace_parent = cas_store.root.parent
         workspace_parent.mkdir(parents=True, exist_ok=True)
     with publication_transaction(cas_store, image_reference, target_platform, "artifactory") as published, \
-            tempfile.TemporaryDirectory(prefix="artifactory_download_", dir=workspace_parent) as temp:
+            ExitStack() as workspace_resources:
+        temp = workspace_resources.enter_context(
+            tempfile.TemporaryDirectory(prefix="artifactory_download_", dir=workspace_parent))
         workspace = Path(temp)
         raw_root = workspace / "registry-v2"
         archive_root = workspace / "docker-archive"
         raw_root.mkdir()
+        pull = PullProgress(len(files), reporter, display, image_reference) if cas_only else None
         if workers == 0:
             max_workers = min(12, len(files))
             selected_workers = min(6, len(files))
@@ -1023,12 +1027,16 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
                     cancel_pending_on_error(executor, limiter.cancel) as submit, ExitStack() as resources:
                 prefetched, preparation_futures = set(), []
                 if cas_only:
+                    pull.update("metadata", milestone=True)
                     (manifest, manifest_raw, config_path, descriptors, diff_ids,
                      layer_names, prefetched) = _cas_download_metadata(
                         opener, directory_url, files, raw_root, sizes, limiter, stats, display)
                     completed = len(prefetched)
                     preparation = LayerProgress("prepare", len(descriptors), reporter, display,
                                                 source="artifactory", image=image_reference)
+                    pull.preparation = preparation
+                    pull.update("transfer", milestone=True, files_completed=completed,
+                                bytes_completed=stats.snapshot(), bytes_total=exact_total)
                     # 解压/哈希会释放 GIL；限制为两层，避免与网络下载争抢过多磁盘带宽。
                     converter = resources.enter_context(ThreadPoolExecutor(max_workers=2))
                     prepare_submit = resources.enter_context(cancel_pending_on_error(converter, limiter.cancel))
@@ -1092,8 +1100,13 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
                                 completed, len(files), format_size(transferred),
                                 smoothed_speed / (1024 * 1024), active, limit
                             )
-                        display.status(status)
-                        if reporter is not None:
+                        if cas_only:
+                            pull.update("transfer", files_completed=completed, bytes_completed=transferred,
+                                        bytes_total=exact_total, speed=smoothed_speed,
+                                        eta=eta if exact_total is not None else None)
+                        else:
+                            display.status(status)
+                        if reporter is not None and not cas_only:
                             reporter.progress(transferred, exact_total, "Downloading base image")
                         last_report = now
                         last_report_bytes = transferred
@@ -1133,8 +1146,8 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
                         last_adjust_bytes = transferred
                 download_finished = time.monotonic()
                 if cas_only:
-                    display.log("下载完成：{}，耗时 {}；层准备已与下载重叠，等待剩余任务…".format(
-                        format_size(stats.snapshot()), format_duration(download_finished - report_started)))
+                    pull.update("waiting", milestone=True, files_completed=len(files),
+                                bytes_completed=stats.snapshot())
                     prepared_times = [future.result() for future in as_completed(preparation_futures)]
                     preparation.finish()
                     preparation_finished = time.monotonic()
@@ -1184,9 +1197,15 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
             reporter.record_timing("Convert Artifactory layers", conversion_elapsed)
         if cas_store is not None:
             import_started = time.monotonic()
+            import_progress = None
+            if cas_only:
+                import_progress = LayerProgress("store", len(layer_paths), reporter, display,
+                                                source="artifactory", image=image_reference)
+                pull.update("ingest", milestone=True, store_group=import_progress.group_id,
+                            store_total=len(layer_paths), store_completed=0, store_active=0)
             cas_store.import_registry(manifest_raw, config_path, layer_paths,
                                       image_reference, target_platform, replace=True,
-                                      verified_diff_ids=True, owned_layers=cas_only)
+                                      verified_diff_ids=True, owned_layers=cas_only, layer_progress=import_progress)
             if reporter is not None:
                 reporter.record_timing("Import Artifactory CAS blobs", time.monotonic() - import_started)
             if not cas_only:
@@ -1194,6 +1213,9 @@ def download_and_pack(opener, directory_url: str, files: List[str], output: Path
         if cas_only:
             # 保留基础镜像入口对 media type 与配置的检查；层内容已在发布前验证。
             cas_store.inspect_ref(image_reference, target_platform, "artifactory")
+            # 临时目录收尾失败仍会回滚引用；不能在退出工作区前就宣称镜像已就绪。
+            workspace_resources.close()
+            pull.update("ready", milestone=True)
             return
         display.log("格式转换完成，耗时 {}；开始生成 Docker tar…".format(
             format_duration(conversion_elapsed)))

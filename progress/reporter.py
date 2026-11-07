@@ -34,6 +34,8 @@ class BuildReporter:
         self.finished = False
         self._closed = False
         self.timings = {}
+        self._pull_state = None
+        self._pull_since = None
         self.stop = threading.Event()
         self.thread = None
         self._started = False
@@ -87,7 +89,8 @@ class BuildReporter:
                 with self.lock:
                     if self.active and self.active_since is not None and not self.finished:
                         duration = time.monotonic() - self.active_since
-                        self._emit("heartbeat", self.active, duration=round(duration, 3))
+                        details = {"pull": self._pull_snapshot()} if self._pull_state else {}
+                        self._emit("heartbeat", self.active, duration=round(duration, 3), details=details)
         except BaseException as exc:
             # _emit 已登记渲染异常，下一次主线程输出会报告；后台不能静默成功。
             with self.lock:
@@ -118,6 +121,7 @@ class BuildReporter:
                     # 关闭后不再持有异常 traceback；它可能保留整个失败构建的输入对象。
                     with self.lock:
                         self._render_error = None
+                        self._pull_state = self._pull_since = None
         except BaseException:
             if not unwinding:
                 raise
@@ -159,6 +163,7 @@ class BuildReporter:
     def phase_start(self, message):
         """标记 Dockerfile 指令以外的阶段，如下载或导出。"""
         with self.lock:
+            self._pull_state = None
             self.active = message
             self.active_since = time.monotonic()
             self.step = self.instruction = self.line = None
@@ -170,6 +175,7 @@ class BuildReporter:
             duration = time.monotonic() - self.active_since if self.active_since else 0
             self._emit("phase_success", message or self.active or "done", duration=round(duration, 3))
             self.active = self.active_since = None
+            self._pull_state = None
 
     def step_start(self, index, total, instruction, line):
         """把后续日志和进度关联到当前 Dockerfile 指令及源行号。"""
@@ -194,7 +200,44 @@ class BuildReporter:
         """发布结构化层任务事件；Dockerfile step 字段仍由当前构建上下文维护。"""
         if kind not in LAYER_EVENTS:
             raise ValueError("Unknown layer event: " + kind)
-        self._emit(kind, message, **fields)
+        with self.lock:
+            if self._pull_state is not None:
+                data = dict(fields.get("details", {}))
+                for prefix in ("prepare", "store"):
+                    if data.get("group_id") and data.get("group_id") == self._pull_state.get(prefix + "_group"):
+                        for key in ("total", "completed", "active", "pending", "revision"):
+                            self._pull_state[prefix + "_" + key] = data["layers_" + key]
+                data["pull"] = self._pull_snapshot()
+                fields["details"] = data
+            self._emit(kind, message, **fields)
+
+    def pull_status(self, state):
+        """拉取子阶段不改写外层 phase；只有引用验证成功后才退出整体拉取状态。"""
+        with self.lock:
+            state = dict(state)
+            # 调度线程取得层快照后，工作线程可能先发出更新的完成事件。
+            # 用组内修订号合并，不能让较早取得的快照把完成数和运行数倒退。
+            if self._pull_state is not None:
+                for prefix in ("prepare", "store"):
+                    if (state.get(prefix + "_group") and
+                            state.get(prefix + "_group") == self._pull_state.get(prefix + "_group") and
+                            self._pull_state.get(prefix + "_revision", -1) > state.get(prefix + "_revision", -1)):
+                        for key in ("total", "completed", "active", "pending", "revision"):
+                            name = prefix + "_" + key
+                            if name in self._pull_state:
+                                state[name] = self._pull_state[name]
+            if self._pull_state is None or state["stage"] != self._pull_state["stage"]:
+                self._pull_since = time.monotonic()
+            self._pull_state = None if state["stage"] == "ready" else dict(state)
+            if self._pull_state is not None:
+                state = self._pull_snapshot()
+            self._emit("pull_status", details=state)
+
+    def _pull_snapshot(self):
+        """调用方持 reporter 锁；子阶段计时独立于外层解析基础镜像的累计时长。"""
+        value = dict(self._pull_state)
+        value["stage_seconds"] = round(max(0, time.monotonic() - self._pull_since), 3)
+        return value
 
     def cache_miss(self):
         """报告指令需要重新生成层。"""
@@ -237,6 +280,7 @@ class BuildReporter:
                     return
                 try:
                     self.active = self.active_since = None
+                    self._pull_state = None
                     if self.timings:
                         summary["timings"] = {key: round(value, 3)
                                               for key, value in self.timings.items()}

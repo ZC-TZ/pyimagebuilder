@@ -30,13 +30,14 @@ class PhaseSixteenTests(unittest.TestCase):
 
     def invoke(self, script, *arguments, hash_seed="0"):
         environment = os.environ.copy()
+        environment["PYTHONIOENCODING"] = "utf-8"
         if hash_seed is None:
             environment.pop("PYTHONHASHSEED", None)
         else:
             environment["PYTHONHASHSEED"] = hash_seed
         return subprocess.run([sys.executable, str(PROJECT / script), *arguments],
                               cwd=self.root, env=environment, capture_output=True,
-                              text=True)
+                              text=True, encoding="utf-8")
 
     def create_lock(self):
         result = self.invoke("hermetic.py", *self.common, "--output", str(self.lock))

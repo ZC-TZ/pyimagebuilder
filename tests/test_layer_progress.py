@@ -157,7 +157,8 @@ class LayerProgressTests(unittest.TestCase):
                             artifacts.download_and_pack(*args, cas_store=store, cas_only=True, reporter=reporter)
                     if mode == "json":
                         events = self.events(stream)
-                        completed = [e for e in events if e["type"] == "layer_complete"]
+                        completed = [e for e in events if e["type"] == "layer_complete" and
+                                     e["details"]["operation"] == "prepare"]
                         indices = [e["details"]["layer_index"] for e in completed]
                         if invalid:
                             self.assertLessEqual(len(completed), 20)
@@ -167,7 +168,10 @@ class LayerProgressTests(unittest.TestCase):
                         self.assertEqual(len(indices), len(set(indices)))
                         self.assertEqual([e["details"]["layers_completed"] for e in completed],
                                          list(range(1, len(completed) + 1)))
-                        self.assertEqual(sum(e["type"] == "layers_complete" for e in events), 0 if invalid else 1)
+                        self.assertEqual(sum(e["type"] == "layers_complete" for e in events), 0 if invalid else 2)
+                        stored = [e for e in events if e["type"] == "layer_complete" and
+                                  e["details"]["operation"] == "store"]
+                        self.assertEqual(len(stored), 0 if invalid else 21)
                         failed = [e for e in events if e["type"] == "layer_failed"]
                         if invalid:
                             self.assertIn(21, [e["details"]["layer_index"] for e in failed])

@@ -5,6 +5,7 @@ import sys
 from .progress_bar import progress_text, size
 from .renderer_base import Renderer
 from .layers import LAYER_EVENTS, format_layer_event
+from .pull import format_pull_status
 
 
 class PlainRenderer(Renderer):
@@ -23,8 +24,11 @@ class PlainRenderer(Renderer):
         kind = event.type
         if self.quiet and kind not in ("build_success", "build_failed"):
             return
-        if kind in LAYER_EVENTS:
-            self._line(format_layer_event(event))
+        if kind == "pull_status":
+            self._line("    " + format_pull_status(event.details))
+        elif kind in LAYER_EVENTS:
+            if kind != "layer_start" or self.verbose:
+                self._line(format_layer_event(event))
         elif kind == "build_start":
             self._line("PyBuilder | Building {} [{}]".format(
                 event.details.get("image", "image"), event.details.get("platform", "unknown")))
@@ -46,7 +50,10 @@ class PlainRenderer(Renderer):
         elif kind == "step_progress":
             self._line("    {}".format(progress_text(event)))
         elif kind == "heartbeat":
-            self._line("    ... {} ({:.1f}s)".format(event.message, event.duration or 0))
+            if event.details.get("pull"):
+                self._line("    ... " + format_pull_status(event.details["pull"]))
+            else:
+                self._line("    ... {} ({:.1f}s)".format(event.message, event.duration or 0))
         elif kind == "step_success":
             suffix = " ({:.2f}s)".format(event.duration or 0)
             self._line("    OK {}{}".format(event.message or "done", suffix))
@@ -74,6 +81,12 @@ class PlainRenderer(Renderer):
                     self._line("{:<10} {}".format(key.capitalize() + ":", summary[key]))
             if summary.get("timings"):
                 self._line("Stage timings (seconds):")
+                self._line("  注意：包含嵌套或并行操作，不能直接相加；总耗时以 Duration 为准。")
                 for label, seconds in summary["timings"].items():
-                    self._line("  {:<29} {:>8.2f}".format(label, seconds))
+                    note = ""
+                    if label == "Prepare Artifactory layers (overlap)":
+                        note = "（与下载并行的墙钟跨度，不相加）"
+                    elif label == "Wait for Artifactory layers":
+                        note = "（下载结束后的剩余等待）"
+                    self._line("  {:<29} {:>8.2f} {}".format(label, seconds, note).rstrip())
             self._line("Duration:  {:.2f}s".format(event.duration or 0))

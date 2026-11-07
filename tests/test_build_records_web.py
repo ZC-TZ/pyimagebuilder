@@ -315,6 +315,52 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(result["state"], "cancelled")
         self.assertNotEqual(result["status"], "正在取消")
 
+    def test_parallel_pull_status_uses_aggregate_counts_without_log_flood(self):
+        jobs = self.workspace.jobs
+        with jobs.condition:
+            identity = jobs.submit("build", [], [], "test")
+            jobs.queue.remove(identity)
+            job = jobs.jobs[identity]
+            job["state"] = "running"
+        state = {"stage": "waiting", "prepare_total": 21, "prepare_completed": 15,
+                 "prepare_active": 2, "prepare_pending": 4, "stage_seconds": 7}
+        layer = {"operation": "prepare", "group_id": "g", "layer_index": 3,
+                 "layers_total": 21, "layers_completed": 14, "pull": state}
+        events = [{"type": "pull_status", "elapsed": 1, "details": dict(state, milestone=True)},
+                  {"type": "layer_start", "elapsed": 2, "details": layer},
+                  {"type": "pull_status", "elapsed": 3, "details": dict(state, milestone=False)},
+                  {"type": "heartbeat", "elapsed": 8, "message": "Resolving base image", "details": {"pull": state}}]
+        stream = io.BytesIO(b"".join(json.dumps(e).encode() + b"\n" for e in events))
+
+        def finish():
+            status = jobs.snapshot(identity)["status"]
+            self.assertIn("准备 15/21", status)
+            self.assertIn("运行 2", status)
+            self.assertIn("本阶段 7.0s", status)
+            self.assertNotIn("准备镜像层 3/21", status)
+            return 0
+
+        jobs._collect(job, Mock(stdout=stream, wait=finish))
+        logs = jobs.snapshot(identity)["logs"]
+        self.assertEqual(len(logs), 1)
+        self.assertIn("网络传输完成", logs[0])
+
+    def test_malformed_pull_event_does_not_break_log_collection(self):
+        jobs = self.workspace.jobs
+        with jobs.condition:
+            identity = jobs.submit("build", [], [], "test")
+            jobs.queue.remove(identity)
+            job = jobs.jobs[identity]
+            job["state"] = "running"
+        events = [{"type": "pull_status", "elapsed": 1, "details": {"stage": "unknown"}},
+                  {"type": "heartbeat", "elapsed": 2, "details": {"pull": {"stage": "transfer"}}},
+                  {"type": "build_failed", "elapsed": 3, "message": "expected failure"}]
+        stream = io.BytesIO(b"".join(json.dumps(e).encode() + b"\n" for e in events))
+        jobs._collect(job, Mock(stdout=stream, wait=lambda: 1))
+        result = jobs.snapshot(identity)
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("expected failure", "\n".join(result["logs"]))
+
     def test_fast_then_manage_local_image(self):
         war = self.root / "app.war"
         war.write_bytes(b"war")

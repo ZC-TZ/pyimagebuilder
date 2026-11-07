@@ -76,8 +76,8 @@ class LayerProgress:
 
     def _send(self, kind, task=None, error=None):
         details = {"group_id": self.group_id, "operation": self.operation,
-                   "layers_total": self.total, "layers_completed": len(self.completed),
                    "source": self.source, "image": self.image}
+        details.update(self.snapshot())
         fields = {"details": details}
         if task is not None:
             details.update(layer_index=task.index, digest=task.digest, cached=task.cached)
@@ -92,6 +92,14 @@ class LayerProgress:
             event = BuildEvent(kind, 0, message=message, **fields)
             output = self.display.status if kind == "layer_progress" else self.display.log
             output(format_layer_event(event))
+
+    def snapshot(self):
+        """在同一把锁下读取数量，不能用当前层序号代表完成数。"""
+        with self.lock:
+            return {"layers_total": self.total, "layers_completed": len(self.completed),
+                    "layers_active": len(self.started - self.completed - self.failed),
+                    "layers_pending": self.total - len(self.started), "layers_failed": len(self.failed),
+                    "layers_revision": len(self.started) + len(self.completed) + len(self.failed)}
 
     @contextmanager
     def layer(self, index, digest=""):

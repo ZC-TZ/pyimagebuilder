@@ -599,7 +599,8 @@ def _cache_fixture(root):
 
 def _run(command, timeout=300):
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, timeout=timeout)
+                            env=dict(os.environ, PYTHONIOENCODING="utf-8"),
+                            text=True, encoding="utf-8", errors="replace", timeout=timeout)
     if result.returncode:
         raise BuildError("Command failed ({}): {}".format(result.returncode,
             (result.stderr or result.stdout).strip()[-2000:]))

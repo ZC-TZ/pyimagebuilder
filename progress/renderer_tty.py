@@ -1,17 +1,36 @@
 """交互式终端渲染器：可选颜色和单行传输进度刷新。"""
 
 import os
+import shutil
 import unicodedata
 
 from .progress_bar import progress_text
 from .renderer_plain import PlainRenderer
 from .layers import format_layer_event
+from .pull import format_pull_status
 
 
 def terminal_width(value):
     """按终端列计算中文及组合字符的宽度，避免较短的新状态留下旧行尾。"""
     return sum(0 if unicodedata.combining(char) or unicodedata.category(char) in ("Mn", "Me", "Cf")
                else 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in value)
+
+
+def fit_status_line(value, columns):
+    """临时状态不占满终端最后一列，避免自动换行后旧行无法用回车擦除。"""
+    limit = max(1, columns - 1)
+    if terminal_width(value) <= limit:
+        return value
+    suffix = "." * min(3, limit)
+    available = limit - len(suffix)
+    prefix, width = [], 0
+    for char in value:
+        count = terminal_width(char)
+        if width + count > available:
+            break
+        prefix.append(char)
+        width += count
+    return "".join(prefix) + suffix
 
 
 class TTYRenderer(PlainRenderer):
@@ -42,11 +61,14 @@ class TTYRenderer(PlainRenderer):
 
     def render(self, event):
         """刷新活动状态行，同时保留已完成事件的日志。"""
-        if event.type in ("step_progress", "heartbeat", "layer_progress") and not self.quiet:
-            message = (format_layer_event(event).strip() if event.type == "layer_progress" else
+        transient_pull = event.type == "pull_status" and not event.details.get("milestone")
+        if (event.type in ("step_progress", "heartbeat", "layer_progress") or transient_pull) and not self.quiet:
+            pull = event.details if transient_pull else event.details.get("pull")
+            message = (format_pull_status(pull) if pull else
+                       format_layer_event(event).strip() if event.type == "layer_progress" else
                        progress_text(event, bar=True) if event.type == "step_progress" else (
                 "... {} ({:.1f}s)".format(event.message, event.duration or 0)))
-            value = "    " + message
+            value = fit_status_line("    " + message, shutil.get_terminal_size((120, 24)).columns)
             width = terminal_width(value)
             self.stream.write("\r" + value + " " * max(0, self.width - width))
             self.stream.flush()

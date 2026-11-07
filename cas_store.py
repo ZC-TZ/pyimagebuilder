@@ -16,6 +16,7 @@ import tarfile
 import tempfile
 import sys
 import zlib
+from contextlib import nullcontext
 from pathlib import Path
 
 from compat import is_linked_directory, unlink_missing
@@ -307,7 +308,7 @@ class CASStore:
 
     def import_registry(self, manifest_raw, config_path, layer_paths,
                         reference, platform, source="artifactory", replace=False,
-                        verified_diff_ids=False, *, owned_layers=False):
+                        verified_diff_ids=False, *, owned_layers=False, layer_progress=None):
         """按 descriptor 摘要保存原始 Registry blob，包括 config 和层。
 
         层可以是压缩或未压缩内容；本方法不解压，也不独立核对层的 DiffID。
@@ -315,6 +316,8 @@ class CASStore:
         记录可信本地校验状态；外部/低层导入默认由 open_base 首次使用时补验。
         owned_layers 仅用于移交下载器独占的临时文件；默认复制，绝不接管用户文件。
         同盘移交仍完整校验摘要、大小并 fsync；跨盘退回流式复制。
+        layer_progress 可报告原始传输 blob 的入库复核；组完成只表示层已保存，
+        引用仍须随后提交，不等同于基础镜像已经可用。
         """
         if type(verified_diff_ids) is not bool:
             raise ArchiveError("verified_diff_ids must be a boolean")
@@ -360,27 +363,37 @@ class CASStore:
                     raise ArchiveError("Conflicting Registry descriptors for one layer path")
                 sources[key] = (digest, size)
             plans.append((entry, path, diff_id, digest, size, key))
+        if layer_progress is not None and layer_progress.total != len(plans):
+            raise ArchiveError("Registry layer progress total mismatch")
         self._put_bytes(config_raw)
         layers, consumed = [], set()
-        for entry, path, diff_id, digest, size, key in plans:
-            if owned_layers:
-                if key not in consumed:
-                    self._store_owned_blob(path, digest, size=size)
-                    consumed.add(key)
-            else:
-                with open(path, "rb") as stream:
-                    self._put_stream(stream, digest, size)
-            with self._blob(digest).open("rb") as stream:
-                magic = stream.read(2)
-            media_type = entry.get("mediaType") or ("application/vnd.oci.image.layer.v1.tar+gzip"
-                     if magic == b"\x1f\x8b" else LAYER_TYPE)
-            if not isinstance(media_type, str):
-                raise ArchiveError("Invalid Registry layer media type")
-            layers.append({"digest": digest, "diff_id": diff_id,
-                           "mediaType": media_type, "size": size})
-            if verified_diff_ids:
-                layers[-1]["diff_id_verified"] = True
-                layers[-1]["diff_id_verification_version"] = DIFF_ID_VERIFICATION_VERSION
+        for index, (entry, path, diff_id, digest, size, key) in enumerate(plans, 1):
+            lifecycle = layer_progress.layer(index, digest) if layer_progress is not None else nullcontext()
+            with lifecycle as task:
+                if task is not None:
+                    task.cached = self._blob(digest).is_file()
+                if owned_layers:
+                    if key not in consumed:
+                        self._store_owned_blob(path, digest, size=size)
+                        consumed.add(key)
+                else:
+                    with open(path, "rb") as stream:
+                        self._put_stream(stream, digest, size)
+                with self._blob(digest).open("rb") as stream:
+                    magic = stream.read(2)
+                media_type = entry.get("mediaType") or ("application/vnd.oci.image.layer.v1.tar+gzip"
+                         if magic == b"\x1f\x8b" else LAYER_TYPE)
+                if not isinstance(media_type, str):
+                    raise ArchiveError("Invalid Registry layer media type")
+                layers.append({"digest": digest, "diff_id": diff_id,
+                               "mediaType": media_type, "size": size})
+                if verified_diff_ids:
+                    layers[-1]["diff_id_verified"] = True
+                    layers[-1]["diff_id_verification_version"] = DIFF_ID_VERIFICATION_VERSION
+                if task is not None:
+                    task.current = size
+        if layer_progress is not None:
+            layer_progress.finish()
         return self._publish(reference, platform, source, config_digest, layers,
                              replace, manifest_raw)
 

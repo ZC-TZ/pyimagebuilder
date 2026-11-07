@@ -173,13 +173,13 @@ class ContextInputTests(unittest.TestCase):
             dockerfile = context / "Dockerfile"
             dockerfile.write_text("FROM scratch\nCOPY . /app/\n")
             # 在真实的固定 HASHSEED 子进程中满足前置检查，避免因无关错误假通过。
-            environment = dict(os.environ, PYTHONHASHSEED="0")
+            environment = dict(os.environ, PYTHONHASHSEED="0", PYTHONIOENCODING="utf-8")
             command = ("import sys; from hermetic import make_lock; "
                        "make_lock(sys.argv[1], sys.argv[2], tag='example/app:1')")
             result = subprocess.run([sys.executable, "-c", command, str(dockerfile), str(context)],
                                     cwd=str(Path(__file__).resolve().parents[1]), env=environment,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    universal_newlines=True, timeout=30)
+                                    universal_newlines=True, encoding="utf-8", timeout=30)
             self.assertNotEqual(result.returncode, 0)
             self.assertRegex(result.stderr, "context (symlinks|directory links)")
             with self.assertRaisesRegex(BuildError, "(symlink|directory link)"):

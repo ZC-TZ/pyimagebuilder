@@ -22,6 +22,7 @@ from path_policy import output_path, resolve_host_path
 from web_job_journal import JobJournal, form_snapshot
 from progress.events import BuildEvent
 from progress.renderer_plain import PlainRenderer
+from progress.pull import format_pull_status
 
 
 LABELS = {"fast": "快速打包", "build": "Dockerfile 构建", "check": "检查 Dockerfile",
@@ -51,10 +52,20 @@ def _render_event(event):
             values[key] = PHASE_NAMES.get(values[key], values[key])
     output = StringIO()
     try:
-        PlainRenderer(output, error_stream=output).render(BuildEvent(**values))
+        PlainRenderer(output, error_stream=output, verbose=True).render(BuildEvent(**values))
     except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
         return "{}: {}".format(event.get("type"), event.get("message") or event.get("phase") or "")
     return output.getvalue().strip() or "{}: {}".format(event.get("type"), event.get("message") or "")
+
+
+def _pull_text(value):
+    """CLI 输出还可能混有任意 RUN 文本；损坏的事件不能中断任务日志收集。"""
+    if not isinstance(value, dict):
+        return None
+    try:
+        return format_pull_status(value)
+    except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+        return None
 
 
 def _text(data, name, default="", strip=True):
@@ -444,14 +455,18 @@ class Jobs:
                             continue
                         if isinstance(event, dict) and "type" in event and "elapsed" in event:
                             kind = event["type"]
+                            details = event.get("details")
+                            pull = details.get("pull") if isinstance(details, dict) else None
+                            pull_text = _pull_text(pull)
                             if kind == "heartbeat":
-                                if active_layers and isinstance(event["elapsed"], (int, float)):
+                                if pull_text is not None:
+                                    job["status"] = pull_text[:LOG_LINE_CHARS]
+                                elif active_layers and isinstance(event["elapsed"], (int, float)):
                                     label, started = min(active_layers.values(), key=lambda item: item[1])
                                     seconds = max(0, event["elapsed"] - started)
                                     job["status"] = "{} | {:.0f}s".format(label, seconds)[:LOG_LINE_CHARS]
                                 continue
                             rendered = _render_event(event)
-                            details = event.get("details")
                             if isinstance(details, dict) and isinstance(details.get("group_id"), str):
                                 index = details.get("layer_index")
                                 if type(index) is int:
@@ -463,7 +478,10 @@ class Jobs:
                             if kind in ("phase_start", "phase_success", "step_start", "step_success"):
                                 active_layers.clear()
                             if rendered:
-                                job["status"] = rendered.splitlines()[0][:LOG_LINE_CHARS]
+                                job["status"] = (pull_text if pull_text is not None and kind != "layer_failed" else
+                                                 rendered.splitlines()[0])[:LOG_LINE_CHARS]
+                            if kind == "pull_status" and not (isinstance(details, dict) and details.get("milestone")):
+                                continue
                             if kind in ("step_progress", "layer_progress", "layer_start"):
                                 continue
                             if rendered:

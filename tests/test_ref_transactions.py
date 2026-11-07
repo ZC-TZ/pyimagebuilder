@@ -251,8 +251,9 @@ class RefTransactionTests(unittest.TestCase):
             def child(script=code):
                 return subprocess.run([sys.executable, "-c", script, str(root / "store"), REFERENCE],
                                       cwd=str(Path(__file__).resolve().parents[1]),
+                                      env=dict(os.environ, PYTHONIOENCODING="utf-8"),
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                      universal_newlines=True, timeout=10)
+                                      universal_newlines=True, encoding="utf-8", timeout=10)
 
             with store.ref_lock(REFERENCE, PLATFORM, "local"):
                 # 不同 CASStore 对象的同线程嵌套仍属于同一操作，不能再次争用内核锁。
