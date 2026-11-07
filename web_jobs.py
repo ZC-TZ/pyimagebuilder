@@ -344,8 +344,9 @@ class Jobs:
         if len(line) > LOG_LINE_CHARS:
             line = line[:LOG_LINE_CHARS - 1] + "…"
         job["logs"].append(line)
-        if elapsed is None and "started" in job:
-            elapsed = round(max(0, time.monotonic() - job["started"]), 3)
+        if elapsed is None:
+            elapsed = (round(max(0, time.monotonic() - job["started"]), 3)
+                       if "started" in job else job.get("elapsed"))
         job["log_meta"].append(log_record(kind, elapsed))
         job["log_end"] += 1
 
@@ -457,7 +458,10 @@ class Jobs:
                         if job["delivery"] and isinstance(event, dict) and isinstance(event.get("web_metrics"), dict):
                             job["metrics"] = event["web_metrics"]
                             continue
-                        if isinstance(event, dict) and "type" in event and "elapsed" in event:
+                        # 子进程也会输出普通 JSON。先验证时间边界，不能让超大整数或
+                        # NaN 进入活动层计时，导致收集线程退出并阻塞后续排队任务。
+                        if (isinstance(event, dict) and isinstance(event.get("type"), str) and
+                                log_record(elapsed=event.get("elapsed"))["elapsed"] is not None):
                             kind = event["type"]
                             details = event.get("details")
                             pull = details.get("pull") if isinstance(details, dict) else None
@@ -533,12 +537,13 @@ class Jobs:
             self._finish(job)
 
     def _finish(self, job):
-        if "started" in job:
-            job["elapsed"] = int(time.monotonic() - job.pop("started"))
         cleanup = job.pop("cleanup", None)
         if cleanup is not None:
             try:
                 cleanup()
             except OSError as exc:
                 self._append_log(job, "未能清理暂存文件：{}".format(exc), "warning")
+        # 清理也是任务收尾的一部分；保留起点到最后，告警才有准确时间。
+        if "started" in job:
+            job["elapsed"] = int(time.monotonic() - job.pop("started"))
         self._save(job)

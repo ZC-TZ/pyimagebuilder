@@ -2,8 +2,10 @@
 
 import io
 import json
+import threading
 import unittest
 from collections import deque
+from unittest.mock import Mock, patch
 
 from progress import make_reporter
 from progress.events import BuildEvent
@@ -15,6 +17,58 @@ from web_log import event_kind, log_lines, log_metadata, log_record, pull_flow, 
 
 
 class LogPresentationTests(unittest.TestCase):
+    def collector_job(self):
+        jobs = Jobs.__new__(Jobs)
+        jobs.condition = threading.Condition()
+        jobs.journal = Mock()
+        job = {"logs": deque(maxlen=250), "log_meta": deque(maxlen=250), "log_end": 0,
+               "delivery": False, "outputs": [], "state": "running", "status": ""}
+        return jobs, job
+
+    def test_invalid_event_times_cannot_stop_collection_or_hide_final_error(self):
+        for elapsed in (10 ** 1000, float("nan"), float("inf"), -1, True, "2", None):
+            with self.subTest(elapsed=repr(elapsed)[:40]):
+                jobs, job = self.collector_job()
+                events = [{"type": "layer_start", "elapsed": elapsed,
+                           "details": {"group_id": "g", "layer_index": 1}},
+                          {"type": "heartbeat", "elapsed": 4.0},
+                          {"type": "build_failed", "elapsed": 5, "message": "original build failure"}]
+                encoded = [json.dumps(event) for event in events]
+                process = Mock(stdout=io.BytesIO(("\n".join(encoded) + "\n").encode()),
+                               wait=Mock(return_value=1))
+                jobs._collect(job, process)
+                process.wait.assert_called_once_with()
+                self.assertEqual(job["state"], "failed")
+                self.assertEqual(job["logs"][0], encoded[0][:3999] + "…" if len(encoded[0]) > 4000 else encoded[0])
+                self.assertIn("original build failure", "\n".join(job["logs"]))
+
+    def test_final_timing_and_warning_include_cleanup(self):
+        for fails in (False, True):
+            with self.subTest(fails=fails):
+                jobs, job = self.collector_job()
+                now = [110]
+                job["started"] = 100
+
+                def cleanup():
+                    now[0] = 125
+                    if fails:
+                        raise OSError("cleanup warning")
+
+                job["cleanup"] = cleanup
+                with patch("web_jobs.time.monotonic", side_effect=lambda: now[0]):
+                    jobs._finish(job)
+                self.assertEqual(job["elapsed"], 25)
+                self.assertNotIn("started", job)
+                if fails:
+                    self.assertEqual(job["log_meta"][-1], {"kind": "warning", "elapsed": 25})
+
+    def test_journal_warning_keeps_time_after_task_has_finished(self):
+        jobs, job = self.collector_job()
+        job["elapsed"] = 25
+        jobs.journal.write.side_effect = OSError("journal unavailable")
+        jobs._save(job)
+        self.assertEqual(job["log_meta"][-1], {"kind": "warning", "elapsed": 25})
+
     def test_timing_table_sorts_and_aligns_by_display_columns(self):
         rows = list(timing_lines({"Wait for Artifactory layers": 2,
                                   "Download Artifactory files": 142.61, "custom operation": 0}))
