@@ -2,7 +2,7 @@
 
 [文档目录](README.md) · [项目首页](../README.md)
 
-本页面向维护者，说明模块分工、数据流和实现边界。使用步骤见 [用户指南](README.md#按任务阅读)，Dockerfile 支持范围见 [兼容表](DOCKERFILE_COMPAT.md)，测试方法见 [开发与维护](../CONTRIBUTING.md)。
+本页面向维护者，说明模块分工、数据流和实现边界。使用步骤见 [用户指南](README.md#使用指南按任务查)，Dockerfile 支持范围见 [兼容表](DOCKERFILE_COMPAT.md)，测试方法见 [开发与维护](../CONTRIBUTING.md)。
 
 `main.py` 编排构建与镜像管理，Fast 复用同一构建器。基础镜像来自 Docker archive 或本地 CAS；Registry/Artifactory 下载器负责远端输入。文件指令生成层，元数据指令更新配置；RUN 另外使用 Linux 执行器。Docker/OCI writer 生成并校验交付归档。
 
@@ -24,7 +24,7 @@ Windows 上无 RUN 的构建原生执行；有 RUN 时可将源码和输入交�
 
 | 主题 | 对应章节 |
 | --- | --- |
-| 整体流程 | [统一配置](#统一配置) · [数据流](#数据流) · [工程目录](#工程目录) |
+| 整体流程 | [统一配置](#统一配置) · [Web 与运行数据](#web-与运行数据) · [数据流](#数据流) · [工程目录](#工程目录) |
 | Dockerfile 构建 | [文件指令](#文件指令) · [多阶段状态](#多阶段状态) · [ARG 与挂载](#arg-与临时-run-挂载) |
 | 存储与交付 | [层缓存](#层缓存) · [双格式输出](#双格式输出) · [Docker save 归档](#docker-save-归档) |
 | 平台与执行 | [平台传播](#平台传播与双平台归档) · [RUN 隔离](#run-隔离) · [执行模型](#run-执行模型) |
@@ -46,14 +46,29 @@ Windows 上无 RUN 的构建原生执行；有 RUN 时可将源码和输入交�
 
 ## 统一配置
 
-`settings.py` 读取 `config.json`（schemaVersion 2），把相对缓存和 CA 路径解析到配置文件目录。`repositories` 按主机名匹配普通 `build/pull`、独立 Registry 客户端、Artifactory 下载器和 Fast 的基础镜像；命令行选项覆盖相应字段，密码始终通过配置指定的环境变量名在运行时读取。`fast.profiles` 存放多个应用打包模板，`fast init` 只增加一个 profile 并保留其他配置段。配置不参与镜像内容，缓存键仍以实际构建输入计算。
+`settings.py` 读取 `config.json`（schemaVersion 2），把相对缓存和 CA 路径解析到配置文件目录。`repositories` 按主机名匹配普通 `build/pull`、独立 Registry 客户端、Artifactory 下载器和 Fast 的基础镜像；命令行选项覆盖相应字段，密码始终通过配置指定的环境变量名在运行时读取。`fast.profiles` 存放多个应用打包模板，`fast init` 只增加一个 profile 并保留其他配置段。配置文件本身不打进镜像；影响构建的模板字段先转成 Dockerfile 和实际输入，缓存键据这些输入计算。
+
+## Web 与运行数据
+
+| 模块 | 职责 |
+| --- | --- |
+| `build_records_web.py` | 回环 HTTP 服务、会话边界、响应与文件发送 |
+| `web_workbench.py` | 页面、表单预览、任务与产物操作入口 |
+| `web_jobs.py` | 串行任务队列、独立 CLI 子进程、日志收集及结果登记 |
+| `web_uploads.py` | 上传配额、认领、到期回收与自有节点清理 |
+| `web_job_journal.py` | Web 任务结果和可复用表单持久化 |
+| `build_records.py` | 成功构建台账，与镜像库及 tar 分开 |
+| `web_log.py` / `progress/` | 原始日志的展示元数据、并行拉取快照与多种渲染器 |
+| `web_delivery.py` / `web_delivery_worker.py` | 交付计划、来源快照、独立交付操作 |
+
+Web 不在服务线程中直接执行 RUN；受支持的构建通过独立 Python CLI 进程执行。上传管理器只回收登记的文件和空目录，任务持有输入期间不由到期回收删除。用户操作见 [Web 指南](guides/WEB.md)，身份与并发约束见 [资源生命周期](CONCURRENCY_AND_RESOURCES.md)。
 
 ## 数据流
 
 多阶段 RUN 按阶段分配独立物化目录。进入新阶段只复用其 FROM 对应的镜像层，
 不复用前一阶段的宿主目录；同一阶段多次 RUN 则继续应用新层并复用本阶段文件树。
 显式 FROM 前一阶段与 COPY --from 通过阶段快照继承或复制内容。
-这避免编译阶段文件在运行阶段的 RUN 中隐式可见；旧错误结果由指令缓存版本 23 淘汰。
+这避免编译阶段文件在运行阶段的 RUN 中隐式可见；不兼容的旧结果由缓存版本机制淘汰，当前版本与复用规则见 [缓存策略](CACHE_POLICY.md)。
 
 ```text
 Dockerfile ───────────────► DockerfileParser ───────┐
@@ -254,7 +269,7 @@ repositories
 诊断管道按固定大小读取到 EOF，保留不超过 256 KiB 的首尾字节与截断提示，避免异常文本无限占用内存。
 诊断截断点落在多字节字符内部时允许出现替换字符；日志回调的存储与阻塞行为不受执行器缓冲上限约束。
 
-1. 在 Linux 上，从已校验的 base layers 和 Phase 1 新层安全还原真实 rootfs，依次应用 OCI whiteout，保留 uid/gid、mode、mtime、链接和可表示的 xattr。拒绝越界路径。Windows 原生模式不物化 Linux rootfs。
+1. 在 Linux 上，从已校验的 基础层和新增层安全还原真实 rootfs，依次应用 OCI whiteout，保留 uid/gid、mode、mtime、链接和可表示的 xattr。拒绝越界路径。Windows 原生模式不物化 Linux rootfs。
 2. 为每条 `RUN` fork 子进程，在子进程中 unshare mount/PID namespace，默认也 unshare network namespace；把 mount 传播设为 private 后，挂载只读 lower rootfs、同文件系统上的 `upperdir/workdir` 与 `merged`。OverlayFS 不可用时失败。父构建进程不进入这些 namespace。
 3. 在命名空间内挂载最小 `/proc`、tmpfs `/dev`、`/dev/pts`，chroot 到 merged，然后按 Dockerfile 当前 `ENV`、`WORKDIR`、`USER`、`SHELL` 执行命令。PID namespace 在 unshare 后 fork；等待并传播退出码，非零即失败。子进程退出时命名空间内的挂载消失。`/sys`、DNS 注入和 cgroup 资源限制尚未实现；seccomp 收紧由前述 hardened/rootless 沙箱负责。
 4. 把 upperdir 的内容**转换**为 OCI/Docker layer：OverlayFS 的 0/0 字符设备或 `overlay.whiteout` xattr → 空 `.wh.<name>` 文件；`overlay.opaque=y` → `.wh..wh..opq`。upper 根初始化时复制 lower 根的权限、属主和普通 xattr；RUN 修改根的权限、属主或 xattr 时输出 `.` 目录头，根 opaque 单独输出顶层 `.wh..wh..opq`。mtime 仍按固定 epoch 规范化。保留基本元数据、符号链接和硬链接；RUN 产生的 `.wh.*` 实体及无法可靠表示的 metacopy、redirect 或非 UTF-8 xattr 会失败，不能直接 tar upperdir。完成后更新可见 rootfs 和 config；下一个 `RUN` 在上一个结果上执行。

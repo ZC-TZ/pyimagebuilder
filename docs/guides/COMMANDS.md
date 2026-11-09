@@ -2,7 +2,7 @@
 
 [文档目录](../README.md) · [项目首页](../../README.md)
 
-以下命令在工具目录执行。`IMAGE` 表示镜像引用，`archive.tar` 表示镜像归档，`rootfs.tar` 表示纯文件系统归档；它们不能互换。查完整参数用 **对应子命令的 `--help`**，例如 `python .\main.py flatten --help`。
+以下命令在工具目录执行，UOS/Linux 可将 `python` 换成 `python3`。`IMAGE` 表示镜像引用，`archive.tar` 表示镜像归档，`rootfs.tar` 表示纯文件系统归档；它们不能互换。查完整参数用 **对应子命令的 `--help`**，例如 `python .\main.py flatten --help`。
 
 ## 1. 构建与快速打包
 
@@ -12,10 +12,10 @@
 | `python main.py fast init --help` | 查看首次创建模板的参数 |
 | `python main.py build CONTEXT -t IMAGE -o archive.tar` | 使用 Dockerfile 构建 |
 | `python main.py build CONTEXT --check` | 静态检查，不下载或执行 RUN |
-| `python main.py builds --project hisq` | 按时间倒序查看本机记录的 Fast 打包；去掉项目筛选则列出全部构建 |
+| `python main.py builds --project hisq` | 按时间倒序筛选 Fast 项目记录；去掉项目筛选可查全部成功构建记录 |
 | `python main.py --web` | 启动本机工作台，进行打包、构建、镜像库操作和历史查询；`builds --web` 也是入口 |
 
-首次步骤：[Fast 指南](FAST.md) · [Dockerfile 构建](BUILD.md)。`main.py` 也接受省略 build 的旧式构建参数；新命令示例统一使用显式 build。
+首次步骤：[Fast 指南](FAST.md) · [Dockerfile 构建](BUILD.md) · [Web 工作台](WEB.md) · [打包台账](HISTORY.md)。`main.py` 也接受省略 build 的旧式构建参数；新命令示例统一使用显式 build。
 
 ## 2. 查看与管理本地镜像
 
@@ -89,5 +89,7 @@
 | `python attest.py --help` | 生成签名密钥、核对交付证明 |
 | `python hermetic.py --help` | 生成严格构建输入锁 |
 | `python conformance.py --help` | 离线及目标环境兼容性验收 |
+
+### 与 Docker CLI 的主要差异
 
 当前 main.py 不提供 Docker 的容器生命周期命令，如 create/run/start/stop/rm；没有 bundle export/import、login/logout 命令。Docker CLI 与本工具有相似的操作名称，具体输入、输出和作用位置以上述说明为准。

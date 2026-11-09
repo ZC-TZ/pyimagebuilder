@@ -1,107 +1,116 @@
 # PyImageBuilder
 
-**在没有 Docker、Podman 的机器上，用 Python 将 WAR、dist.zip 或 Dockerfile 构建成镜像归档。** 默认生成可供 `docker load` 使用的 `.tar`，也支持 OCI 格式。
+**用 Python 把 WAR、dist.zip 或 Dockerfile 构建成镜像 tar，构建机器无需安装 Docker 或 Podman。**
 
-## 从哪里开始
+支持 Docker archive 和 OCI Image Layout。Fast 面向 TongWeb/Tomcat 应用交付；普通构建读取 Dockerfile；图形操作可使用本机 Web 工作台。
 
-| 你要做什么 | 使用方式 | 详细指南 |
+## 选择使用方式
+
+| 你的任务 | 入口 | 操作指南 |
 | --- | --- | --- |
-| 快速打包 WAR 或前端 dist.zip | `fast`，首次配置一次模板 | [Fast 打包](docs/guides/FAST.md) |
-| 使用自己的 Dockerfile | `build`，支持本地基础镜像与自动拉取 | [Dockerfile 构建](docs/guides/BUILD.md) |
-| 将已有镜像合并为单层，保留启动配置 | `flatten` | [文件系统与扁平化](docs/ROOTFS_COMMANDS.md) |
-| 下载、查看、导入、导出或推送镜像 | 镜像与 Registry 命令 | [命令速查](docs/guides/COMMANDS.md) |
+| 已有 WAR 或 dist.zip，立即打包 | `main.py fast` / 独立 `fast.py` | [Fast 打包](docs/guides/FAST.md) |
+| 在浏览器选择文件、提交任务 | `main.py --web` | [Web 工作台](docs/guides/WEB.md) |
+| 已有 Dockerfile | `main.py build` | [Dockerfile 构建](docs/guides/BUILD.md) |
+| 查打包过的版本、找到交付物 | `main.py builds` | [打包台账与运行数据](docs/guides/HISTORY.md) |
+| 下载、入库、导出或推送镜像 | `pull/load/save/push` | [命令速查](docs/guides/COMMANDS.md) |
+| 将镜像合为一层并保留启动配置 | `flatten` | [rootfs 与扁平化](docs/ROOTFS_COMMANDS.md) |
 
-首次阅读建议按 **本页 → 对应使用指南 → 配置说明** 的顺序。全部文档见 [文档目录](docs/README.md)。
+## 环境与能力边界
 
-## 环境要求
-
-| 构建场景 | 条件 |
+| 场景 | 所需环境 |
 | --- | --- |
-| Fast、无 RUN 的 Dockerfile、镜像归档处理 | Windows 或 Linux，Python 3.7 及以上；核心使用标准库 |
-| Dockerfile 中实际执行 RUN | Linux，或 Windows 上已安装的 WSL；还需 namespace、OverlayFS 和相应权限 |
-| 离线构建 | 已准备本地基础 tar，或镜像库已有需要的镜像 |
-| 加载并启动最终镜像 | 在目标机器使用 Docker 等兼容运行环境 |
+| Fast、无 RUN 的 Dockerfile、镜像归档处理 | Windows 或 Linux（包括 UOS），Python 3.7 及以上；核心使用标准库 |
+| 真正执行 Linux RUN | Linux，或 Windows 上已配置的 WSL；另需 namespace、OverlayFS 和相应权限 |
+| 离线打包 | 已有本地基础 tar，或本工具镜像库已有匹配平台和来源的基础镜像 |
+| 加载并启动交付镜像 | 目标机器安装 Docker 或其他兼容运行环境 |
 
-**只有 Python 可以完成归档构建；执行 Linux RUN 还需要 Linux 内核能力。** 本项目是实验性构建器，支持范围见 [Dockerfile 兼容表](docs/DOCKERFILE_COMPAT.md)。已在 Windows 的 Python 3.7.9 和 Python 3.12 运行完整离线回归；真实 Docker 与 Linux RUN 仍需目标环境验收。
+Python 可以完成镜像归档构建；RUN 仍依赖 Linux 内核执行环境。指令与 flag 见 [Dockerfile 兼容表](docs/DOCKERFILE_COMPAT.md)。本项目是实验性构建器，最终镜像需在目标环境加载并启动应用验收。
 
-以下命令在工具目录执行，使用 PowerShell。`D:\packages`、`D:\images` 和内网地址都是示例，请替换为实际路径和地址。输出建议放在构建目录外；已有同名输出会报错。
+## 首次准备
 
-## 获取源码
+下载 [GitHub 源码](https://github.com/ZC-TZ/pyimagebuilder)并解压，或执行：
 
 ```text
 git clone https://github.com/ZC-TZ/pyimagebuilder.git
 cd pyimagebuilder
-python main.py --help
 ```
 
-也可以在 GitHub 的 **Code → Download ZIP** 下载并解压源码，然后进入包含 `main.py` 的目录。核心功能无需安装第三方 Python 包。
+进入包含 `main.py` 的目录，再配置基础镜像。已有 `config.json` 时检查和编辑；尚未配置时，可复制 `config.example.json` 为 `config.json`，按[配置指南](docs/guides/CONFIGURATION.md)修改地址、账户、模板和输出目录。
 
-## 快速开始：WAR 转镜像
+模板名 `tongweb`、`tomcat` 只是选择名。基础镜像引用、Linux 账户、部署目录与服务配置必须符合实际镜像。示例地址和包路径均需替换。
 
-### 1. 首次准备模板
+## 最常用的打包命令
 
-已有基础镜像 Docker save tar 时，创建 TongWeb profile：
+以下假定已配置好对应 profile，且输出文件尚不存在。
+
+**UOS / Linux：**WAR 命令按所需模板二选一；前端生成另一份输出。
+
+```bash
+python3 main.py fast /data/packages/hisq.war hisq 1.0.0 --profile tongweb
+python3 main.py fast /data/packages/hisq.war hisq 1.0.0 --profile tomcat
+python3 main.py fast /data/packages/dist.zip hisq 1.0.0 --profile tomcat
+```
+
+**Windows / PowerShell：**
 
 ```powershell
-python .\main.py fast init --base-tar D:\images\tongweb-base.tar `
-  --base-image company/tongweb:11 --flavor tongweb --profile tongweb `
-  --server-config .\config\tongweb.xml --output-dir D:\images
+python main.py fast D:/packages/hisq.war hisq 1.0.0 --profile tomcat
+python main.py fast D:/packages/dist.zip hisq 1.0.0 --profile tomcat
 ```
 
-`--base-image` 必须是基础 tar 内真实的标签。命令会创建或向 `config.json` 添加 profile；**同名 profile 已存在时拒绝覆盖**，请编辑配置。没有基础 tar 时，使用 [从内网地址配置模板](docs/guides/FAST.md#从-artifactory-地址开始)。
+| 输入 | 默认标签 | 默认文件名 |
+| --- | --- | --- |
+| WAR | `hisq_back:1.0.0` | `hisq_back-1.0.0.tar` |
+| dist.zip | `hisq_front:1.0.0` | `hisq_front-1.0.0.tar` |
 
-### 2. 日常打包
+项目名与版本来自位置参数，输出目录来自模板的 `outputDir`；未设置时，CLI 使用应用包所在目录。可用 `-o 路径` 指定文件。独立运行时将 `main.py fast` 换成 `fast.py`，其余参数相同。
 
-```powershell
-python .\main.py fast D:\packages\report-1.2.3.war sfcx 1.3.4 --profile tongweb
+配置在当前目录时通常无需每次传 `--config`。存在多套配置时显式指定同一份配置；[配置查找顺序](docs/guides/CONFIGURATION.md#1-找到正在使用的配置)也适用于普通构建与 Web。
+
+## 在浏览器操作
+
+```bash
+python3 main.py --web
 ```
 
-得到 `D:\images\sfcx_back-1.3.4.tar`，镜像标签为 `sfcx_back:1.3.4`。项目名和版本来自命令行，包文件名不会决定标签。
+Windows 使用 `python main.py --web`。在本机浏览器打开终端输出的完整会话链接；默认端口 8765，冲突时加 `--port 0`。
 
-前端包与独立脚本也能使用：
+工作台支持 Fast、Dockerfile 构建、镜像库操作、台账、空间与配置管理。仓库密码需在**启动工作台的终端**设置环境变量；操作步骤见 [Web 指南](docs/guides/WEB.md)。
 
-```powershell
-python .\main.py fast D:\packages\dist.zip sfcx 1.3.4 --profile tongweb
-python .\fast.py D:\packages\report-1.2.3.war sfcx 1.3.4 --profile tongweb
+## 普通构建与交付
+
+```bash
+python3 main.py build /data/project --check
+python3 main.py build /data/project -t hisq_back:1.0.0 -o /data/images/hisq_back-1.0.0.tar
+python3 main.py verify /data/images/hisq_back-1.0.0.tar
 ```
 
-前端默认标签为 `sfcx_front:1.3.4`。Fast 会生成临时 Dockerfile，并用 `COPY` 添加应用文件；不执行 `RUN`。模板差异、输出位置和完整流程见 [Fast 指南](docs/guides/FAST.md)。
+未提供基础 tar/map 时，build 先查本地镜像库，缺失后按仓库配置拉取 FROM。`--offline` 禁止联网；`--pull` 刷新远端基础镜像。详见[构建指南](docs/guides/BUILD.md)。
 
-成功打包会自动写入本机台账。用 `python main.py builds --project sfcx` 查前后端版本。用 `python main.py --web` 启动[本机工作台](docs/guides/FAST.md#在浏览器里使用工作台)，可提交构建、查看进度和操作镜像库。
-
-## 使用 Dockerfile
-
-```powershell
-python .\main.py build D:\project --check
-python .\main.py build D:\project --base-tar D:\images\base.tar `
-  -t sfcx_back:1.3.4 -o D:\images\sfcx_back-1.3.4.tar
-```
-
-不提供 `--base-tar` 或 `--base-map` 时，构建会查找本地镜像库，缺失后尝试拉取 `FROM`。自动拉取需完整镜像引用及正确的仓库配置；`--offline` 禁止联网，`--pull` 刷新远端基础镜像。`--check` 仅检查静态输入，不下载镜像、不执行命令。
-
-多阶段、平台、OCI 和 RUN 用法见 [构建指南](docs/guides/BUILD.md)。
-
-## 验证和交付
-
-在构建机器上检查归档：
-
-```powershell
-python .\main.py verify D:\images\sfcx_back-1.3.4.tar
-```
-
-将归档复制到有 Docker 的目标机器，再加载：
+把 Docker archive 复制到目标 Docker 机器后执行：
 
 ```text
-docker load -i sfcx_back-1.3.4.tar
+docker load -i hisq_back-1.0.0.tar
 ```
 
-归档校验通过后，还需在目标环境启动应用，检查部署路径、启动配置和服务行为。
+本工具的 build/fast 生成归档并登记成功台账，**不会自动将结果注册到本工具镜像库，也不会加载到 Docker**。需要本工具按标签管理时执行 `python3 main.py load -i /data/images/hisq_back-1.0.0.tar`。
 
-## 下一步
+## 日常查询与升级
 
-- [统一配置](docs/guides/CONFIGURATION.md)：下载地址、鉴权、TongWeb/Tomcat 模板、缓存路径。
-- [命令速查](docs/guides/COMMANDS.md)：按用途查命令，以及与 Docker CLI 的差异。
-- [进阶构建](docs/guides/ADVANCED.md)：RUN/WSL、跨架构、缓存、签名与严格封闭构建。
-- [常见问题](docs/guides/TROUBLESHOOTING.md)：下载失败、找不到基础镜像、输出与缓存问题。
-- [文档目录](docs/README.md)：用户指南和技术参考的完整入口。
-- [开发与维护](CONTRIBUTING.md)：源码结构、测试方法和提交范围。
+```bash
+python3 main.py builds
+python3 main.py builds --project hisq
+python3 main.py images
+python3 main.py system df
+```
+
+`builds` 查询成功构建记录，`images` 查询本工具镜像库，两者用途不同。台账位置及迁移见 [打包台账](docs/guides/HISTORY.md)。
+
+更新程序时保留自己的 `config.json`、部署 XML、镜像库、缓存、台账与交付 tar；停止旧工作台，更新代码后重新启动。数据不应随源码更新包反复搬运。
+
+## 查阅更多
+
+- [完整文档目录](docs/README.md)：按任务找到使用指南和技术参考。
+- [常见问题](docs/guides/TROUBLESHOOTING.md)：按报错和现象排查。
+- [性能排查](docs/guides/PERFORMANCE.md)：区分下载、层准备、索引与导出耗时。
+- [开发与维护](CONTRIBUTING.md)：测试方法、验收范围和提交约定。

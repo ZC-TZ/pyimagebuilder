@@ -33,6 +33,7 @@ python .\main.py build D:\project -t company/app:1 -o D:\images\app.tar `
 | `cache` | 共享镜像库和指令层缓存的位置 |
 | `repositories` | 按仓库主机名设置下载方式、账号、密码环境变量与 CA |
 | `fast` | 默认 profile 与多个 TongWeb/Tomcat 打包模板 |
+| `buildRecordsDir` | 可选的成功打包台账目录；Web 任务摘要也存放在该目录下 |
 
 使用 UTF-8 JSON，可带 Windows 编辑器生成的 BOM。配置不允许注释、尾随逗号、重复键或 NaN/Infinity；`schemaVersion` 必须是整数 `2`，不能写成 `2.0` 或字符串。顶层、cache、repositories 和 fast 各层只接受已定义字段，拼错字段或放错层级会立即报错。
 
@@ -110,12 +111,17 @@ Artifactory 仓库未设置该字段时，Fast 使用选中模板的 URL；按�
 修改 UOS 上的 `config.json` 后重启 Web 工作台。仓库诊断下拉项会显示 HTTP/HTTPS 和证书兼容状态，
 任务日志会显示当前实际检查的地址；浏览器登录页能打开不代表同一地址上的 HTTPS 证书已经受 Python 信任。
 
-在运行命令的终端设置密码：
+在运行命令的终端设置配置指定的密码变量。以 UOS/Bash 的 Artifactory 为例：
 
-```powershell
-$env:PYIMAGEBUILDER_ARTIFACTORY_PASSWORD = '实际密码'
-$env:PYIMAGEBUILDER_REGISTRY_PASSWORD = '实际密码'
+```bash
+read -r -s -p '仓库密码: ' PYIMAGEBUILDER_ARTIFACTORY_PASSWORD
+echo
+export PYIMAGEBUILDER_ARTIFACTORY_PASSWORD
 ```
+
+Registry 配置若使用 `PYIMAGEBUILDER_REGISTRY_PASSWORD`，将变量名换成对应名称。`read` 隐藏输入，`export` 将变量传给后续 Python 进程；PowerShell 的隐藏输入示例见 [Web 指南](WEB.md#1-启动与仓库密码)。
+
+启动 Web 前也要设置变量；网页没有仓库密码输入框，已启动进程不会读取另一个终端后设置的变量。
 
 `passwordEnv` 存的是变量名，程序运行时读取其值。JSON 中不允许 `password` 或 `token` 字段。连接参数通常可用相应命令的 `--username`、`--password-env`、`--ca-file` 覆盖；Fast 日常命令使用 profile 对应的 repositories 设置。
 
@@ -178,6 +184,8 @@ Artifactory 地址也不能写成 `https://用户名:密码@主机/...`：这类
 有配置时，未设置 imageStore 默认使用配置目录下的 `data/image-store/`。没有配置时，独立命令使用系统临时目录中的默认镜像库。层缓存未配置时使用临时目录下的默认层缓存。建议长期使用时显式指定这两个缓存路径。
 
 程序升级时保留运行数据，程序分发包不包含下载镜像和构建缓存。旧 profile 的 `baseCacheDir` 应迁移到 `cache.imageStore`；内部缓存格式、迁移和清理边界见 [CAS 镜像库](../CAS_STORE.md)。
+
+完整查询与迁移步骤见[打包台账与运行数据](HISTORY.md)。
 
 台账默认保存在当前用户的 `~/.pyimagebuilder/build-records/`。可在配置顶层设置 `"buildRecordsDir": "./data/build-records"`，相对路径以配置文件所在目录为准；环境变量优先。建议放在 Dockerfile 构建上下文之外。每次成功打包保存一份小型 JSON，记录时间、标签、平台和产物信息，不保存应用包、鉴权参数或镜像层。换机器时可以单独备份、迁移此目录。
 

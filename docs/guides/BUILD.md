@@ -2,7 +2,15 @@
 
 [文档目录](../README.md) · [项目首页](../../README.md) · [Dockerfile 兼容表](../DOCKERFILE_COMPAT.md)
 
-普通构建的基本形式是：
+普通构建的基本形式如下。在工具目录执行；示例路径需替换，输出文件必须尚不存在。
+
+**UOS / Linux：**
+
+```bash
+python3 main.py build /data/project -t company/app:1 -o /data/images/app.tar
+```
+
+**Windows / PowerShell：**
 
 ```powershell
 python .\main.py build D:\project -t company/app:1 -o D:\images\app.tar
@@ -127,5 +135,7 @@ python .\main.py load -i D:\images\app.tar
 ```
 
 `load` 将镜像注册到 **PyImageBuilder 的本地镜像库**，便于后续按引用使用。交付给 Docker 时，在目标机器执行 `docker load -i app.tar`；与本工具的 load 作用位置不同。
+
+成功的普通构建也会登记台账，查询与迁移见[打包台账](HISTORY.md)。耗时定位见[性能排查](PERFORMANCE.md)，图形操作见[Web 工作台](WEB.md)。
 
 下一步：[命令速查](COMMANDS.md) · [常见问题](TROUBLESHOOTING.md) · [交付证明与封闭构建](ADVANCED.md)

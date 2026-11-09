@@ -1,6 +1,6 @@
 # 构建进度输出
 
-[文档目录](README.md) · [项目首页](../README.md)
+[文档目录](README.md) · [Web 工作台](guides/WEB.md#5-进度日志和取消) · [性能排查](guides/PERFORMANCE.md)
 
 以下是当前 `PlainRenderer` 的输出格式示例。路径、镜像名和 digest 已缩写；RUN 和私有仓库示例展示相应事件的渲染格式，本机 Windows 环境未执行 Linux RUN 或连接内网仓库。
 
@@ -28,6 +28,26 @@ Web 仅把具有有效非负、有界有限时间值的 JSON 当作结构化事�
 有结构化拉取快照时，Web 另显示当前基础镜像的五段流程条、文件数、层数和当前子阶段时间，
 目前用于 Artifactory 直接入 CAS 的路径。没有快照的本地构建不推测或伪造拉取进度。
 基础镜像就绪只表示基础镜像可以使用；应用镜像的任务结果仍以最终构建状态为准。
+
+## 阶段耗时怎么读
+
+以下数字只用于展示格式，不代表本机或 UOS 实测性能。阶段名以中文显示，按耗时排序；
+`#` 的长度只相对最长操作。准备跨度与下载有重叠，导出也有内部子项，不能把各项相加。
+
+```text
+Stage timings (seconds):
+  注意：包含嵌套或并行操作，不能直接相加；总耗时以 Duration 为准。
+  下载基础镜像文件        142.61 s  ############
+  准备镜像层 [并行]        74.00 s  ######  与下载并行的墙钟跨度，不相加
+  读取基础镜像与索引       39.70 s  ###
+  等待剩余层               35.50 s  ###  下载结束后的剩余等待
+  写出 Docker tar          26.20 s  ##
+  校验 Docker tar          23.50 s  ##
+  计算最终文件 SHA-256     15.60 s  #
+Duration:  339.00s
+```
+
+实际定位步骤见[性能排查](guides/PERFORMANCE.md)。JSON 的 `details.timings` 继续使用原始英文键，方便脚本处理。
 
 ## 1. 完全命中层缓存
 
@@ -83,7 +103,7 @@ PyBuilder | Building sfcx_back:1.3.4 [linux/amd64]
     > Dockerfile parsed: 3 instruction(s)
     OK 解析构建输入 (0.00s)
 [1/3] FROM example/tongweb:11
-[2/3] COPY --chown=tongadmin:tonggrp app.war /soft/TongWeb7.0/autodeploy/sfcx.war
+[2/3] COPY --chown=tongadmin:tonggrp ["app.war", "/soft/TongWeb7.0/autodeploy/sfcx.war"]
 [3/3] COPY --chown=tongadmin:tonggrp tongweb.xml /soft/TongWeb7.0/conf/tongweb.xml
 [+] 写出镜像归档
 ...
@@ -121,7 +141,7 @@ Artifactory 并行拉取期间，任务状态区同时显示网络与层准备�
 默认普通 CLI 不输出单层开始行，`--verbose` 可展开；JSON 仍保留所有生命周期事件。
 构建结束后日志列出阶段耗时，并明确提示嵌套/并行子项不能直接相加。
 
-导出统计分别列出 `Write Docker/OCI archive`、`Verify Docker/OCI archive` 和
+JSON 的导出耗时键分别为 `Write Docker/OCI archive`、`Verify Docker/OCI archive` 和
 `Publish Docker/OCI archive`。Publish 包含最终排他发布，以及必要的跨盘或无硬链接回退复制；
 最终整个交付文件的 SHA-256 仍单列为 `Hash final output archive`。
 这些是导出阶段内部的子项，不能再与外层导出总耗时重复相加。
@@ -254,4 +274,4 @@ Build succeeded
 {"type":"step_success","elapsed":0.892,"message":"done","phase":"COPY app.war /app/app.war","step":2,"total":3,"instruction":"COPY app.war /app/app.war","line":2,"duration":0.871}
 ```
 
-事件由 `progress.events.BuildEvent` 定义，`progress.reporter.BuildReporter` 发布；console、JSON 和未来的 Web UI 只需实现 `render(event)` / `close()` 接口。高频字节更新最多每 250 毫秒发一次，读取器每约 1 MiB 才调用一次进度回调。CI 和重定向输出不含颜色与回车覆盖符。
+事件由 `progress.events.BuildEvent` 定义，`progress.reporter.BuildReporter` 发布；console 与 JSON 使用 `render(event)` / `close()` 接口；Web 收集子进程的 JSON 事件并增量更新界面。高频字节更新最多每 250 毫秒发一次，读取器每约 1 MiB 才调用一次进度回调。CI 和重定向输出不含颜色与回车覆盖符。
