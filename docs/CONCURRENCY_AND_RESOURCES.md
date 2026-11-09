@@ -114,6 +114,12 @@ Python 官方明确指出，多线程进程中的 fork 不安全；Python 3.12 �
 文件系统不能提供有效标识时，工具保留节点并明确报告无法安全清理。
 这不提供检查与 unlink 之间的 OS 级原子隔离，也不把同一 inode 的就地改写识别为另一份发布。
 
+Web 上传暂存目录及文件也登记设备号、inode/file ID 与节点类型，在读取、认领和清理时核对。
+清理只删除登记的上传文件，再用 `rmdir` 移除空目录；同名替换节点和后来放入的其他文件均保留。
+暂存目录由上传管理器显式清理，不再让 `TemporaryDirectory` 的自动 finalizer 按旧路径递归删除。
+清理失败保留配额并使令牌失效，后续重试不会重新认领替换文件；重复释放已清理令牌安全返回。
+关闭工作台时，已认领或仍在接收的文件交给相应任务或接收线程收尾，不能提前删除其输入。
+
 ## 6. 验证方法
 
 无需 Docker 的专项测试：
@@ -122,6 +128,7 @@ Python 官方明确指出，多线程进程中的 fork 不安全；Python 3.12 �
 python -m unittest discover -s tests -p test_concurrency_lifecycle.py -v
 python -m unittest discover -s tests -p test_run_parent_cleanup.py -v
 python -m unittest discover -s tests -p test_publication_ownership.py -v
+python -m unittest discover -s tests -p test_web_upload_lifecycle.py -v
 ```
 
 它们使用真实线程、锁、Future、文件和管道；网络及 Linux 系统调用使用本地替身，不代表生产服务或真实 namespace 验收。

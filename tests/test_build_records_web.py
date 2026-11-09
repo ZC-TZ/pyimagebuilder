@@ -546,24 +546,23 @@ class WorkbenchTests(unittest.TestCase):
         self.assertIn(b"picker:1", self.http("/images")[2])
 
     def test_upload_cleanup_retry_preserves_quota_and_invalidates_token(self):
-        import shutil
         from errors import BuildError
         status, body = self.upload_package("locked.war", b"war")
         self.assertEqual(status, 200, body)
         uploads = self.workspace.uploads
         token = json.loads(body)["token"]
         staged = uploads.path(token)
-        real_rmtree = shutil.rmtree
+        real_unlink = Path.unlink
         denied = threading.Event()
 
         def temporarily_busy(path, *args, **kwargs):
-            if Path(path) == staged.parent and not denied.is_set():
+            if Path(path) == staged and not denied.is_set():
                 denied.set()
                 raise PermissionError("busy")
-            return real_rmtree(path, *args, **kwargs)
+            return real_unlink(path, *args, **kwargs)
 
         with patch("web_uploads.CLEANUP_RETRY_SECONDS", 0.6), patch.object(
-                shutil, "rmtree", side_effect=temporarily_busy):
+                Path, "unlink", new=temporarily_busy):
             self.assertEqual(self.http("/discard-fast-upload", {"token": token})[0], 400)
             with uploads.lock:
                 self.assertIn(token, uploads.entries)

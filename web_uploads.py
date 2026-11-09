@@ -1,7 +1,8 @@
 """为工作台暂存浏览器选中的构建文件。"""
 
+import os
 import secrets
-import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -21,12 +22,36 @@ CLEANUP_RETRY_SECONDS = 5
 
 @dataclass
 class Upload:
-    directory: tempfile.TemporaryDirectory
+    directory: Path
     path: Path
     size: int
     kind: str
     expires: float = 0
     discarded: bool = False
+    identity: tuple = None
+    file_identity: tuple = None
+
+
+def _identity(info):
+    """只比较节点身份，写入或 chmod 不能让本次创建的节点变成外来节点。"""
+    return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)) if info.st_ino else None
+
+
+def _owned_directory(entry):
+    """拒绝同名替换、链接和无法确认身份的节点；真正缺失可释放登记。"""
+    try:
+        info = entry.directory.lstat()
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(info.st_mode) or entry.identity is None or _identity(info) != entry.identity:
+        raise OSError("应用包暂存目录已被替换或无法确认身份")
+    try:
+        resolved = entry.directory.resolve()
+    except RuntimeError as exc:
+        raise OSError("应用包暂存目录无法解析") from exc
+    if resolved != entry.directory:
+        raise OSError("应用包暂存目录已被替换")
+    return True
 
 
 class FastUploads:
@@ -36,20 +61,25 @@ class FastUploads:
         self.closed = False
 
     def _remove(self, token):
-        entry = self.entries[token]
+        entry = self.entries.get(token)
+        if entry is None:
+            return
         entry.discarded = True
         entry.expires = time.monotonic() + CLEANUP_RETRY_SECONDS
-        directory = entry.path.parent
+        if not _owned_directory(entry):
+            del self.entries[token]
+            return
         try:
-            resolved = directory.resolve()
-        except RuntimeError as exc:
-            raise OSError("应用包暂存目录无法解析") from exc
-        if resolved != directory:
-            raise OSError("应用包暂存目录已被替换")
-        entry.directory.cleanup()
-        # Python 3.7 在首次清理失败后已摘除 finalizer，再调用 cleanup 可能直接返回。
-        if directory.exists():
-            shutil.rmtree(directory)
+            info = entry.path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if entry.file_identity is None or _identity(info) != entry.file_identity:
+                raise OSError("应用包暂存文件已被替换或无法确认身份")
+            entry.path.unlink()
+        # 此目录只创建一个上传文件。只删自有节点，再用 rmdir 核实为空；
+        # 不递归删除后来放入的文件，也不留下可绕过身份检查的自动 finalizer。
+        entry.directory.rmdir()
         del self.entries[token]
 
     def _ready(self, token, kind):
@@ -59,6 +89,11 @@ class FastUploads:
             raise BuildError("暂存文件已过期或已提交，请重新选择应用包")
         if entry.kind != kind:
             raise BuildError("暂存文件类型与当前输入不匹配")
+        try:
+            if not _owned_directory(entry) or _identity(entry.path.lstat()) != entry.file_identity:
+                raise OSError("暂存文件已变更")
+        except OSError as exc:
+            raise BuildError("暂存文件已移走或替换，请重新选择应用包") from exc
         return entry
 
     def _reap(self, force=False):
@@ -99,11 +134,18 @@ class FastUploads:
                 raise BuildError("应用包暂存空间已满，请等待现有任务结束，或直接填写文件路径")
             token = secrets.token_urlsafe(24)
             root = resolve_host_path(tempfile.gettempdir())
-            directory = tempfile.TemporaryDirectory(prefix="pyib-fast-upload-", dir=str(root))
-            path = Path(directory.name) / stored_name
-            self.entries[token] = Upload(directory, path, size, kind)
+            directory = Path(tempfile.mkdtemp(prefix="pyib-fast-upload-", dir=str(root)))
+            path = directory / stored_name
+            entry = Upload(directory, path, size, kind)
+            self.entries[token] = entry
         try:
+            entry.identity = _identity(directory.lstat())
+            if entry.identity is None:
+                raise OSError("无法确认应用包暂存目录身份")
             with path.open("xb") as output:
+                entry.file_identity = _identity(os.fstat(output.fileno()))
+                if entry.file_identity is None:
+                    raise OSError("无法确认应用包暂存文件身份")
                 remaining = size
                 while remaining:
                     block = source.read1(min(remaining, 1024 * 1024))
@@ -154,10 +196,13 @@ class FastUploads:
 
     def unclaim(self, token):
         with self.lock:
+            entry = self.entries.get(token)
+            if entry is None:
+                return
             if self.closed:
                 self._remove(token)
-            else:
-                self.entries[token].expires = time.monotonic() + IDLE_SECONDS
+            elif not entry.discarded:
+                entry.expires = time.monotonic() + IDLE_SECONDS
 
     def finish(self, token):
         with self.lock:
