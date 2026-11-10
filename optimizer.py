@@ -135,44 +135,61 @@ def _hash_stream(stream):
     return value.hexdigest()
 
 
-def _signature(index, memo):
+def _signature(index, memo, reporter=None):
+    """比较最终文件树、共享 inode 拓扑及有效元数据，不比较硬链接的创建顺序。"""
     result = []
     if index.root_metadata is not None:
         member = index.root_metadata
-        # 只有根权限变化的层也不能删；原先仅比较 entries 会漏掉 chmod/chown /。
         result.append(("", "root-directory", (member.mode, member.uid, member.gid,
                        member.mtime, json.dumps(member.pax_headers, sort_keys=True))))
-    inode_names = {}
-    for path, entry in sorted(index.entries.items()):
-        if entry.kind == "other":
-            raise BuildError("Cannot safely optimize an image with special rootfs entries")
-        if not entry.layer:
-            result.append((path, "implicit-directory"))
-            continue
-        identity = (entry.layer, entry.member)
-        if identity not in memo:
-            with tarfile.open(entry.layer, "r:") as archive:
-                member = normalized_metadata(archive.getmember(entry.member))
+    needed = defaultdict(set)
+    for entry in index.entries.values():
+        if entry.layer and (entry.layer, entry.member) not in memo:
+            needed[entry.layer].add(entry.member)
+    total, completed = sum(len(names) for names in needed.values()), 0
+    # 按层顺序解析一次；不能为每个文件重新 getmember 并扫描整份大 tar。
+    for layer, names in needed.items():
+        with tarfile.open(layer, "r:") as archive:
+            for raw in archive:
+                if raw.name not in names:
+                    continue
+                member = normalized_metadata(raw)
+                if not (member.isfile() or member.isdir() or member.issym() or
+                        member.isfifo() or member.ischr() or member.isblk()):
+                    raise ArchiveError("Unsupported rootfs entry type during optimization: " + repr(member.type))
+                if (member.isfifo() or member.ischr() or member.isblk()) and member.size:
+                    raise ArchiveError("Special rootfs entry has unexpected payload: " + member.name)
                 content = None
                 if member.isfile():
                     stream = archive.extractfile(member)
                     if stream is None:
-                        raise ArchiveError("Unreadable visible file: " + path)
+                        raise ArchiveError("Unreadable visible file: " + member.name)
                     with stream:
                         content = _hash_stream(stream)
-                memo[identity] = (member.type, member.size, member.mode, member.uid,
-                                  member.gid, member.mtime, member.linkname,
-                                  member.devmajor, member.devminor,
-                                  json.dumps(member.pax_headers, sort_keys=True), content)
-        effective = list(memo[identity])
+                memo[(layer, raw.name)] = (member.type, member.size, member.mode, member.uid,
+                                          member.gid, member.mtime, member.linkname,
+                                          member.devmajor, member.devminor,
+                                          json.dumps(member.pax_headers, sort_keys=True), content)
+                completed += 1
+                if reporter is not None:
+                    reporter.progress(completed, total, "Compare optimization files", unit="files")
+        if any((layer, name) not in memo for name in names):
+            raise ArchiveError("Missing rootfs backing member during optimization")
+    inode_names = {}
+    for path, entry in sorted(index.entries.items()):
+        if not entry.layer:
+            result.append((path, "implicit-directory"))
+            continue
+        effective = list(memo[(entry.layer, entry.member)])
         if entry.metadata is not None:
             metadata = entry.metadata
             effective[2:6] = [metadata.mode, metadata.uid, metadata.gid, metadata.mtime]
             effective[9] = json.dumps(metadata.pax_headers, sort_keys=True)
-        # 相同内容和权限不等于共享 inode；更换硬链接目标同样会改变后续 chmod/chown 效果。
-        alias = (inode_names.setdefault(id(entry.inode), path)
-                 if entry.kind in ("file", "hardlink") else None)
-        result.append((path, entry.kind, tuple(effective), alias))
+        # 文件内容来源已经固定。最终拓扑按可见路径分组，不按原 tar 链接头指向谁。
+        # 两份相同字节的独立文件不能与共享 inode 的两个名字混为一谈。
+        regular = entry.kind in ("file", "hardlink")
+        alias = inode_names.setdefault(id(entry.inode), path) if regular else None
+        result.append((path, "file" if regular else entry.kind, tuple(effective), alias))
     return tuple(result)
 
 
@@ -237,10 +254,10 @@ def analyze_image(path, tag=None, large_mib=50):
                 "note": "Duplicate and hidden byte counts are opportunities, not guaranteed savings."}
 
 
-def optimize_image(path, output, tag=None, source_date_epoch=0):
+def optimize_image(path, output, tag=None, source_date_epoch=0, reporter=None):
     """仅移除已证明不影响最终文件树的完整层，并同步重写配置。
 
-    不是文件级压缩；遇到硬链接或特殊文件等无法保守验证的结构时拒绝优化。
+    不是文件级压缩；比较共享 inode 和设备/FIFO 元数据，无法证明等价的层保留。
     """
     output = output_path(output)
     path = Path(path).resolve()
@@ -250,15 +267,18 @@ def optimize_image(path, output, tag=None, source_date_epoch=0):
     output.parent.mkdir(parents=True, exist_ok=True)
     with publication_transaction() as published, \
             tempfile.TemporaryDirectory(prefix="pyimagebuilder-optimize-", dir=output.parent) as temp:
+        if reporter is not None:
+            reporter.phase_start("Read optimization source")
         kind, tag, image = load_image(path, Path(temp) / "input", tag, with_image=True)
         config, layers = image.config, image.layers
-        for layer in layers:
-            with tarfile.open(layer, "r:") as archive:
-                if any(member.islnk() or member.ischr() or member.isblk() or member.isfifo()
-                       for member in archive):
-                    raise BuildError("Cannot safely prune layers containing hardlinks or special files")
+        if reporter is not None:
+            reporter.phase_success()
+            reporter.phase_start("Compare optimization filesystem")
         memo = {}
-        original = _signature(_index(layers), memo)
+        original = _signature(_index(layers), memo, reporter)
+        if reporter is not None:
+            reporter.phase_success()
+            reporter.phase_start("Check redundant layers")
         retained = list(range(len(layers)))
         removed = []
         for number in range(len(layers)):
@@ -270,6 +290,12 @@ def optimize_image(path, output, tag=None, source_date_epoch=0):
             if same:
                 retained = candidate
                 removed.append(number)
+            if reporter is not None:
+                reporter.log("镜像层 {}/{}：{}".format(number + 1, len(layers), "已证明冗余，移除" if same else "保留"))
+                reporter.progress(number + 1, len(layers), "Check redundant layers", unit="layers")
+        if reporter is not None:
+            reporter.phase_success()
+            reporter.phase_start("Write optimized image")
         updated = copy.deepcopy(config)
         updated["rootfs"]["diff_ids"] = [config["rootfs"]["diff_ids"][item] for item in retained]
         history = image_history(config, len(layers))
@@ -299,10 +325,16 @@ def optimize_image(path, output, tag=None, source_date_epoch=0):
                          manifest_template=template, index_template=image.source_index)
         else:
             writer.write_new(partial, updated, [layers[item] for item in retained], tag)
+        if reporter is not None:
+            reporter.phase_success()
+            reporter.phase_start("Verify optimized filesystem")
         writer.verify(partial, tag)
         _, _, _, verified_layers = load_image(partial, Path(temp) / "verify", tag)
-        if _signature(_index(verified_layers), {}) != original:
+        if _signature(_index(verified_layers), {}, reporter) != original:
             raise BuildError("Optimized image rootfs verification failed")
+        if reporter is not None:
+            reporter.phase_success()
+            reporter.log("优化完成：移除 {} 层，保留 {} 层。未证明冗余的层不会删除。".format(len(removed), len(retained)))
         original_size = path.stat().st_size
         optimized_size = partial.stat().st_size
         publish_new_file(partial, output)

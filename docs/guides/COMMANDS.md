@@ -79,7 +79,7 @@ slim 支持显式 delete/keep、规则文件及内置保护，gzip 后仍按未�
 | `python main.py analyze --archive archive.tar --output report.json` | 分析大层、重复文件和覆盖内容 |
 | `python main.py optimize --archive archive.tar --output optimized.tar` | 在既有边界内保守删除冗余整层 |
 
-`optimize` 与 `flatten` 不同：前者尝试删掉冗余整层，后者重写最终文件树为一层。清理镜像库的孤立 blob 前应停止同一镜像库上的构建、拉取、导入等操作；详细行为见 [CAS 镜像库](../CAS_STORE.md)。
+`optimize` 与 `flatten` 不同：前者尝试删掉冗余整层，后者重写最终文件树为一层。优化支持普通硬链接、FIFO、字符及块设备；保留仍被链接引用的旧内容、inode 共享关系和有效权限，不能证明等价的层不删除。没有删除层时正常另存并保留 ImageID，不保证体积变小。清理镜像库的孤立 blob 前应停止同一镜像库上的构建、拉取、导入等操作；详细行为见 [CAS 镜像库](../CAS_STORE.md)。
 
 ## 6. 独立脚本
 

@@ -219,7 +219,7 @@ def _deliver_archive(plan, settings, store, path, size, workspace):
             verify_archive(path, tag, platform)
         if action == "analyze":
             return analyze_image(path, tag)
-        return optimize_image(path, plan["output"], tag)
+        return _optimize(plan, path)
     if action == "rootfs-export":
         return export_rootfs(path, plan["output"], tag=tag, platform=platform)
     if action == "flatten":
@@ -257,6 +257,25 @@ def _deliver_archive(plan, settings, store, path, size, workspace):
                       **tls_options(connection.get("verifyTls", True)))
         return {"reference": destination, "digest": digest}
     raise BuildError("该归档不支持所选操作")
+
+
+def _optimize(plan, source):
+    """让较长的优化任务报告阶段、候选层决定和最终复核，收尾失败也回滚产物。"""
+    from optimizer import optimize_image
+    from progress import make_reporter
+    reporter = make_reporter("json", stream=sys.stdout)
+    try:
+        with publication_transaction() as published:
+            reporter.start(plan["tag"], plan["platform"], mode="optimize")
+            result = optimize_image(source, plan["output"], plan["tag"], reporter=reporter)
+            published.append(Path(result["output"]))
+            reporter.success(output=result["output"], size=result["after_bytes"])
+        return result
+    except BaseException as exc:
+        reporter.fail(exc)
+        raise
+    finally:
+        reporter.close()
 
 
 def _compress(plan, source):

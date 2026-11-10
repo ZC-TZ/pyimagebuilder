@@ -817,6 +817,46 @@ class WorkbenchTests(unittest.TestCase):
         self.assertNotIn('value="compress"', self.http("/delivery?" + urlencode(selector))[2].decode())
         self.assertEqual(self.http("/delivery/prepare", dict(selector, action="compress", output=str(output)))[0], 400)
 
+
+    def test_optimize_hardlinks_and_fifo_via_history_and_cas_reports_progress(self):
+        from test_slim import fixture, TAG as base_tag
+        from optimizer import load_image
+        from image_reader import ImageArchiveReader
+        selectors = []
+        for kind in ("docker", "oci"):
+            folder = self.root / ("opt-" + kind);folder.mkdir()
+            base, _ = fixture(folder)
+            context = folder / "context";context.mkdir()
+            (context / "Dockerfile").write_text("FROM " + base_tag + "\nCOPY payload /new-payload\n", encoding="utf-8")
+            (context / "payload").write_bytes(b"application")
+            archive = folder / "built.tar"
+            self.run_job("build", {"context": str(context), "tag": "example/optimized-web:1",
+                                  "output": str(archive), "format": kind, "base-tar": str(base),
+                                  "offline": "1", "no-cache": "1"})
+            record, = [row for row in build_records.list_builds(self.workspace.directory)
+                       if row["artifacts"][0]["path"] == str(archive)]
+            selector = {"scope": "history", "id": record["id"], "file": "0"}
+            output = folder / "optimized.tar"
+            _, identity = self.run_request("/delivery/prepare", dict(selector, action="optimize", output=str(output)))
+            logs = "\n".join(self.workspace.jobs.snapshot(identity)["logs"])
+            self.assertIn("检查冗余镜像层", logs)
+            self.assertIn("复核优化后的文件系统", logs)
+            self.assertNotIn("Cannot safely prune", logs)
+            self.assertEqual(self.http("/download?id=" + identity + "&file=0")[2], output.read_bytes())
+            before = load_image(archive, folder / "before", with_image=True)[2]
+            after = load_image(output, folder / "after", with_image=True)[2]
+            self.assertEqual(before.config_digest, after.config_digest)
+            selectors.append(selector)
+        self.run_request("/delivery/prepare", dict(selectors[-1], action="load"))
+        rows = library_items(self.workspace.settings)["images"]
+        item, = [item for row in rows for item in row["delivery_items"]]
+        target = self.root / "cas-optimized.tar"
+        _, identity = self.run_request("/delivery/prepare", {
+            "scope": "library", "id": item["id"], "action": "optimize", "output": str(target)})
+        self.assertEqual(self.http("/download?id=" + identity + "&file=0")[2], target.read_bytes())
+        parsed = ImageArchiveReader(target, self.root / "cas-result").read("example/optimized-web:1")
+        self.assertGreaterEqual(len(parsed.layers), 2)
+
     def test_slim_cas_source_and_invalid_rules(self):
         _, source = self.built_delivery("oci")
         self.run_request("/delivery/prepare", dict(source, action="load"))

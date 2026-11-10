@@ -84,7 +84,7 @@ CAS 的统一 ref 发布入口在落盘 blob 与 ref 之间核对 manifest/confi
 | `builder.py` / `image_config.py` / `fast.py` | FROM 原始身份随阶段传递；Fast 使用同一 builder | 实际 Dockerfile 变化；Fast 配置文件、SBOM/provenance 等新产物 |
 | `image_writer.py` | 转存 config 强制保留；层 tar 不重新打包 | Docker save manifest/repositories/旧式层 metadata、派生配置 |
 | `oci_writer.py` | 转存 config 保留；已有 manifest 最终不变时保留 | 新布局 index、派生 manifest/config；模板保留扩展信息但不冒充旧 digest |
-| `optimizer.py` | 未删除任何层：保留 config；OCI 同时原样保留 manifest/index | 确实裁层时更新 DiffID/history，生成新身份，并保留存活描述符和各级注解 |
+| `optimizer.py` | 未删除任何层：保留 config；OCI 同时原样保留 manifest/index，硬链接/FIFO/设备节点也遵守此规则 | 确实裁层时更新 DiffID/history，生成新身份，并保留存活描述符和各级注解 |
 | `rootfs_archive.py` / `image_changes.py` | export 只导出文件系统，不写 image config；flatten 从已验证镜像配置复制运行字段 | import 从 rootfs 创建新镜像；flatten 替换层链，明确使用 write_new，更新 history/DiffID/ImageID；不会承诺原身份 |
 | `registry.py` push/push-index | config 上传原字节；零层 manifest 原字节；index 完全未变时原字节 | gzip 压缩、平台描述符或引用变化；保留注解，移除失效的旧 data/urls |
 | `multiarch.py` | 子 config/manifest/layer blob 不重新编码；保留平台描述符额外注解 | 合并的顶层 index 是新对象；不自动合并两个来源顶层 index 的注解 |

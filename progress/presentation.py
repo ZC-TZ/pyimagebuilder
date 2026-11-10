@@ -5,6 +5,9 @@ import unicodedata
 
 
 PHASE_NAMES = {
+    "Read optimization source": "读取并验证优化源镜像", "Compare optimization filesystem": "建立最终文件树签名",
+    "Check redundant layers": "检查冗余镜像层", "Write optimized image": "写出优化镜像",
+    "Verify optimized filesystem": "复核优化后的文件系统", "Compare optimization files": "核对文件与节点元数据",
     "Compressing image archive": "压缩镜像归档", "Verifying gzip archive": "回读校验压缩归档",
     "Check compression input": "检查原始 tar 结构",
     "Compress and verify original archive": "压缩并核对原始归档",
