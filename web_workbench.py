@@ -19,6 +19,7 @@ from web_jobs import FORMATS, LABELS, PLATFORMS, Jobs, _path, command_for, fast_
 from web_maintenance import (PROFILE_FIELDS, _revision, cache_fingerprint, cache_plan, cache_root, candidate_profile,
                              image_store_root, old_image_rows, save_profile)
 from web_ui import icon
+from web_delivery_ui import DESCRIPTIONS, navigation, suggested_output
 from web_uploads import FastUploads
 from web_paths import check_oci_platform
 from web_log import log_lines, log_metadata, pull_flow
@@ -519,12 +520,16 @@ class Workbench:
         hidden = "".join('<input type="hidden" name="{}" value="{}">'.format(key, _e(data[key]))
                          for key in ("scope", "id", "file") if key in data)
         buttons = []
-        for action in self.delivery.actions(item):
+        actions = self.delivery.actions(item)
+        for action in actions:
             content = hidden + '<input type="hidden" name="action" value="{}">'.format(action)
-            if action in ("tag", "save", "optimize", "flatten", "rootfs-export", "slim"):
-                content += _path_field("output", "新 tar 输出路径", "/data/images/release.tar", True, mode="output")
+            suggestion = suggested_output(item, action)
+            if suggestion:
+                mode = "output-gzip" if action == "compress" else "output-archive" if action == "slim" else "output"
+                content += _path_field("output", "新压缩归档路径" if action == "compress" else "新 tar 输出路径",
+                                       suggestion, True, mode=mode)
+                content += '<button type="button" class="secondary suggest-output" data-suggest-output="{}">使用建议名称</button>'.format(_e(suggestion))
             if action == "compress":
-                content += _path_field("output", "新压缩归档路径", "/data/images/release.tar.gz", True, mode="output")
                 content += '<p class="muted">只压缩原 tar，不合层、不改配置与镜像 ID。填写 .tar 时追加 .gz；另存 .compress.json 校验报告。</p>'
                 content += _select("compress-level", "gzip 压缩级别", tuple(str(n) for n in range(1, 10)), "6")
                 content += _input("upload-limit", "解压后上传限制（字节）", value="2000000000")
@@ -548,13 +553,27 @@ class Workbench:
                 content += _input("new-tag", "新镜像标签", "hisq_front:1.0.1", True)
             if action == "push":
                 content += _input("destination", "目标 Registry / Harbor 标签", "harbor.example/project/image:1", True)
-            buttons.append(_section(DELIVERY_ACTIONS[action],
-                '<form class="job-form" action="{}/delivery/prepare" method="post">{}<button>{}</button></form>'.format(
-                    self.prefix, content, "预览推送" if action == "push" else DELIVERY_ACTIONS[action])))
+            buttons.append(
+                '<article class="operation-panel" id="operation-{0}" data-operation-panel="{0}">'
+                '<header><div><span class="operation-impact">{1}</span><h2 tabindex="-1">{2}</h2>'
+                '<p class="muted">{3}</p></div></header>'
+                '<form class="job-form" action="{4}/delivery/prepare" method="post">{5}'
+                '<div class="form-footer"><button>{6}</button><small class="muted">提交后可在任务页查看进度和结果。</small>'
+                '</div></form></article>'.format(action, _e(DESCRIPTIONS[action][2]), _e(DELIVERY_ACTIONS[action]),
+                                                _e(DESCRIPTIONS[action][1]), self.prefix, content,
+                                                "预览推送" if action == "push" else DELIVERY_ACTIONS[action]))
         if item["format"] in ("docker", "oci"):
             buttons.append(_section("交付验签", '<a class="button" href="{}/attest?{}">校验签名和产物摘要</a>'.format(
                 self.prefix, _e(urlencode({key: data[key] for key in ("scope", "id", "file") if key in data})))))
-        return _section("所选产物", _pairs(fields)) + '<div class="operation-grid">{}</div>'.format("".join(buttons))
+        default = "compress" if "compress" in actions else "save" if "save" in actions else "verify"
+        source = ('<article class="delivery-source"><div class="delivery-source-heading">{0}'
+                  '<div><span class="eyebrow">当前产物</span><h2>{1}</h2>'
+                  '<div class="meta"><span class="badge">{2}</span><span>{3}</span></div></div></div>'
+                  '<details><summary>查看来源与完整路径</summary>{4}</details></article>').format(
+                      icon("package", 26), _e(item["tag"]), _e(item["format"].upper()), _e(item["platform"]), _pairs(fields))
+        return ('<div data-delivery-workspace data-default-operation="{}">{}{}'
+                '<div class="operation-panels">{}</div></div>').format(
+                    default, source, navigation(actions), "".join(buttons))
 
     def attestation_page(self, data):
         fields = (("public-key", "可信公钥"), ("provenance", "Provenance"), ("envelope", "DSSE 签名"),

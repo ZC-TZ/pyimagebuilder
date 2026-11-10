@@ -164,6 +164,8 @@ def _workbench_page(workspace, title, body, fast_script=False, active=None, job_
         head += '<script defer src="{}/build-modes.js"></script>'.format(workspace.prefix)
     if title == "最近任务":
         head += '<script defer src="{}/tasks.js"></script>'.format(workspace.prefix)
+    if title == "产物操作":
+        head += '<script defer src="{}/delivery.js"></script>'.format(workspace.prefix)
     return document(title, '<section class="records">{}</section>'.format(body),
                     workspace.nav(default_active if active is None else active), description, head)
 
@@ -364,6 +366,9 @@ def make_server(directory, port=8765, limit=None, workspace=None):
                     return self._reply(200, BUILD_MODES_SCRIPT, content_type="application/javascript")
                 if route == "/job.js" and not query:
                     return self._reply(200, JOB_SCRIPT, content_type="application/javascript")
+                if route == "/delivery.js" and not query:
+                    from web_delivery_ui import DELIVERY_SCRIPT
+                    return self._reply(200, DELIVERY_SCRIPT, content_type="application/javascript")
                 if route == "/paths.js" and not query:
                     from web_paths import PATH_SCRIPT
                     return self._reply(200, PATH_SCRIPT, content_type="application/javascript")
@@ -445,16 +450,16 @@ def make_server(directory, port=8765, limit=None, workspace=None):
             if route is None:
                 return self._reject_unread_post(404, "Not found")
             if route in ("/browse-path", "/choose-output") and not query:
-                from web_paths import browse, selected_output
+                from web_paths import OUTPUT_SUFFIXES, browse, selected_output
                 try:
                     fields = form_data(self)
                     if route == "/browse-path":
                         result = browse(fields)
                     else:
                         kind = fields.pop("kind", "tar")
-                        if set(fields) != {"path", "filename"} or kind not in ("tar", "json"):
+                        if set(fields) != {"path", "filename"} or kind not in OUTPUT_SUFFIXES:
                             raise ValueError("无效的输出路径")
-                        result = {"path": selected_output(fields["path"], fields["filename"], "." + kind)}
+                        result = {"path": selected_output(fields["path"], fields["filename"], OUTPUT_SUFFIXES[kind])}
                     return self._json(200, result)
                 except (BuildError, OSError, ValueError) as exc:
                     return self._json(400, {"error": str(exc)})

@@ -54,6 +54,8 @@ Windows 上无 RUN 的构建原生执行；有 RUN 时可将源码和输入交�
 | --- | --- |
 | `build_records_web.py` | 回环 HTTP 服务、会话边界、响应与文件发送 |
 | `web_workbench.py` | 页面、表单预览、任务与产物操作入口 |
+| `web_delivery_ui.py` | 产物任务分组、身份影响说明、建议名称和渐进交互 |
+| `web_paths.py` | 本机路径浏览、受限分页、输出后缀检查和文件控件交互 |
 | `web_jobs.py` | 串行任务队列、独立 CLI 子进程、日志收集及结果登记 |
 | `web_uploads.py` | 上传配额、认领、到期回收与自有节点清理 |
 | `web_job_journal.py` | Web 任务结果和可复用表单持久化 |

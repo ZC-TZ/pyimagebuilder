@@ -492,7 +492,8 @@ class WorkbenchTests(unittest.TestCase):
         status, _, raw = self.http("/browse-path", fields)
         self.assertEqual(status, 200, raw)
         result = json.loads(raw)
-        self.assertEqual(result["entries"], [{"name": "sample.tar", "path": str(sample), "directory": False}])
+        self.assertEqual([{key: item[key] for key in ("name", "path", "directory")} for item in result["entries"]],
+                         [{"name": "sample.tar", "path": str(sample), "directory": False}])
         self.assertNotIn(b"content must not be returned", raw)
         self.assertEqual(self.http("/choose-output", {"path": str(folder), "filename": "sample.tar"})[0], 400)
         self.assertEqual(self.http("/choose-output", {"path": str(folder), "filename": "../else.tar"})[0], 400)
@@ -503,6 +504,37 @@ class WorkbenchTests(unittest.TestCase):
         status, _, raw = self.http("/browse-path", dict(fields, path=str(sample), initial="1"))
         self.assertEqual(status, 200, raw)
         self.assertEqual(json.loads(raw)["filename"], "sample.tar")
+
+
+    def test_path_picker_accepts_compression_formats_and_lists_conflicts(self):
+        folder = self.root / "picked";folder.mkdir()
+        (folder / "existing.tar.gz").write_bytes(b"existing")
+        status, _, raw = self.http("/browse-path", {"path": str(folder), "mode": "output-gzip", "hidden": "0"})
+        self.assertEqual(status, 200, raw)
+        self.assertEqual(json.loads(raw)["entries"][0]["name"], "existing.tar.gz")
+        for kind, name in (("gzip", "new.tar.gz"), ("gzip", "new.tgz"), ("archive", "new.tar"), ("archive", "new.tar.gz")):
+            status, _, raw = self.http("/choose-output", {"path": str(folder), "filename": name, "kind": kind})
+            self.assertEqual(status, 200, raw)
+            self.assertEqual(json.loads(raw)["path"], str(folder / name))
+            self.assertFalse((folder / name).exists())
+        self.assertEqual(self.http("/choose-output", {"path": str(folder), "filename": "existing.tar.gz", "kind": "gzip"})[0], 400)
+        self.assertEqual(self.http("/choose-output", {"path": str(folder), "filename": "wrong.tar", "kind": "gzip"})[0], 400)
+
+    def test_delivery_task_navigation_script_and_format_aware_fields(self):
+        archive, source = self.built_delivery()
+        status, _, raw = self.http("/delivery?" + urlencode(source))
+        self.assertEqual(status, 200)
+        page = raw.decode()
+        self.assertIn('data-default-operation="compress"', page)
+        self.assertIn('data-operation-panel="compress"', page)
+        self.assertIn('data-path-mode="output-gzip"', page)
+        self.assertIn('data-path-mode="output-archive"', page)
+        self.assertIn('data-suggest-output=', page)
+        self.assertIn("保守移除冗余层", page)
+        self.assertIn("保留镜像身份", page)
+        self.assertIn(self.workspace.prefix + "/delivery.js", page)
+        self.assertEqual(self.http("/delivery.js")[0], 200)
+        self.assertEqual(self.http("/delivery.js", authenticated=False)[0], 404)
 
     def test_build_path_preserves_spaces_from_browsed_filename(self):
         from web_jobs import command_for
