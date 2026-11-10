@@ -14,6 +14,7 @@
 | 查打包过的版本、找到交付物 | `main.py builds` | [打包台账与运行数据](docs/guides/HISTORY.md) |
 | 下载、入库、导出或推送镜像 | `pull/load/save/push` | [命令速查](docs/guides/COMMANDS.md) |
 | 将镜像合为一层并保留启动配置 | `flatten` | [rootfs 与扁平化](docs/ROOTFS_COMMANDS.md) |
+| 裁剪镜像文件、生成审计或压缩 tar | `slim` | [镜像裁剪与压缩](docs/guides/SLIM.md) |
 
 ## 环境与能力边界
 

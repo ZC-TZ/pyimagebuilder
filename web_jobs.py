@@ -26,7 +26,7 @@ from progress.pull import format_pull_status
 from web_log import event_kind, log_record, pull_view
 
 
-LABELS = {"fast": "快速打包", "build": "Dockerfile 构建", "check": "检查 Dockerfile",
+LABELS = {"fast": "快速打包", "build": "Dockerfile 构建", "check": "检查 Dockerfile", "slim": "裁剪与压缩镜像",
           "pull": "拉取镜像", "load": "导入归档", "save": "导出镜像",
           "inspect": "查看归档", "verify": "验证归档", "df": "查看磁盘占用",
           "remove": "删除镜像引用", "tag": "改标签并另存", "push": "推送镜像",

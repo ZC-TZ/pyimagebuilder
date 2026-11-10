@@ -171,6 +171,9 @@ def main(argv=None):
     if argv and argv[0] == "fast":
         from fast import main as fast_main
         return fast_main(argv[1:])
+    if argv and argv[0] == "slim":
+        from slim import main as slim_main
+        return slim_main(argv[1:])
     if argv and argv[0] in ("builds", "--web"):
         from build_records import main as builds_main
         return builds_main(argv if argv[0] == "--web" else argv[1:])
@@ -193,7 +196,7 @@ def main(argv=None):
         argv.pop(0)
     parser = argparse.ArgumentParser(
         description=__doc__,
-        epilog="Commands: build (default), builds, pull, fast, cas, load, save, export, import, flatten, rmi, images, "
+        epilog="Commands: build (default), builds, pull, fast, slim, cas, load, save, export, import, flatten, rmi, images, "
                "image prune, system df, inspect, verify, history, cache, tag, "
                "manifest inspect/create/push, push, analyze, optimize. "
                "Use 'main.py COMMAND --help' for command options.")

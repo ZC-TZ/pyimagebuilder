@@ -102,17 +102,19 @@ class _LayerFiles:
         self.opened.clear()
 
 
-def merge_rootfs(layers, output, reporter=None):
+def merge_rootfs(layers, output, reporter=None, *, index=None):
     """按层应用 whiteout，输出最终文件树；保留 inode 分组与文件元数据。
 
     内容直接由原始层流式复制。硬链接先前目标被覆盖/删除时，仍保留原 inode
     的内容；选一个可见名字先写成普通文件，其余名字链接到它。
+    index 可传入已经校验并裁剪的最终 RootFSIndex；只复用该索引，不重新应用层。
     """
-    index = RootFSIndex()
-    for number, layer in enumerate(layers, 1):
-        index.apply_layer(layer)
-        if reporter is not None:
-            reporter.progress(number, len(layers), "Indexing source layers", unit="layers")
+    if index is None:
+        index = RootFSIndex()
+        for number, layer in enumerate(layers, 1):
+            index.apply_layer(layer)
+            if reporter is not None:
+                reporter.progress(number, len(layers), "Indexing source layers", unit="layers")
     needed = {(entry.layer, entry.member) for entry in index.entries.values() if entry.layer}
     metadata = {}
     # 只保存最终可见 inode 的头；即使 LRU 句柄被淘汰，再打开也可直接按偏移读数据。

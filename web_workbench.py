@@ -521,12 +521,24 @@ class Workbench:
         buttons = []
         for action in self.delivery.actions(item):
             content = hidden + '<input type="hidden" name="action" value="{}">'.format(action)
-            if action in ("tag", "save", "optimize", "flatten", "rootfs-export"):
+            if action in ("tag", "save", "optimize", "flatten", "rootfs-export", "slim"):
                 content += _path_field("output", "新 tar 输出路径", "/data/images/release.tar", True, mode="output")
             if action == "rootfs-export":
                 content += '<p class="muted">输出只包含合并后的文件系统，可用于 rootfs 导入。</p>'
             if action == "flatten":
                 content += _change_field()
+            if action == "slim":
+                content += ('<p class="muted">默认只扁平化。规则只作用于新镜像，保留优先；自动保护不能保证应用一定可运行。'
+                            '勾选 gzip 时 .tar 路径自动加 .gz；旁边另存 .slim.json 完整审计报告。</p>'
+                            '<label>删除规则（每行一条）<textarea name="delete" rows="3" maxlength="8192" '
+                            'placeholder="/usr/share/doc&#10;/var/cache"></textarea></label>'
+                            '<label>保留规则（优先于删除）<textarea name="keep" rows="3" maxlength="8192" '
+                            'placeholder="/app/config"></textarea></label>')
+                content += _check("analyze-only", "仅预览并生成审计报告，不写镜像", True)
+                content += _check("gzip", "生成 gzip 压缩归档")
+                content += _check("no-auto-protect", "关闭运行路径自动保护，仅使用手工保留规则")
+                content += _select("compress-level", "gzip 压缩级别", tuple(str(n) for n in range(1, 10)), "6")
+                content += _input("upload-limit", "解压后上传限制（字节）", value="2000000000")
             if action == "tag":
                 content += _input("new-tag", "新镜像标签", "hisq_front:1.0.1", True)
             if action == "push":
@@ -580,6 +592,8 @@ class Workbench:
 
     def submit_delivery(self, plan):
         outputs = [Path(plan["output"])] if "output" in plan else []
+        if plan["action"] == "slim":
+            outputs = ([] if plan["analyze_only"] else outputs) + [Path(plan["report"])]
         return self.jobs.submit(plan["action"], [json.dumps(plan, ensure_ascii=True)], outputs,
                                 (plan.get("destination") or plan.get("tag") or plan.get("label", ""))[:300], delivery=True)
 
@@ -840,6 +854,8 @@ class Workbench:
         metrics = job.get("metrics", {})
         if metrics:
             names = {"before_bytes": "处理前", "after_bytes": "处理后", "saved_bytes": "体积差（节省）",
+                     "uncompressed_archive_bytes": "解压后镜像大小", "upload_limit": "上传限制（字节）",
+                     "removed_paths": "删除路径数", "protected_paths": "保护候选数", "removed_unique_bytes": "回收载荷",
                      "archive_bytes": "归档大小", "hidden_file_bytes": "被覆盖文件字节",
                      "duplicate_groups": "重复内容组", "large_layers": "大层编号",
                      "deleted": "已删除文件数", "bytes": "已删除文件字节"}

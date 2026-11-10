@@ -16,6 +16,8 @@
 
 `save/load` 处理已有镜像的 manifest/config/layers；`export/import` 处理文件系统，二者不能互换。`optimize` 尝试删除冗余整层，`flatten` 将整个可见文件树写成一层。单层不保证更小；被下层文件占用但已覆盖/删除的数据不会再进入合并层。
 
+需要进一步按路径裁剪、出具审计报告或生成 gzip 镜像时，使用 [slim：镜像裁剪与压缩](guides/SLIM.md)。slim 默认不主动删除文件，输出为 Docker archive；flatten 仍保留 Docker/OCI 双格式与 `--change` 能力。
+
 ## 1. 推荐：构建后直接扁平化
 
 在工具目录运行；以下假设 Dockerfile 和构建上下文位于 `D:\project`，输出放在 `D:\images`：

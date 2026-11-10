@@ -147,8 +147,10 @@ def execute(plan):
         result = _deliver_archive(plan, settings, store, snapshot, size, workspace)
         if result.get("archive") == str(snapshot):
             result["archive"] = str(source)
-        if "output" in plan:
+        if "output" in plan and not (plan["action"] == "slim" and plan["analyze_only"]):
             published.append(Path(plan["output"]))
+        if plan["action"] == "slim":
+            published.append(Path(plan["report"]))
         return result
 
 
@@ -176,6 +178,8 @@ def _deliver_cas(plan, settings, store):
         if action == "flatten":
             return flatten_image(tag, plan["output"], platform=platform, store=root, kind=source,
                                  changes=plan["changes"], stored=True)
+        if action == "slim":
+            return _slim(plan, tag, store=root, kind=source, stored=True)
         if action in ("history", "analyze", "optimize"):
             with tempfile.TemporaryDirectory(prefix="pyimagebuilder-delivery-cas-") as temporary:
                 workspace = Path(temporary)
@@ -188,6 +192,8 @@ def _deliver_cas(plan, settings, store):
 def _deliver_archive(plan, settings, store, path, size, workspace):
     action, tag, platform = plan["action"], plan["tag"], plan["platform"]
     is_oci = plan["format"] == "oci"
+    if action == "slim":
+        return _slim(plan, path, tag=tag)
     if action == "verify":
         return _verify_oci(path, tag, platform) if is_oci else verify_archive(path, tag, platform)
     if action == "history" and not is_oci:
@@ -251,11 +257,42 @@ def _deliver_archive(plan, settings, store, path, size, workspace):
     raise BuildError("该归档不支持所选操作")
 
 
+def _slim(plan, source, **kwargs):
+    """完整决策写报告文件，任务日志只写摘要，避免大报告挤掉实际错误。"""
+    from slim import slim_image
+    from progress import make_reporter
+    options = {key: plan[key] for key in ("deletes", "keeps", "auto_protect", "analyze_only", "report",
+                                         "gzip_output", "compress_level", "upload_limit")}
+    reporter = make_reporter("json", stream=sys.stdout)
+    try:
+        reporter.start(plan["tag"], plan["platform"], mode="slim")
+        with publication_transaction() as published:
+            result = slim_image(source, plan["output"], platform=plan["platform"], reporter=reporter,
+                                **options, **kwargs)
+            for key in ("output", "report"):
+                if result.get(key):
+                    published.append(Path(result[key]))
+            decision = result.pop("decision")
+            result.update(removed_paths=len(decision["removed_paths"]),
+                          protected_paths=len(decision["protected_paths"]),
+                          removed_unique_bytes=decision["removed_unique_bytes"])
+            if result["under_upload_limit"] is False:
+                print("警告：解压后归档仍达到上传限制，gzip 不能绕过该限制。", flush=True)
+            reporter.success(image=result["tag"], output=result["output"], size=result.get("after_bytes"))
+    except BaseException as exc:
+        reporter.fail(exc)
+        raise
+    finally:
+        reporter.close()
+    return result
+
+
 def main():
     try:
         plan = json.loads(sys.argv[1])
         result = execute(plan)
         metrics = {key: result[key] for key in ("before_bytes", "after_bytes", "saved_bytes",
+                   "uncompressed_archive_bytes", "upload_limit", "removed_paths", "protected_paths", "removed_unique_bytes",
                    "archive_bytes", "hidden_file_bytes", "duplicate_groups", "deleted", "bytes")
                    if type(result.get(key)) is int}
         if isinstance(result.get("large_layers"), list):

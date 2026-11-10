@@ -708,6 +708,55 @@ class WorkbenchTests(unittest.TestCase):
         _, failed = self.run_request("/delivery/prepare", dict(source, action="verify"), expected="failed")
         self.assertIn("SHA-256", "\n".join(self.workspace.jobs.snapshot(failed)["logs"]))
 
+    def test_slim_preview_and_gzip_delivery_register_downloadable_report_and_archive(self):
+        import gzip
+        from image_writer import ImageArchiveWriter
+        archive, source = self.built_delivery()
+        before = archive.read_bytes()
+        menu = self.http("/delivery?" + urlencode(source))[2].decode("utf-8")
+        self.assertIn('name="analyze-only"', menu)
+        self.assertIn('name="gzip"', menu)
+        preview = self.root / "preview.tar"
+        _, identity = self.run_request("/delivery/prepare", dict(source, action="slim", output=str(preview),
+                                               **{"delete": "/contents", "keep": "/contents", "analyze-only": "1"}))
+        self.assertFalse(preview.exists())
+        plan = json.loads(self.http("/download?id=" + identity + "&file=0")[2])
+        self.assertTrue(plan["analyze_only"])
+        self.assertEqual(plan["decision"]["removed_paths"], [])
+        self.assertEqual(plan["decision"]["protected_paths"][0]["path"], "/contents")
+        target = self.root / "slim.tar"
+        _, identity = self.run_request("/delivery/prepare", dict(source, action="slim", output=str(target),
+                                               **{"delete": "/contents", "gzip": "1", "upload-limit": "1"}))
+        compressed = Path(str(target) + ".gz")
+        self.assertFalse(target.exists())
+        self.assertEqual(self.http("/download?id=" + identity + "&file=0")[2], compressed.read_bytes())
+        result = json.loads(self.http("/download?id=" + identity + "&file=1")[2])
+        self.assertFalse(result["under_upload_limit"])
+        self.assertEqual(result["decision"]["removed_paths"][0]["path"], "/contents")
+        raw = self.root / "uncompressed-slim.tar"
+        raw.write_bytes(gzip.decompress(compressed.read_bytes()))
+        ImageArchiveWriter().verify(raw, "hisq_front:1.0.0")
+        self.assertEqual(self.workspace.jobs.snapshot(identity)["metrics"]["removed_paths"], 1)
+        persisted = self.workspace.jobs.journal.read(identity)
+        self.assertEqual(len(persisted["artifacts"]), 2)
+        self.assertEqual(archive.read_bytes(), before)
+
+    def test_slim_cas_source_and_invalid_rules(self):
+        _, source = self.built_delivery("oci")
+        self.run_request("/delivery/prepare", dict(source, action="load"))
+        row, = library_items(self.workspace.settings)["images"]
+        item, = row["delivery_items"]
+        selector = {"scope": "library", "id": item["id"], "action": "slim"}
+        target = self.root / "from-cas-slim.tar"
+        invalid = dict(selector, output=str(target), delete="/cache/..")
+        self.assertEqual(self.http("/delivery/prepare", invalid)[0], 400)
+        self.assertFalse(target.exists())
+        _, identity = self.run_request("/delivery/prepare", dict(selector, output=str(target)))
+        self.assertEqual(self.http("/download?id=" + identity + "&file=0")[2], target.read_bytes())
+        report = json.loads(self.http("/download?id=" + identity + "&file=1")[2])
+        self.assertEqual(report["layers"], 1)
+        self.assertIsNone(report["source_sha256"])
+
     def test_oci_actions_verify_import_and_export_cas(self):
         _, source = self.built_delivery("oci")
         self.run_request("/delivery/prepare", dict(source, action="verify"))

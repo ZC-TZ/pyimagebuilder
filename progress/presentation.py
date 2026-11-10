@@ -5,6 +5,8 @@ import unicodedata
 
 
 PHASE_NAMES = {
+    "Snapshot slim input": "准备瘦身输入快照", "Plan image slimming": "分析删除与保护计划",
+    "Write slim rootfs": "写出瘦身文件树", "Compress and verify slim archive": "压缩并校验镜像归档",
     "Resolving base image": "准备基础镜像", "Resolving base images": "准备基础镜像",
     "Preparing application package": "准备应用包", "Preparing build": "解析构建输入",
     "Exporting image archive": "写出镜像归档", "Verifying image archive": "校验镜像归档",

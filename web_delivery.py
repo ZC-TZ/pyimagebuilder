@@ -15,16 +15,18 @@ from errors import BuildError
 from image_cli import _check_tag, list_images
 from image_reader import digest_hex
 from image_store import _archive_path
+from path_policy import output_path
 from settings import cache_directory
 from web_artifacts import artifact_state
 from web_delivery_worker import push_destination
-from web_jobs import PLATFORMS, _required, _target, file_stamp, open_artifact, rootfs_changes
+from web_jobs import PLATFORMS, _path, _required, _target, file_stamp, open_artifact, path_value, rootfs_changes
 
 
 DELIVERY_ACTIONS = {"verify": "校验", "load": "导入镜像库", "tag": "改标签并另存",
                     "push": "推送到 Registry / Harbor", "save": "导出 Docker tar",
                     "history": "镜像层历史", "analyze": "大层与重复文件分析",
-                    "optimize": "优化并另存", "flatten": "扁平化并另存", "rootfs-export": "导出 rootfs"}
+                    "optimize": "优化并另存", "flatten": "扁平化并另存", "rootfs-export": "导出 rootfs",
+                    "slim": "裁剪与压缩镜像"}
 
 
 def _key(parts):
@@ -108,10 +110,10 @@ class Delivery:
         if selected["format"] == "oci-index":
             return ("verify", "push")
         if selected["format"] == "cas":
-            return ("verify", "save", "history", "analyze", "optimize", "flatten", "rootfs-export")
+            return ("verify", "save", "history", "analyze", "optimize", "flatten", "rootfs-export", "slim")
         if selected["format"] == "oci":
-            return ("verify", "load", "push", "history", "analyze", "optimize", "flatten", "rootfs-export")
-        return ("verify", "load", "tag", "push", "history", "analyze", "optimize", "flatten", "rootfs-export")
+            return ("verify", "load", "push", "history", "analyze", "optimize", "flatten", "rootfs-export", "slim")
+        return ("verify", "load", "tag", "push", "history", "analyze", "optimize", "flatten", "rootfs-export", "slim")
 
     def plan(self, data):
         selected = self.select(data)
@@ -137,6 +139,36 @@ class Delivery:
             result["output"] = str(_target(data))
         if action == "flatten":
             result["changes"] = rootfs_changes(data)
+        if action == "slim":
+            from slim_rules import DEFAULT_LIMIT, load_patterns
+            compressed = bool(data.get("gzip"))
+            target = _path(path_value(data, "output", required=True))
+            compressed = compressed or str(target).lower().endswith((".tar.gz", ".tgz"))
+            if compressed and target.suffix.lower() == ".tar":
+                target = Path(str(target) + ".gz")
+            if not str(target).lower().endswith((".tar.gz", ".tgz") if compressed else (".tar",)):
+                raise BuildError("请选择新的 tar 或 tar.gz 输出路径")
+            target = output_path(target)
+            report = output_path(Path(str(target) + ".slim.json"))
+            if target.exists() or report.exists():
+                raise BuildError("瘦身输出或报告已存在，请选择新文件名")
+            options = {}
+            for field, key in (("delete", "deletes"), ("keep", "keeps")):
+                text = data.get(field, "")
+                if len(text) > 8192:
+                    raise BuildError("瘦身规则过长")
+                options[key] = load_patterns([line.strip() for line in text.splitlines()
+                                             if line.strip() and not line.lstrip().startswith("#")])
+            try:
+                level = int(data.get("compress-level", "6"))
+                limit = int(data.get("upload-limit", str(DEFAULT_LIMIT)))
+            except ValueError as exc:
+                raise BuildError("压缩级别和上传限制必须是整数") from exc
+            if not 1 <= level <= 9 or not 0 < limit <= 2 ** 63 - 1:
+                raise BuildError("压缩级别须为 1–9，上传限制须为正字节数")
+            result.update(output=str(target), report=str(report), gzip_output=compressed,
+                          compress_level=level, upload_limit=limit, auto_protect=not bool(data.get("no-auto-protect")),
+                          analyze_only=bool(data.get("analyze-only")), **options)
         if action == "tag":
             new_tag = _required(data, "new-tag")
             _check_tag(new_tag)
