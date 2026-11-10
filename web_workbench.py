@@ -523,6 +523,11 @@ class Workbench:
             content = hidden + '<input type="hidden" name="action" value="{}">'.format(action)
             if action in ("tag", "save", "optimize", "flatten", "rootfs-export", "slim"):
                 content += _path_field("output", "新 tar 输出路径", "/data/images/release.tar", True, mode="output")
+            if action == "compress":
+                content += _path_field("output", "新压缩归档路径", "/data/images/release.tar.gz", True, mode="output")
+                content += '<p class="muted">只压缩原 tar，不合层、不改配置与镜像 ID。填写 .tar 时追加 .gz；另存 .compress.json 校验报告。</p>'
+                content += _select("compress-level", "gzip 压缩级别", tuple(str(n) for n in range(1, 10)), "6")
+                content += _input("upload-limit", "解压后上传限制（字节）", value="2000000000")
             if action == "rootfs-export":
                 content += '<p class="muted">输出只包含合并后的文件系统，可用于 rootfs 导入。</p>'
             if action == "flatten":
@@ -592,6 +597,8 @@ class Workbench:
 
     def submit_delivery(self, plan):
         outputs = [Path(plan["output"])] if "output" in plan else []
+        if plan["action"] == "compress":
+            outputs += [Path(plan["report"])]
         if plan["action"] == "slim":
             outputs = ([] if plan["analyze_only"] else outputs) + [Path(plan["report"])]
         return self.jobs.submit(plan["action"], [json.dumps(plan, ensure_ascii=True)], outputs,

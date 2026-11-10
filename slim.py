@@ -2,24 +2,22 @@
 """无 Docker 瘦身镜像：默认扁平化，显式裁剪、保护、审计及 gzip 压缩。"""
 
 import argparse
-import gzip
 import hashlib
 import json
 import lzma
 import os
-import shutil
 import sys
 import tarfile
 import tempfile
 import zlib
 from pathlib import Path
 
+from archive_compression import gzip_stream
 from cache_identity import file_identity, stat_identity
 from errors import BuildError
 from file_publish import publication_transaction, publish_new_file
 from file_resources import open_regular_file
 from image_reader import sha256_file
-from path_policy import output_path
 from platforms import normalize_platform
 from progress import make_reporter
 from reproducible import parse_epoch
@@ -58,29 +56,8 @@ def _snapshot(source, target):
 
 def _gzip(source, output, level, reporter=None):
     """固定 gzip 头，并从压缩结果重读校验 CRC、长度与未压缩摘要。"""
-    original = hashlib.sha256()
-    total = source.stat().st_size
-    done = 0
-    with source.open("rb") as stream, output.open("xb") as raw:
-        with gzip.GzipFile(filename="", mode="wb", compresslevel=level, fileobj=raw, mtime=0) as target:
-            while True:
-                block = stream.read(BUFFER)
-                if not block:
-                    break
-                original.update(block)
-                target.write(block)
-                done += len(block)
-                if reporter is not None:
-                    reporter.progress(done, total, "Compressing image archive")
-        raw.flush()
-        os.fsync(raw.fileno())
-    verified, count = hashlib.sha256(), 0
-    with gzip.open(output, "rb") as stream:
-        for block in iter(lambda: stream.read(BUFFER), b""):
-            verified.update(block)
-            count += len(block)
-    if count != total or verified.digest() != original.digest():
-        raise BuildError("Compressed image verification failed")
+    with source.open("rb") as stream:
+        return gzip_stream(stream, output, source.stat().st_size, level, reporter)
 
 
 def _default_output(source, compressed):
@@ -174,14 +151,17 @@ def slim_image(source, output=None, *, tag=None, reference=None, platform="linux
                               uncompressed_archive_bytes=raw_archive.stat().st_size)
                 result["under_upload_limit"] = result["uncompressed_archive_bytes"] < upload_limit
                 artifact = raw_archive
+                compressed_details = None
                 if compressed:
                     if reporter is not None:
                         reporter.phase_start("Compress and verify slim archive")
                     artifact = private / "image.tar.gz"
-                    _gzip(raw_archive, artifact, compress_level, reporter)
+                    compressed_details = _gzip(raw_archive, artifact, compress_level, reporter)
                     if reporter is not None:
                         reporter.phase_success()
-                result.update(output=str(destination), sha256="sha256:" + sha256_file(artifact),
+                # gzip 写入时已计算压缩摘要，避免再完整读取同一压缩包。
+                digest = compressed_details["sha256"] if compressed_details else "sha256:" + sha256_file(artifact)
+                result.update(output=str(destination), sha256=digest,
                               after_bytes=artifact.stat().st_size)
                 if before_bytes is not None:
                     result["saved_bytes"] = before_bytes - result["after_bytes"]

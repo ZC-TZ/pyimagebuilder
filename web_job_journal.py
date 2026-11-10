@@ -33,6 +33,8 @@ def form_snapshot(action, data):
 
 
 def task_artifact_suffixes(action):
+    if action == "compress":
+        return (".tar.gz", ".tgz", ".compress.json")
     if action == "slim":
         return (".tar", ".tar.gz", ".tgz", ".slim.json")
     return (".json",) if action == "lock-inputs" else TASK_ARTIFACT_SUFFIXES
@@ -62,7 +64,7 @@ class JobJournal:
         identity = job["id"]
         form = form_snapshot(job["action"], job.get("form", {}))
         item = {"version": 1, "id": identity, "action": job["action"], "state": job["state"],
-                "label": job["label"] if form or job["action"] in ("multiarch", "slim") else "", "form": form,
+                "label": job["label"] if form or job["action"] in ("multiarch", "slim", "compress") else "", "form": form,
                 "updated": datetime.now(timezone.utc).isoformat(timespec="seconds")}
         if "code" in job:
             item["code"] = job["code"]

@@ -23,6 +23,7 @@ from rootfs import RootFSIndex
 from slim import slim_image
 from slim_rules import load_patterns, normalize_pattern, runtime_rules
 import slim
+import archive_compression
 from test_rootfs_commands import tar_at
 
 TAG = "example/slim:1"
@@ -247,7 +248,7 @@ class SlimTests(unittest.TestCase):
 
     def test_gzip_verification_failure_does_not_publish(self):
         target, report = self.root / "invalid.tar.gz", self.root / "report.json"
-        with patch.object(slim.gzip, "open", return_value=io.BytesIO(b"wrong decompressed content")):
+        with patch.object(archive_compression.gzip, "open", return_value=io.BytesIO(b"wrong decompressed content")):
             with self.assertRaisesRegex(BuildError, "Compressed image verification failed"):
                 slim_image(self.source, target, report=report)
         self.assertFalse(target.exists())

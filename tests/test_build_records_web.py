@@ -741,6 +741,50 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(len(persisted["artifacts"]), 2)
         self.assertEqual(archive.read_bytes(), before)
 
+
+    def test_compress_docker_and_oci_downloads_preserve_original_bytes_and_report(self):
+        import gzip
+        for kind in ("docker", "oci"):
+            archive, source = self.built_delivery(kind, "-" + kind)
+            original = archive.read_bytes()
+            menu = self.http("/delivery?" + urlencode(source))[2].decode()
+            self.assertIn('value="compress"', menu)
+            target = self.root / (kind + "-compressed.tar")
+            _, identity = self.run_request("/delivery/prepare", dict(
+                source, action="compress", output=str(target), **{"compress-level": "1", "upload-limit": "1"}))
+            packed = Path(str(target) + ".gz")
+            self.assertFalse(target.exists())
+            self.assertEqual(gzip.decompress(self.http("/download?id=" + identity + "&file=0")[2]), original)
+            report = json.loads(self.http("/download?id=" + identity + "&file=1")[2])
+            self.assertEqual(report["source"], str(archive))
+            self.assertTrue(report["archive_bytes_preserved"])
+            self.assertFalse(report["under_upload_limit"])
+            self.assertEqual(archive.read_bytes(), original)
+            persisted = self.workspace.jobs.journal.read(identity)
+            self.assertEqual(len(persisted["artifacts"]), 2)
+            self.assertEqual(persisted["label"], "hisq_front:1.0.0")
+            self.assertEqual(self.workspace.jobs.snapshot(identity)["metrics"]["uncompressed_archive_bytes"], len(original))
+            self.assertEqual(packed.read_bytes(), self.http("/download?id=" + identity + "&file=0")[2])
+
+    def test_compression_rejects_output_conflicts_invalid_options_and_cas_only_source(self):
+        _, source = self.built_delivery("oci")
+        output = self.root / "compressed.tgz"
+        for extra in ({"output": str(self.root / "wrong.zip")}, {"compress-level": "0"},
+                      {"compress-level": "wrong"}, {"upload-limit": "-1"}):
+            options = dict(source, action="compress", output=str(output))
+            options.update(extra)
+            self.assertEqual(self.http("/delivery/prepare", options)[0], 400)
+        report = Path(str(output) + ".compress.json");report.write_text("existing")
+        self.assertEqual(self.http("/delivery/prepare", dict(source, action="compress", output=str(output)))[0], 400)
+        self.assertEqual(report.read_text(), "existing")
+        self.assertFalse(output.exists())
+        self.run_request("/delivery/prepare", dict(source, action="load"))
+        row, = library_items(self.workspace.settings)["images"]
+        item, = row["delivery_items"]
+        selector = {"scope": "library", "id": item["id"]}
+        self.assertNotIn('value="compress"', self.http("/delivery?" + urlencode(selector))[2].decode())
+        self.assertEqual(self.http("/delivery/prepare", dict(selector, action="compress", output=str(output)))[0], 400)
+
     def test_slim_cas_source_and_invalid_rules(self):
         _, source = self.built_delivery("oci")
         self.run_request("/delivery/prepare", dict(source, action="load"))
@@ -1193,6 +1237,12 @@ class WorkbenchTests(unittest.TestCase):
             self.assertEqual(status, 200, raw)
             tokens[arch + "-upload"] = json.loads(raw)["token"]
         _, multi_job = self.run_job("multiarch", dict(tokens, tag="multi:1", output=str(output), epoch="100"))
+        import gzip
+        compressed = self.root / "multi-compressed.tar.gz"
+        _, compress_job = self.run_request("/delivery/prepare", {
+            "scope": "job", "id": multi_job, "action": "compress", "output": str(compressed)})
+        self.assertEqual(gzip.decompress(self.http("/download?id=" + compress_job + "&file=0")[2]), output.read_bytes())
+        self.assertTrue(json.loads(self.http("/download?id=" + compress_job + "&file=1")[2])["archive_bytes_preserved"])
         self.assertFalse(self.workspace.uploads.entries)
         with tarfile.open(output, "r:") as bundle:
             index = json.load(bundle.extractfile("index.json"))

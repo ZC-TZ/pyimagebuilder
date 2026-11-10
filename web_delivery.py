@@ -26,7 +26,7 @@ DELIVERY_ACTIONS = {"verify": "校验", "load": "导入镜像库", "tag": "改�
                     "push": "推送到 Registry / Harbor", "save": "导出 Docker tar",
                     "history": "镜像层历史", "analyze": "大层与重复文件分析",
                     "optimize": "优化并另存", "flatten": "扁平化并另存", "rootfs-export": "导出 rootfs",
-                    "slim": "裁剪与压缩镜像"}
+                    "slim": "裁剪与压缩镜像", "compress": "仅压缩归档"}
 
 
 def _key(parts):
@@ -108,12 +108,12 @@ class Delivery:
     @staticmethod
     def actions(selected):
         if selected["format"] == "oci-index":
-            return ("verify", "push")
+            return ("verify", "push", "compress")
         if selected["format"] == "cas":
             return ("verify", "save", "history", "analyze", "optimize", "flatten", "rootfs-export", "slim")
         if selected["format"] == "oci":
-            return ("verify", "load", "push", "history", "analyze", "optimize", "flatten", "rootfs-export", "slim")
-        return ("verify", "load", "tag", "push", "history", "analyze", "optimize", "flatten", "rootfs-export", "slim")
+            return ("verify", "load", "push", "history", "analyze", "optimize", "flatten", "rootfs-export", "slim", "compress")
+        return ("verify", "load", "tag", "push", "history", "analyze", "optimize", "flatten", "rootfs-export", "slim", "compress")
 
     def plan(self, data):
         selected = self.select(data)
@@ -139,6 +139,25 @@ class Delivery:
             result["output"] = str(_target(data))
         if action == "flatten":
             result["changes"] = rootfs_changes(data)
+        if action == "compress":
+            from slim_rules import DEFAULT_LIMIT
+            target = _path(path_value(data, "output", required=True))
+            if target.suffix.lower() == ".tar":
+                target = Path(str(target) + ".gz")
+            if not str(target).lower().endswith((".tar.gz", ".tgz")):
+                raise BuildError("仅压缩输出须为 .tar.gz 或 .tgz")
+            target = output_path(target)
+            report = output_path(Path(str(target) + ".compress.json"))
+            if target.exists() or report.exists():
+                raise BuildError("压缩产物或报告已存在，请选择新文件名")
+            try:
+                level = int(data.get("compress-level", "6"))
+                limit = int(data.get("upload-limit", str(DEFAULT_LIMIT)))
+            except ValueError as exc:
+                raise BuildError("压缩级别和上传限制必须是整数") from exc
+            if not 1 <= level <= 9 or not 0 < limit <= 2 ** 63 - 1:
+                raise BuildError("压缩级别须为 1–9，上传限制须为正字节数")
+            result.update(output=str(target), report=str(report), compress_level=level, upload_limit=limit)
         if action == "slim":
             from slim_rules import DEFAULT_LIMIT, load_patterns
             compressed = bool(data.get("gzip"))

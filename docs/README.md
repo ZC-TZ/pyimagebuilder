@@ -17,6 +17,7 @@
 | 排查报错 | [常见问题](guides/TROUBLESHOOTING.md) | 按现象定位和处理 |
 | 定位打包为什么慢 | [性能排查](guides/PERFORMANCE.md) | 首次下载/本地复用、并发进度、磁盘与缓存耗时 |
 | 使用 RUN、WSL、签名或封闭构建 | [进阶构建](guides/ADVANCED.md) | 环境要求、参数和验收边界 |
+| 只压缩原 tar、保留镜像身份 | [仅压缩 tar](guides/COMPRESSION.md) | compress、gzip 校验、多标签/多平台归档与 Web |
 | 裁剪已构建镜像、压缩并审计 | [镜像裁剪与压缩](guides/SLIM.md) | slim、保护规则、预览、gzip、上传大小与独立入口 |
 | 导入/导出 rootfs 或合并为一层 | [rootfs 与扁平化](ROOTFS_COMMANDS.md) | export、import、--change、flatten 与运行配置 |
 

@@ -5,6 +5,9 @@ import unicodedata
 
 
 PHASE_NAMES = {
+    "Compressing image archive": "压缩镜像归档", "Verifying gzip archive": "回读校验压缩归档",
+    "Check compression input": "检查原始 tar 结构",
+    "Compress and verify original archive": "压缩并核对原始归档",
     "Snapshot slim input": "准备瘦身输入快照", "Plan image slimming": "分析删除与保护计划",
     "Write slim rootfs": "写出瘦身文件树", "Compress and verify slim archive": "压缩并校验镜像归档",
     "Resolving base image": "准备基础镜像", "Resolving base images": "准备基础镜像",

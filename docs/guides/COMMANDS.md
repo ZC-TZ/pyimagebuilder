@@ -43,10 +43,13 @@
 | `python main.py export archive.tar -o rootfs.tar` | 导出最终可见文件树，不带运行配置 |
 | `python main.py import rootfs.tar company/app:1 -o image.tar --change 'CMD ["/app/start.sh"]'` | 从文件系统生成新镜像，并设置配置 |
 | `python main.py flatten archive.tar -t company/app:flat -o flat.tar` | 合并为单层，默认保留运行配置 |
+| `python main.py compress archive.tar -o archive.tar.gz --compress-level 1` | 仅压缩原 tar，解码后字节一致，保留镜像身份 |
 | `python main.py slim archive.tar -o slim.tar.gz --gzip --report slim.json` | 合并、可选裁剪文件、压缩并审计；默认不主动删除文件 |
 | `python main.py slim archive.tar --analyze-only --delete '/usr/share/doc' --report plan.json` | 预览裁剪与保护决定，不写镜像 |
 
 一般镜像交付用 **save**；希望现有镜像合并为单层用 **flatten**。export 的 rootfs.tar 不能直接 docker load。import 从空运行配置开始，flatten 则继承配置。完整参数、stdin/stdout 和 `--change` 支持范围见 [rootfs 指南](../ROOTFS_COMMANDS.md)。
+
+只需缩小传输包且保留原始层、标签和 ImageID 时用 [compress](COMPRESSION.md)。它只接受已有未压缩 tar；不自动导出 CAS 或转换镜像格式。
 
 slim 支持显式 delete/keep、规则文件及内置保护，gzip 后仍按未压缩 tar 判断上传大小；使用前看[裁剪与压缩指南](SLIM.md)。它会产生派生镜像，不能当成原样转存。
 
@@ -86,6 +89,7 @@ slim 支持显式 delete/keep、规则文件及内置保护，gzip 后仍按未�
 | --- | --- |
 | `python fast.py ...` | 参数与 main.py fast 后面的参数一致 |
 | `python rootfs_archive.py export/import/flatten ...` | 文件系统处理和扁平化 |
+| `python compress.py ...` | 参数与 main.py compress 一致，仅压缩原 tar |
 | `python slim.py ...` / `python shrink_docker_archive.py ...` | 参数与 main.py slim 一致；需与项目模块一起分发 |
 | `python image_cli.py --help` | 镜像检查、存储、缓存和 Registry 管理命令 |
 | `python registry.py --help` | 独立标准 Registry 客户端 |

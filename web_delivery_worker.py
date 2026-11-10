@@ -142,14 +142,14 @@ def execute(plan):
         workspace = Path(temporary)
         snapshot = workspace / "source.tar"
         size = _snapshot_archive(plan, source, snapshot)
-        if plan["format"] == "oci-index":
+        if plan["format"] == "oci-index" and action != "compress":
             return _deliver_index(plan, settings, snapshot)
         result = _deliver_archive(plan, settings, store, snapshot, size, workspace)
         if result.get("archive") == str(snapshot):
             result["archive"] = str(source)
         if "output" in plan and not (plan["action"] == "slim" and plan["analyze_only"]):
             published.append(Path(plan["output"]))
-        if plan["action"] == "slim":
+        if plan["action"] in ("slim", "compress"):
             published.append(Path(plan["report"]))
         return result
 
@@ -192,6 +192,8 @@ def _deliver_cas(plan, settings, store):
 def _deliver_archive(plan, settings, store, path, size, workspace):
     action, tag, platform = plan["action"], plan["tag"], plan["platform"]
     is_oci = plan["format"] == "oci"
+    if action == "compress":
+        return _compress(plan, path)
     if action == "slim":
         return _slim(plan, path, tag=tag)
     if action == "verify":
@@ -255,6 +257,28 @@ def _deliver_archive(plan, settings, store, path, size, workspace):
                       **tls_options(connection.get("verifyTls", True)))
         return {"reference": destination, "digest": digest}
     raise BuildError("该归档不支持所选操作")
+
+
+def _compress(plan, source):
+    """压缩已经验证来源摘要的私有快照，记录原路径，报告与归档共同回滚。"""
+    from compress import compress_archive
+    from progress import make_reporter
+    reporter = make_reporter("json", stream=sys.stdout)
+    try:
+        with publication_transaction() as published:
+            reporter.start(plan["tag"], plan["platform"], mode="compress")
+            result = compress_archive(source, plan["output"], compress_level=plan["compress_level"],
+                                      upload_limit=plan["upload_limit"], report=plan["report"],
+                                      reporter=reporter, source_label=plan["archive"])
+            for key in ("output", "report"):
+                published.append(Path(result[key]))
+            reporter.success(output=result["output"], size=result["after_bytes"])
+        return result
+    except BaseException as exc:
+        reporter.fail(exc)
+        raise
+    finally:
+        reporter.close()
 
 
 def _slim(plan, source, **kwargs):
