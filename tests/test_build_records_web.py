@@ -211,6 +211,41 @@ class WorkbenchTests(unittest.TestCase):
         self.assertIn(b"sample:1", self.http("/jobs-fragment?state=success")[2])
         self.assertGreaterEqual(jobs.journal.read(identity)["elapsed"], 65)
 
+    def test_job_log_empty_state_is_separate_from_log_rows(self):
+        jobs = self.workspace.jobs
+        with jobs.condition:
+            identity = jobs.submit("build", [], [], "sample:1")
+            jobs.queue.remove(identity)
+            job = jobs.jobs[identity]
+            job["state"] = "running"
+        route = "/job?id=" + identity
+
+        def page():
+            status, _, raw = self.http(route)
+            self.assertEqual(status, 200)
+            return raw.decode("utf-8")
+
+        waiting = page()
+        self.assertRegex(waiting, r'<p id="job-log-empty"[^>]*data-waiting="1">等待输出…</p>')
+        self.assertRegex(waiting, r'<pre id="job-output"[^>]* hidden></pre>')
+        self.assertIn('id="job-export" hidden', waiting)
+        self.assertRegex(waiting, r'<div id="job-log-legend"[^>]* hidden>')
+        progress = json.loads(self.http("/job-progress?id=" + identity + "&after=0")[2])
+        self.assertEqual(progress["lines"], [])
+
+        with jobs.condition:
+            job.update(state="success", status="Done", code=0)
+        finished = page()
+        self.assertRegex(finished, r'<p id="job-log-empty"[^>]*data-waiting="0">此任务暂无日志。</p>')
+        self.assertRegex(finished, r'<pre id="job-output"[^>]* hidden></pre>')
+
+        with jobs.condition:
+            jobs._append_log(job, "first output")
+        with_output = page()
+        self.assertRegex(with_output, r'<p id="job-log-empty"[^>]* hidden>')
+        self.assertRegex(with_output, r'<pre id="job-output"[^>]*data-running="0"><span[^>]*>first output</span>')
+        self.assertNotIn('id="job-export" hidden', with_output)
+
     def test_job_progress_returns_only_new_lines_even_after_log_rotation(self):
         jobs = self.workspace.jobs
         with jobs.condition:

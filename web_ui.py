@@ -147,7 +147,6 @@ li+li{margin-top:6px}
 .state[data-state=running]::before{content:"";width:12px;height:12px;flex:none;box-sizing:border-box;
   border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:job-spin .85s linear infinite}
 @keyframes job-spin{to{transform:rotate(1turn)}}
-@media(prefers-reduced-motion:reduce){.state[data-state=running]::before{animation:none}}
 .state[data-state=queued],.state[data-state=unverified]{background:#fff2de;color:#795018}
 .state[data-state=cancelled],.state[data-state=missing],.state[data-state=unknown],.state[data-state=unreadable]{background:#edf0f5;color:#4d5d73}
 .meta{display:flex;gap:4px 13px;flex-wrap:wrap;font-size:13px;overflow-wrap:anywhere}
@@ -199,8 +198,12 @@ pre{font:12px/1.6 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere;backgr
 .pull-flow .flow-active{color:#224f9d;font-weight:700}.flow-stopped .flow-dot{background:#fbe7eb;color:#a43c54}
 .flow-metrics{display:flex;gap:10px 23px;flex-wrap:wrap;padding-top:12px;border-top:1px solid #e8edf5;color:var(--muted);font-size:11px}
 .flow-metrics strong{color:#263a55;margin:0 6px;font:600 13px var(--mono)}
-#job-output:empty::before{content:"此任务暂无日志。"}
-#job-output[data-running="1"]:empty::before{content:"等待输出…"}
+.log-empty{display:flex;align-items:center;gap:10px;min-height:76px;margin:0;padding:15px 17px;
+  background:#101b2d;color:#d0dbea;font-size:13px}
+.log-empty[data-waiting="1"]::before{content:"";width:13px;height:13px;flex:none;color:#a5c9ff;
+  border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:job-spin .85s linear infinite}
+@media(prefers-reduced-motion:reduce){.state[data-state=running]::before,
+  .log-empty[data-waiting="1"]::before{animation:none}}
 .tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
 .operation-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 .tile-value{font-size:24px;letter-spacing:-.035em;font-weight:750}.tile-path{display:block;margin-top:6px}

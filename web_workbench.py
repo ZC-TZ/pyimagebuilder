@@ -131,6 +131,8 @@ JOB_SCRIPT = r"""
   if (!output) return;
   const latest = document.getElementById('job-latest');
   const follow = document.getElementById('job-follow');
+  const empty = document.getElementById('job-log-empty');
+  const legend = document.getElementById('job-log-legend');
   const details = document.getElementById('job-details');
   const status = document.getElementById('job-status');
   const flow = document.getElementById('job-flow');
@@ -156,7 +158,18 @@ JOB_SCRIPT = r"""
   function atBottom() {
     return output.scrollHeight - output.clientHeight - output.scrollTop <= 2;
   }
-  latest.hidden = false;
+  function syncLogPanel(running, archived = false) {
+    const hasLines = output.childElementCount > 0;
+    output.hidden = !hasLines;
+    empty.hidden = hasLines;
+    follow.hidden = legend.hidden = latest.hidden = !hasLines;
+    exportLog.hidden = archived || !hasLines;
+    output.dataset.running = running ? '1' : '0';
+    empty.dataset.waiting = output.dataset.running;
+    const message = running ? '等待输出…' : '此任务暂无日志。';
+    if (empty.textContent !== message) empty.textContent = message;
+  }
+
   latest.addEventListener('click', jump);
   output.addEventListener('scroll', () => {
     if (resizing) return;
@@ -171,7 +184,8 @@ JOB_SCRIPT = r"""
       resizing = false;
     });
   });
-  jump();
+  syncLogPanel(output.dataset.running === '1');
+  if (!output.hidden) jump();
 
   async function poll() {
     let again = true;
@@ -181,7 +195,7 @@ JOB_SCRIPT = r"""
       const response = await fetch(output.dataset.url + '&after=' + after, {signal: request.signal});
       if (response.status === 404) {
         again = false;
-        output.dataset.running = '0';
+        syncLogPanel(false);
         pollStatus.textContent = '此任务已不在当前会话，已停止更新。';
         pollStatus.hidden = false;
         return;
@@ -197,11 +211,12 @@ JOB_SCRIPT = r"""
         flow.innerHTML = next.flow;
         flowHTML = next.flow;
       }
+      let keepTop = null;
       if (!next.archived && next.end !== after) {
         following = atBottom();
         const top = output.scrollTop;
         const removed = Math.max(0, next.start - first);
-        let keepTop = top;
+        keepTop = top;
         // 日志窗口淘汰旧行时，扣掉实际高度，保留仍在窗口内的阅读位置。
         if (!following && removed) {
           const retained = output.children[removed];
@@ -230,15 +245,16 @@ JOB_SCRIPT = r"""
           omitted.textContent = String(first);
           omitted.parentElement.hidden = false;
         }
+      }
+      again = next.running;
+      syncLogPanel(again, next.archived);
+      if (keepTop !== null) {
         if (following) jump();
         else {
           output.scrollTop = keepTop;
           showFollow();
         }
       }
-      exportLog.hidden = next.archived || !output.childElementCount;
-      again = next.running;
-      if (!again) output.dataset.running = '0';
       pollStatus.hidden = true;
     } catch (error) {
       pollStatus.textContent = '暂时无法更新日志，正在重试…';
@@ -922,20 +938,27 @@ class Workbench:
             query = urlencode({"id": job["id"]})
             lines = log_lines(job)
             omitted = job["log_end"] - len(job["logs"])
+            hide_without_logs = "" if lines else " hidden"
             content += ('<article class="log-panel"><header class="log-toolbar"><div><h2>任务日志</h2>'
-                        '<small id="job-follow" role="status"></small><div class="log-legend" aria-label="日志类型">'
+                        '<small id="job-follow" role="status" hidden></small>'
+                        '<div id="job-log-legend" class="log-legend" aria-label="日志类型"{hide_without_logs}>'
                         '<span class="legend-stage">阶段</span><span class="legend-success">完成</span>'
                         '<span class="legend-cache">缓存</span><span class="legend-error">失败</span></div></div>'
                         '<div class="actions log-actions">'
                         '<button type="button" class="secondary" id="job-latest" hidden>跳到最新</button>'
-                        '<a id="job-export"{5} class="button compact" href="{0}/job-log?{1}">导出当前日志</a></div></header>'
-                        '<pre id="job-output" tabindex="0" aria-label="任务日志" data-url="{0}/job-progress?{1}" '
-                        'data-after="{2}" data-running="{3}">{4}</pre>'
+                        '<a id="job-export"{hide_without_logs} class="button compact" href="{base}/job-log?{query}">'
+                        '导出当前日志</a></div></header>'
+                        '<p id="job-log-empty" class="log-empty" role="status" data-waiting="{running}"{hide_with_logs}>'
+                        '{empty_message}</p>'
+                        '<pre id="job-output" tabindex="0" aria-label="任务日志" data-url="{base}/job-progress?{query}" '
+                        'data-after="{after}" data-running="{running}"{hide_without_logs}>{lines}</pre>'
                         '<footer class="log-notes"><p class="muted" id="job-poll-status" role="status" hidden></p>'
-                        '<p class="muted"{6}>前 <span id="job-log-omitted">{7}</span> 条日志已移出窗口。</p>'
+                        '<p class="muted"{hide_omitted}>前 <span id="job-log-omitted">{omitted}</span> 条日志已移出窗口。</p>'
                         '<small>分享日志前请检查命令输出。</small></footer>').format(
-                            self.prefix, query, job["log_end"], int(running), lines, "" if lines else " hidden",
-                            "" if omitted else " hidden", omitted)
+                            base=self.prefix, query=query, after=job["log_end"], running=int(running), lines=lines,
+                            empty_message="等待输出…" if running else "此任务暂无日志。",
+                            hide_without_logs=hide_without_logs, hide_with_logs=" hidden" if lines else "",
+                            hide_omitted="" if omitted else " hidden", omitted=omitted)
             if running:
                 content += '<noscript><p><a href="{}/job?{}">刷新任务状态和日志</a></p></noscript>'.format(self.prefix, query)
             content += "</article>"
