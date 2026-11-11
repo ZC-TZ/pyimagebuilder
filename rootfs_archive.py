@@ -403,7 +403,7 @@ def flatten_image(source, output, reference=None, tag=None, platform="linux/amd6
             result = {"operation": "flatten", "tag": output_tag, "output": str(destination),
                       "format": format, "files": files, "before_layers": len(image.layers), "layers": 1,
                       "source_image_id": image.config_digest, "image_id": _config_digest(partial, format),
-                      "sha256": digest}
+                      "sha256": digest, "after_bytes": partial.stat().st_size}
             publish_new_file(partial, destination)
             published.append(destination)
             return result

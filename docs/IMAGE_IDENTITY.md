@@ -80,7 +80,7 @@ CAS 的统一 ref 发布入口在落盘 blob 与 ref 之间核对 manifest/confi
 | `artifactory_download.py` | config blob 复制原字节；CAS 路径保存原始远端 manifest | Docker save 外层 manifest/repositories、旧式层 json；这些不是远端 OCI manifest |
 | `cas_store.py` | 原始 config/manifest 入库；Docker 导出强制使用原始配置 | Docker archive 本来没有 OCI manifest，导入时合成一个；本地 ref 元数据 |
 | `image_store.py` | 镜像复用检查实际 config digest；类型和层均一致的旧 tar 可从 CAS 修复 | base-map 本地路径映射；修复只替换 tar，保留 CAS 身份 |
-| `image_cli.py` load/save/tag | config 和已有层保持原字节，inspect 使用真实 digest | 改标签重写 Docker save 外层引用；CLI 报告 |
+| `image_cli.py` load/save/tag | config 和已有层保持原字节，inspect 使用真实 digest | 改标签仅重写 Docker save 外层引用，复核暂存归档与原 config 摘要后排他发布 |
 | `builder.py` / `image_config.py` / `fast.py` | FROM 原始身份随阶段传递；Fast 使用同一 builder | 实际 Dockerfile 变化；Fast 配置文件、SBOM/provenance 等新产物 |
 | `image_writer.py` | 转存 config 强制保留；层 tar 不重新打包 | Docker save manifest/repositories/旧式层 metadata、派生配置 |
 | `oci_writer.py` | 转存 config 保留；已有 manifest 最终不变时保留 | 新布局 index、派生 manifest/config；模板保留扩展信息但不冒充旧 digest |

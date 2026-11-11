@@ -133,6 +133,7 @@ class RootfsCommandTests(unittest.TestCase):
             for number in range(2):
                 output = root / ("flat-{}.tar".format(number))
                 result = flatten_image(source, output)
+                self.assertEqual(result["after_bytes"], output.stat().st_size)
                 image, index = read_image(output, root)
                 self.assertEqual(image.config["config"], config["config"])
                 self.assertEqual(image.config["x-company"], config["x-company"])

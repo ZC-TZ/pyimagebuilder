@@ -651,7 +651,7 @@ class CASStore:
             archive_tag = docker_archive_tag(reference)
             # 在排他创建成功后登记路径，临时解码目录清理失败也能撤销本次输出。
             with open(output, "xb") as sink:
-                published.append(output)
+                published.track_exclusive(output, sink)
                 image = BaseImage(config, layers, [archive_tag], {}, value["config"], config_raw)
                 writer.write_image(output, image, archive_tag, fileobj=sink)
             writer.verify(output, archive_tag)

@@ -104,7 +104,7 @@ def _archive_source(path):
         yield stream
         if (stat_identity(os.fstat(stream.fileno())) != initial or
                 file_identity(path, content=False) != stamp):
-            raise ArchiveError("Source archive changed during optimization or analysis")
+            raise ArchiveError("Source archive changed while reading")
 
 
 def _load_image(path, stream, workspace, tag, platform):

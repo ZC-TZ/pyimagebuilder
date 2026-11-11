@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -10,14 +11,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import image_cli
 import optimizer
 import web_delivery_worker as worker
 from cas_store import CASStore
+from file_publish import publication_transaction
 from errors import ArchiveError, BaseImageNotFound
 from image_reader import DigestReader
 from image_writer import ImageArchiveWriter
 from oci_writer import OCIImageWriter
-from test_image_identity_contract import TAG, add_bytes, fixture
+from test_image_identity_contract import TAG, add_bytes, fixture, payloads
 from test_optimizer_links import image as make_image, TAG as LAYER_TAG
 
 
@@ -181,10 +184,13 @@ class OptimizerAuditTests(unittest.TestCase):
             finally:
                 depth -= 1
 
-        with patch.object(CASStore, "ref_lock", fail_outer_release), contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(OSError, "CAS lock release"):
-                worker._deliver_cas(plan, {}, root)
-        self.assertFalse(output.exists())
+        for action in ("optimize", "save"):
+            with self.subTest(action=action), patch.object(CASStore, "ref_lock", fail_outer_release), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(OSError, "CAS lock release"):
+                    worker._deliver_cas(dict(plan, action=action), {}, root)
+            self.assertFalse(output.exists())
+            self.assertEqual(store.resolve(TAG, "linux/amd64", "local")["manifest"], manifest)
 
     def test_cli_and_web_broken_result_pipe_roll_back_completed_optimization(self):
         source, _, _ = fixture(self.root)
@@ -211,3 +217,97 @@ class OptimizerAuditTests(unittest.TestCase):
         with self.assertRaisesRegex(ArchiveError, "platform does not match"):
             optimizer.optimize_image(source, output, platform="linux/amd64")
         self.assertFalse(output.exists())
+
+    def test_retag_verifies_staged_output_without_replacing_competing_file(self):
+        source, _, _ = fixture(self.root)
+        output = self.root / "tagged.tar"
+        read = image_cli._read
+
+        def competing_writer(path, tag, platform):
+            self.assertNotEqual(path, output)
+            self.assertFalse(output.exists())
+            result = read(path, tag, platform)
+            output.write_bytes(b"other writer")
+            return result
+
+        with patch.object(image_cli, "_read", side_effect=competing_writer):
+            with self.assertRaises(FileExistsError):
+                image_cli.tag_archive(source, "example/retag:2", output)
+        self.assertEqual(output.read_bytes(), b"other writer")
+
+    def test_retag_rejects_valid_output_with_different_config(self):
+        source, _, _ = fixture(self.root)
+        other, _, _ = fixture(self.root, arch="arm64")
+        replacement = self.root / "replacement.tar"
+        output = self.root / "tagged.tar"
+        tag = "example/retag:2"
+        image_cli.tag_archive(other, tag, replacement)
+
+        with patch.object(image_cli, "_write_retagged",
+                          side_effect=lambda _, staged, *args: shutil.copyfile(replacement, staged)):
+            with self.assertRaisesRegex(ArchiveError, "original config bytes"):
+                image_cli.tag_archive(source, tag, output)
+        self.assertFalse(output.exists())
+
+    def test_retag_updates_manifest_with_explicit_pax_size(self):
+        source, _, raw_config = fixture(self.root)
+        legacy = self.root / "legacy.tar"
+        with tarfile.open(legacy, "w", format=tarfile.PAX_FORMAT) as archive:
+            for name, raw in members(source).items():
+                member = tarfile.TarInfo(name)
+                member.size = len(raw)
+                if name in ("manifest.json", "repositories"):
+                    member.pax_headers["size"] = str(member.size)
+                archive.addfile(member, io.BytesIO(raw))
+        output = self.root / "tagged.tar"
+        tag = "example/a-much-longer-retag:2"
+        image_cli.tag_archive(legacy, tag, output)
+        result = members(output)
+        self.assertEqual(json.loads(result["manifest.json"])[0]["RepoTags"], [tag])
+        self.assertIn("example/a-much-longer-retag", json.loads(result["repositories"]))
+        self.assertEqual(payloads(output)[0], raw_config)
+
+    def test_web_broken_result_pipe_reclaims_compression_archive_and_report(self):
+        source, _, _ = fixture(self.root)
+        output = self.root / "compressed.tar.gz"
+        report = self.root / "report.json"
+        plan = {"action": "compress", "format": "docker", "archive": str(source),
+                "tag": TAG, "platform": "linux/amd64", "stamp": worker.file_stamp(source.stat()),
+                "output": str(output), "report": str(report), "compress_level": 1, "upload_limit": 1000000}
+
+        def fail_summary(message, **kwargs):
+            if message.startswith("{\n"):
+                self.assertTrue(output.is_file())
+                self.assertTrue(report.is_file())
+                raise BrokenPipeError("result pipe closed")
+
+        with patch.object(sys, "argv", ["worker", json.dumps(plan)]), \
+                patch.object(worker, "print", side_effect=fail_summary, create=True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(worker.main(), 1)
+        self.assertFalse(output.exists())
+        self.assertFalse(report.exists())
+        self.assertTrue(source.is_file())
+
+    def test_outer_rollback_preserves_replacement_and_unobserved_file(self):
+        output = self.root / "output.tar"
+        replacement = self.root / "replacement.tar"
+        existing = self.root / "existing.tar"
+        owned = self.root / "owned.tar"
+        replacement.write_bytes(b"replacement")
+        existing.write_bytes(b"existing")
+        with self.assertRaisesRegex(OSError, "outer rollback"):
+            with publication_transaction() as outer:
+                with publication_transaction() as inner, output.open("xb") as stream:
+                    inner.track_exclusive(output, stream)
+                    stream.write(b"initial")
+                with publication_transaction() as inner, owned.open("xb") as stream:
+                    inner.track_exclusive(owned, stream)
+                replacement.replace(output)
+                outer.track_observed(output)
+                outer.track_observed(existing)
+                outer.track_observed(owned)
+                raise OSError("outer rollback")
+        self.assertEqual(output.read_bytes(), b"replacement")
+        self.assertEqual(existing.read_bytes(), b"existing")
+        self.assertFalse(owned.exists())

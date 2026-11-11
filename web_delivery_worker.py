@@ -91,6 +91,14 @@ def _deliver_index(plan, settings, snapshot):
     return {"reference": destination, "digest": result, "platforms": ["linux/amd64", "linux/arm64"]}
 
 
+def _track_delivery_outputs(published, result):
+    """外层事务只回收实际登记过的新归档和报告。"""
+    for key in ("output", "report"):
+        path = result.get(key)
+        if path and path != "-":
+            published.track_observed(path)
+
+
 def execute(plan):
     action = plan["action"]
     if action == "lock-inputs":
@@ -147,10 +155,7 @@ def execute(plan):
         result = _deliver_archive(plan, settings, store, snapshot, size, workspace)
         if result.get("archive") == str(snapshot):
             result["archive"] = str(source)
-        if "output" in plan and not (plan["action"] == "slim" and plan["analyze_only"]):
-            published.append(Path(plan["output"]))
-        if plan["action"] in ("slim", "compress"):
-            published.append(Path(plan["report"]))
+        _track_delivery_outputs(published, result)
         return result
 
 
@@ -172,24 +177,26 @@ def _deliver_cas(plan, settings, store):
                     "manifest": reference["manifest"], "layers": len(reference["layers"])}
         if action == "save":
             output = cas.export_docker(tag, plan["output"], platform, source)
-            return {"tag": tag, "platform": platform, "source": source, "output": str(output)}
-        if action == "rootfs-export":
-            return export_rootfs(tag, plan["output"], platform=platform, store=root, kind=source, stored=True)
-        if action == "flatten":
-            return flatten_image(tag, plan["output"], platform=platform, store=root, kind=source,
-                                 changes=plan["changes"], stored=True)
-        if action == "slim":
-            return _slim(plan, tag, store=root, kind=source, stored=True)
-        if action in ("history", "analyze", "optimize"):
+            result = {"tag": tag, "platform": platform, "source": source, "output": str(output)}
+        elif action == "rootfs-export":
+            result = export_rootfs(tag, plan["output"], platform=platform, store=root, kind=source, stored=True)
+        elif action == "flatten":
+            result = flatten_image(tag, plan["output"], platform=platform, store=root, kind=source,
+                                   changes=plan["changes"], stored=True)
+        elif action == "slim":
+            result = _slim(plan, tag, store=root, kind=source, stored=True)
+        elif action in ("history", "analyze", "optimize"):
             with tempfile.TemporaryDirectory(prefix="pyimagebuilder-delivery-cas-") as temporary:
                 workspace = Path(temporary)
                 archive = cas.export_docker(tag, workspace / "source.tar", platform, source)
                 result = _deliver_archive(dict(plan, format="docker", tag=docker_archive_tag(tag)),
                                           settings, store, archive, archive.stat().st_size, workspace)
-                if action == "optimize":
-                    published.append(Path(result["output"]))
+                _track_delivery_outputs(published, result)
                 return result
-    raise BuildError("仅有 CAS 数据的镜像请先导出归档")
+        else:
+            raise BuildError("仅有 CAS 数据的镜像请先导出归档")
+        _track_delivery_outputs(published, result)
+        return result
 
 
 def _deliver_archive(plan, settings, store, path, size, workspace):
@@ -224,7 +231,7 @@ def _deliver_archive(plan, settings, store, path, size, workspace):
     if action == "flatten":
         result = flatten_image(path, plan["output"], tag=tag, platform=platform,
                                format="oci" if is_oci else "docker", changes=plan["changes"])
-        result.update(before_bytes=size, after_bytes=Path(plan["output"]).stat().st_size)
+        result["before_bytes"] = size
         result["saved_bytes"] = result["before_bytes"] - result["after_bytes"]
         return result
     if action == "load":
@@ -233,9 +240,7 @@ def _deliver_archive(plan, settings, store, path, size, workspace):
             return CASStore(store or default_store()).import_oci(path, tag, platform, "local")
         return load_archive(path, store, tag, platform)
     if action == "tag" and not is_oci:
-        # 当前改标签仅支持单镜像 Docker tar；先核对用户选中的平台。
-        verify_archive(path, tag, platform)
-        return tag_archive(path, plan["new_tag"], plan["output"], tag)
+        return tag_archive(path, plan["new_tag"], plan["output"], tag, platform=platform)
     if action == "push":
         destination = push_destination(settings, plan["destination"])
         connection = repository_settings(settings, destination)
@@ -268,7 +273,7 @@ def _optimize(plan, source):
             reporter.start(plan["tag"], plan["platform"], mode="optimize")
             result = optimize_image(source, plan["output"], plan["tag"], reporter=reporter,
                                     platform=plan["platform"])
-            published.append(Path(result["output"]))
+            _track_delivery_outputs(published, result)
             reporter.success(output=result["output"], size=result["after_bytes"])
         return result
     except BaseException as exc:
@@ -289,8 +294,7 @@ def _compress(plan, source):
             result = compress_archive(source, plan["output"], compress_level=plan["compress_level"],
                                       upload_limit=plan["upload_limit"], report=plan["report"],
                                       reporter=reporter, source_label=plan["archive"])
-            for key in ("output", "report"):
-                published.append(Path(result[key]))
+            _track_delivery_outputs(published, result)
             reporter.success(output=result["output"], size=result["after_bytes"])
         return result
     except BaseException as exc:
@@ -312,9 +316,7 @@ def _slim(plan, source, **kwargs):
         with publication_transaction() as published:
             result = slim_image(source, plan["output"], platform=plan["platform"], reporter=reporter,
                                 **options, **kwargs)
-            for key in ("output", "report"):
-                if result.get(key):
-                    published.append(Path(result[key]))
+            _track_delivery_outputs(published, result)
             decision = result.pop("decision")
             result.update(removed_paths=len(decision["removed_paths"]),
                           protected_paths=len(decision["protected_paths"]),
@@ -335,8 +337,7 @@ def main():
         plan = json.loads(sys.argv[1])
         with publication_transaction() as published:
             result = execute(plan)
-            if plan["action"] == "optimize":
-                published.append(Path(result["output"]))
+            _track_delivery_outputs(published, result)
             metrics = {key: result[key] for key in ("before_bytes", "after_bytes", "saved_bytes",
                        "uncompressed_archive_bytes", "upload_limit", "removed_paths", "protected_paths", "removed_unique_bytes",
                        "archive_bytes", "hidden_file_bytes", "duplicate_groups", "deleted", "bytes")

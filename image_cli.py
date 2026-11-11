@@ -23,15 +23,18 @@ from image_reader import (MAX_JSON, ImageArchiveReader, archive_members, docker_
                           image_history, outer_name, sha256_file)
 from image_store import (_archive_path, _check_archive_platform, copy_image_archive,
                          default_store, locate_archive)
-from optimizer import audit_cache, cache_files, prune_cache
+from optimizer import _archive_source, audit_cache, cache_files, prune_cache
+from file_publish import publication_transaction, publish_new_file
 from registry import RegistryClient, push
 from settings import cache_directory, load_settings, repository_settings
 from network_tls import tls_options
 
 
-def _manifest(archive):
+def _manifest(archive, *, fileobj=None):
     try:
-        with tarfile.open(archive, "r:*") as source:
+        if fileobj is not None:
+            fileobj.seek(0)
+        with tarfile.open(archive, "r:*", fileobj=fileobj) as source:
             member = archive_members(source)["manifest.json"]
             if not member.isfile() or member.size > MAX_JSON:
                 raise ArchiveError("Missing or oversized manifest.json")
@@ -46,9 +49,10 @@ def _manifest(archive):
         raise ArchiveError("Cannot read Docker archive: " + str(exc)) from exc
 
 
-def _select_tag(archive, tag=None):
+def _select_tag(archive, tag=None, *, manifest=None):
     """选取精确标签；同一标签的平台选择交给完整归档读取器。"""
-    manifest = _manifest(archive)
+    if manifest is None:
+        manifest = _manifest(archive)
     if tag is None:
         tags = {value for item in manifest for value in (item.get("RepoTags") or [])}
         if len(tags) != 1:
@@ -389,51 +393,63 @@ def _check_tag(tag):
         raise BuildError("Invalid new image reference")
 
 
-def tag_archive(archive, new_tag, output, source_tag=None):
-    """生成替换标签后的单镜像 Docker tar，保留输入归档。"""
+def _write_retagged(source, output, entry, new_tag):
+    """保留原成员和层，只重写 Docker save 的两个外层索引。"""
+    manifest = [{**entry, "RepoTags": [new_tag]}]
+    repository, version = new_tag.rsplit(":", 1)
+    top = entry["Layers"][-1].split("/", 1)[0] if entry["Layers"] else remove_suffix(entry["Config"], ".json")
+    replacements = {"manifest.json": json.dumps(manifest, separators=(",", ":")).encode(),
+                    "repositories": json.dumps({repository: {version: top}}, separators=(",", ":")).encode()}
+    source.seek(0)
+    with tarfile.open(fileobj=source, mode="r:*") as original, \
+            tarfile.open(output, "w", format=tarfile.PAX_FORMAT) as target:
+        seen = set()
+        for member in original:
+            name = outer_name(member.name)
+            if name in seen:
+                raise ArchiveError("Duplicate archive member")
+            seen.add(name)
+            if name in replacements:
+                raw = replacements.pop(name)
+                member.size = len(raw)
+                # 显式的 PAX size 会覆盖 tar 头里的大小，改写内容后必须清除旧值。
+                member.pax_headers.pop("size", None)
+                target.addfile(member, io.BytesIO(raw))
+            elif member.isfile():
+                with original.extractfile(member) as payload:
+                    target.addfile(member, payload)
+            else:
+                target.addfile(member)
+        for name, raw in replacements.items():
+            member = tarfile.TarInfo(name)
+            member.size = len(raw)
+            target.addfile(member, io.BytesIO(raw))
+
+
+def tag_archive(archive, new_tag, output, source_tag=None, *, platform=None):
+    """从同一已验证来源改标签，校验配置身份后排他发布。"""
     _check_tag(new_tag)
     archive, output = Path(archive).resolve(), output_path(output)
     if output.exists() or output == archive:
         raise BuildError("Tag output must be a new, distinct file")
     if output.suffix.lower() != ".tar":
         raise BuildError("Tag output must end in .tar")
-    # 改写标签前先验证源归档，避免畸形 manifest 触发未处理异常
-    # 或被复制成新的无效归档。
-    selected, entry, _, _, _ = _read(archive, source_tag)
-    if len(_manifest(archive)) != 1:
-        raise BuildError("Retag currently requires a single-image Docker archive")
-    manifest = [{**entry, "RepoTags": [new_tag]}]
-    repository, version = new_tag.rsplit(":", 1)
-    top = entry["Layers"][-1].split("/", 1)[0] if entry["Layers"] else remove_suffix(entry["Config"], ".json")
-    replacements = {"manifest.json": json.dumps(manifest, separators=(",", ":")).encode(),
-                    "repositories": json.dumps({repository: {version: top}}, separators=(",", ":")).encode()}
-    created = False
-    try:
-        with tarfile.open(archive, "r:*") as source:
-            with open(output, "xb") as sink:
-                created = True
-                with tarfile.open(fileobj=sink, mode="w", format=tarfile.PAX_FORMAT) as target:
-                    seen = set()
-                    for member in source:
-                        name = outer_name(member.name)
-                        if name in seen:
-                            raise ArchiveError("Duplicate archive member")
-                        seen.add(name)
-                        if name in replacements:
-                            raw = replacements.pop(name)
-                            member.size = len(raw)
-                            target.addfile(member, io.BytesIO(raw))
-                        else:
-                            target.addfile(member, source.extractfile(member) if member.isfile() else None)
-                    for name, raw in replacements.items():
-                        member = tarfile.TarInfo(name)
-                        member.size = len(raw)
-                        target.addfile(member, io.BytesIO(raw))
-        verify_archive(output, new_tag)
-    except BaseException:
-        if created:
-            unlink_missing(output)
-        raise
+    with publication_transaction() as published, \
+            tempfile.TemporaryDirectory(prefix="pyimagebuilder-retag-", dir=output.parent) as temporary:
+        workspace = Path(temporary)
+        partial = workspace / "tagged.tar"
+        with _archive_source(archive) as stream:
+            manifest = _manifest(archive, fileobj=stream)
+            if len(manifest) != 1:
+                raise BuildError("Retag currently requires a single-image Docker archive")
+            selected = _select_tag(archive, source_tag, manifest=manifest)
+            image = ImageArchiveReader(archive, workspace / "layers").read(selected, platform, fileobj=stream)
+            _write_retagged(stream, partial, image.source_manifest, new_tag)
+        _, _, _, _, actual_digest = _read(partial, new_tag, platform)
+        if actual_digest != image.config_digest:
+            raise ArchiveError("Retagged archive does not preserve the original config bytes")
+        publish_new_file(partial, output)
+        published.append(output)
     return {"source_tag": selected, "tag": new_tag, "output": str(output)}
 
 
@@ -582,7 +598,11 @@ def main(argv=None):
             else:
                 result = prune_cache(directory)
         elif args.command == "tag":
-            result = tag_archive(args.archive, args.new_tag, args.output, args.source_tag)
+            with publication_transaction() as published:
+                result = tag_archive(args.archive, args.new_tag, args.output, args.source_tag)
+                published.track_observed(result["output"])
+                print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+            return 0
         elif args.command == "manifest":
             if args.manifest_action == "create":
                 from multiarch import combine
