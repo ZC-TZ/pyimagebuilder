@@ -261,7 +261,6 @@ pre{font:12px/1.6 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere;backgr
 .operation-panels{display:grid;gap:14px}.operation-panel{min-width:0;border-top:3px solid #7ea4e4}
 .operation-panel header h2{margin:7px 0 5px}.operation-panel header p{margin:0 0 17px}
 .operation-panel .job-form{padding-top:15px;border-top:1px solid #edf1f7}
-.operation-panel .suggest-output{align-self:center;font-size:12px;padding:7px 10px}
 .operation-panel .job-form>p{flex-basis:100%}.operation-panel textarea{min-height:88px}
 /* 路径弹窗保持地址、列表和确认区稳定，长列表仅在中部滚动。 */
 .path-dialog{width:min(960px,calc(100vw - 24px));height:min(760px,calc(100vh - 24px));max-height:calc(100vh - 24px);padding:0;overflow:hidden;border-radius:16px;box-shadow:0 24px 80px #0d1c3c40}

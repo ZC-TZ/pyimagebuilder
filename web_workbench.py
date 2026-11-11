@@ -280,7 +280,7 @@ def _input(name, label, placeholder="", required=False, value=""):
         "required" if required else "")
 
 
-def _path_field(name, label, placeholder="", required=False, value="", mode="file", upload=None, base=""):
+def _path_field(name, label, placeholder="", required=False, value="", mode="file", upload=None, base="", *, suggested_output=""):
     chooser = '<button type="button" class="secondary" data-browse hidden>浏览{}</button>'.format(
         "目录" if mode != "file" else "本机")
     if upload:
@@ -290,6 +290,9 @@ def _path_field(name, label, placeholder="", required=False, value="", mode="fil
                     '<button type="button" class="secondary" data-reset-pick hidden>清除</button>'
                     '<input type="file" data-picker{} hidden><input type="hidden" name="{}-upload">'
                     ).format(' accept="{}"'.format(accept) if accept else "", name)
+    if suggested_output:
+        chooser += ('<button type="button" class="secondary" data-suggest-output="{}">'
+                    '使用建议名称</button>').format(_e(suggested_output))
     return ('<div class="path-field" data-field="{}" data-path-mode="{}" data-upload-kind="{}" data-path-base="{}">'
             '<div class="package-controls">{}{}</div><small data-path-status role="status"></small>{}</div>').format(
                 name, mode, upload or "", _e(base), _input(name, label, placeholder, required, value), chooser,
@@ -543,8 +546,7 @@ class Workbench:
             if suggestion:
                 mode = "output-gzip" if action == "compress" else "output-archive" if action == "slim" else "output"
                 content += _path_field("output", "新压缩归档路径" if action == "compress" else "新 tar 输出路径",
-                                       suggestion, True, mode=mode)
-                content += '<button type="button" class="secondary suggest-output" data-suggest-output="{}">使用建议名称</button>'.format(_e(suggestion))
+                                       suggestion, True, mode=mode, suggested_output=suggestion)
             if action == "compress":
                 content += '<p class="muted">只压缩原 tar，不合层、不改配置与镜像 ID。填写 .tar 时追加 .gz；另存 .compress.json 校验报告。</p>'
                 content += _select("compress-level", "gzip 压缩级别", tuple(str(n) for n in range(1, 10)), "6")
