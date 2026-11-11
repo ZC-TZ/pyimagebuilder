@@ -17,7 +17,7 @@ from compat import unlink_missing
 from build_args import expand
 from dockerfile_parser import parse
 from path_policy import output_path, stored_file_path
-from file_publish import publication_transaction
+from file_publish import publication_transaction, publish_new_file
 from errors import BuildError
 from fast import _require_base_tag
 from image_reader import (MAX_JSON, digest_hex, docker_manifest, outer_name, parse_image_json,
@@ -106,8 +106,19 @@ def _check_archive_platform(path, reference, platform, verify_layers=False, with
     raise BuildError("Pulled image needs exactly one {} variant for {}".format(platform, reference))
 
 
-def copy_image_archive(archive, output, reference, platform):
-    """复制交付归档，校验成品层及配置身份；失败只清理本次排他创建的副本。
+def _archive_delivery_metrics(path):
+    """用同一个读取流统计归档摘要与字节数。"""
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            digest.update(block)
+            size += len(block)
+    return "sha256:" + digest.hexdigest(), size
+
+
+def copy_image_archive(archive, output, reference, platform, *, with_metrics=False):
+    """暂存并验证归档副本，按需返回该副本的摘要与大小，然后排他发布。
 
     源配置原始摘要锚定本次复制，不能把字段相同但重编码后的 JSON 当作同一镜像。
     成品采用流式层校验，无需将大层再次解包到磁盘；旧 tar-only 镜像库也必须通过。
@@ -118,15 +129,19 @@ def copy_image_archive(archive, output, reference, platform):
     _, expected_config = _check_archive_platform(
         archive, reference, platform, with_config_digest=True)
     output.parent.mkdir(parents=True, exist_ok=True)
-    with publication_transaction() as published:
-        with open(archive, "rb") as source, open(output, "xb") as target:
-            published.append(output)
+    with publication_transaction() as published, \
+            tempfile.TemporaryDirectory(prefix="archive-copy-", dir=output.parent) as temporary:
+        staged = Path(temporary) / "image.tar"
+        with open(archive, "rb") as source, staged.open("xb") as target:
             shutil.copyfileobj(source, target, 4 * 1024 * 1024)
         _, actual_config = _check_archive_platform(
-            output, reference, platform, verify_layers=True, with_config_digest=True)
+            staged, reference, platform, verify_layers=True, with_config_digest=True)
         if actual_config != expected_config:
             raise BuildError("Archive config bytes changed during copy")
-    return output
+        result = (output, *_archive_delivery_metrics(staged)) if with_metrics else output
+        publish_new_file(staged, output)
+        published.append(output)
+    return result
 
 
 def _check_cached_archive(cas, path, reference, platform, source):
@@ -464,21 +479,17 @@ def pull_main(argv=None):
         reporter.log("{} image from {}".format("Pulled" if downloaded else "Cached",
                                               args.source or connection.get("source", "registry")))
         reporter.phase_success("Pulling base image")
-        if args.output is not None:
-            output = output_path(args.output)
-            if output == archive:
-                raise BuildError("--output must be a distinct .tar path")
-            copy_image_archive(archive, output, args.reference, args.platform)
-            reporter.log("Created " + str(output))
-        import hashlib
-        digest = hashlib.sha256()
-        delivered = args.output if args.output is not None else archive
-        with open(delivered, "rb") as stream:
-            for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
-                digest.update(block)
-        reporter.success(image=args.reference, platform=args.platform,
-                         output=str(delivered.resolve()),
-                         digest="sha256:" + digest.hexdigest(), size=delivered.stat().st_size)
+        with publication_transaction() as published:
+            if args.output is not None:
+                delivered, digest, size = copy_image_archive(
+                    archive, args.output, args.reference, args.platform, with_metrics=True)
+                published.track_observed(delivered)
+                reporter.log("Created " + str(delivered))
+            else:
+                delivered = archive
+                digest, size = _archive_delivery_metrics(delivered)
+            reporter.success(image=args.reference, platform=args.platform,
+                             output=str(delivered), digest=digest, size=size)
         return 0
     except (BuildError, OSError, RuntimeError, ValueError) as exc:
         reporter.fail(exc)

@@ -626,7 +626,9 @@ class CASStore:
                 [item["diff_id"] for item in value["layers"]]):
             raise ArchiveError("CAS config DiffIDs do not match ref")
         output.parent.mkdir(parents=True, exist_ok=True)
-        with publication_transaction() as published, tempfile.TemporaryDirectory(prefix="cas-export-") as temporary:
+        with publication_transaction() as published, \
+                tempfile.TemporaryDirectory(prefix="cas-export-output-", dir=output.parent) as staging, \
+                tempfile.TemporaryDirectory(prefix="cas-export-") as temporary:
             layers = []
             for index, item in enumerate(value["layers"]):
                 blob = self._blob(item["digest"])
@@ -649,12 +651,13 @@ class CASStore:
                 layers.append(layer)
             writer = ImageArchiveWriter()
             archive_tag = docker_archive_tag(reference)
-            # 在排他创建成功后登记路径，临时解码目录清理失败也能撤销本次输出。
-            with open(output, "xb") as sink:
-                published.track_exclusive(output, sink)
-                image = BaseImage(config, layers, [archive_tag], {}, value["config"], config_raw)
-                writer.write_image(output, image, archive_tag, fileobj=sink)
-            writer.verify(output, archive_tag)
+            staged = Path(staging) / "image.tar"
+            image = BaseImage(config, layers, [archive_tag], {}, value["config"], config_raw)
+            with staged.open("xb") as sink:
+                writer.write_image(staged, image, archive_tag, fileobj=sink)
+            writer.verify(staged, archive_tag)
+            publish_new_file(staged, output)
+            published.append(output)
         return output
 
     def _record_verified_diff_ids(self, value, indices):

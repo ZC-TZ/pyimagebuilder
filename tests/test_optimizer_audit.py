@@ -15,7 +15,7 @@ import image_cli
 import optimizer
 import web_delivery_worker as worker
 from cas_store import CASStore
-from file_publish import publication_transaction
+from file_publish import publication_transaction, publish_new_file
 from errors import ArchiveError, BaseImageNotFound
 from image_reader import DigestReader
 from image_writer import ImageArchiveWriter
@@ -298,11 +298,12 @@ class OptimizerAuditTests(unittest.TestCase):
         existing.write_bytes(b"existing")
         with self.assertRaisesRegex(OSError, "outer rollback"):
             with publication_transaction() as outer:
-                with publication_transaction() as inner, output.open("xb") as stream:
-                    inner.track_exclusive(output, stream)
-                    stream.write(b"initial")
-                with publication_transaction() as inner, owned.open("xb") as stream:
-                    inner.track_exclusive(owned, stream)
+                initial = self.root / "initial.tar"
+                initial.write_bytes(b"initial")
+                with publication_transaction() as inner:
+                    for destination in (output, owned):
+                        publish_new_file(initial, destination)
+                        inner.append(destination)
                 replacement.replace(output)
                 outer.track_observed(output)
                 outer.track_observed(existing)

@@ -572,9 +572,13 @@ def main(argv=None):
             result = load_archive(args.input, args.image_store or cache_directory(settings, "imageStore", None),
                                   args.tag, args.platform, args.replace)
         elif args.command == "save":
-            result = save_archive(args.reference, args.output,
-                                  args.image_store or cache_directory(settings, "imageStore", None),
-                                  args.platform, args.source)
+            with publication_transaction() as published:
+                result = save_archive(args.reference, args.output,
+                                      args.image_store or cache_directory(settings, "imageStore", None),
+                                      args.platform, args.source)
+                published.track_observed(result["output"])
+                print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+            return 0
         elif args.command == "rmi":
             result = remove_image(args.reference,
                                   args.image_store or cache_directory(settings, "imageStore", None),

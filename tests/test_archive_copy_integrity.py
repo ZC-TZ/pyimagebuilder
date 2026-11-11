@@ -19,7 +19,9 @@ sys.path.insert(0, str(PROJECT / "tests"))
 import image_cli
 import image_store
 import progress
+from cas_store import CASStore
 from errors import BuildError
+from image_writer import ImageArchiveWriter
 from image_reader import sha256_file
 from test_image_identity_contract import fixture, TAG
 from test_phase1 import add_bytes, make_base
@@ -189,6 +191,87 @@ class ArchiveCopyIntegrityTests(unittest.TestCase):
         reported = reporter.success.call_args[1]
         self.assertEqual(reported["digest"], "sha256:" + hashlib.sha256(original).hexdigest())
         self.assertEqual(reported["size"], len(original))
+
+    def test_save_and_cas_export_publish_only_after_verification(self):
+        source = self._legacy_archive()
+        cas = CASStore(self.store)
+        cas.import_docker(source, REFERENCE, PLATFORM, "local")
+        check = image_store._check_archive_platform
+        verify = ImageArchiveWriter.verify
+
+        for mode in ("save", "cas"):
+            with self.subTest(mode=mode):
+                output = self.root / (mode + ".tar")
+
+                def write_competing_file(staged):
+                    self.assertNotEqual(staged, output)
+                    self.assertFalse(output.exists())
+                    output.write_bytes(b"competing file")
+
+                def check_copy(path, *args, **kwargs):
+                    result = check(path, *args, **kwargs)
+                    if kwargs.get("verify_layers"):
+                        write_competing_file(path)
+                    return result
+
+                def check_cas(writer, path, tag):
+                    verify(writer, path, tag)
+                    write_competing_file(path)
+
+                with patch.object(image_store, "_check_archive_platform", check_copy), \
+                        patch.object(ImageArchiveWriter, "verify", check_cas):
+                    with self.assertRaises(FileExistsError):
+                        if mode == "save":
+                            image_cli.save_archive(REFERENCE, output, self.store, source="registry")
+                        else:
+                            cas.export_docker(REFERENCE, output, PLATFORM, "local")
+                self.assertEqual(output.read_bytes(), b"competing file")
+
+    def test_save_cli_does_not_leave_output_if_result_flush_fails(self):
+        source = self._legacy_archive()
+        output = self.root / "saved.tar"
+
+        class BrokenOutput(io.StringIO):
+            def flush(self):
+                raise BrokenPipeError("result pipe closed")
+
+        with contextlib.redirect_stdout(BrokenOutput()), contextlib.redirect_stderr(io.StringIO()):
+            code = image_cli.main(["save", REFERENCE, "-o", str(output), "--image-store", str(self.store),
+                                   "--source", "registry"])
+        self.assertEqual(code, 1)
+        self.assertFalse(output.exists())
+        self.assertTrue(source.is_file())
+
+    def test_pull_reports_verified_bytes_even_if_path_is_replaced(self):
+        source = make_base(self.root)
+        original = source.read_bytes()
+        output, replacement = self.root / "pulled.tar", self.root / "replacement.tar"
+        reporter = Mock()
+        replacement.write_bytes(b"competing file")
+
+        def replace_output(message):
+            if message.startswith("Created "):
+                replacement.replace(output)
+
+        reporter.log.side_effect = replace_output
+        with patch.object(image_store, "pull_image", return_value=(source, True)), \
+                patch.object(progress, "make_reporter", return_value=reporter):
+            self.assertEqual(image_store.pull_main(self._pull_arguments(output)), 0)
+        self.assertEqual(output.read_bytes(), b"competing file")
+        reported = reporter.success.call_args[1]
+        self.assertEqual(reported["digest"], "sha256:" + hashlib.sha256(original).hexdigest())
+        self.assertEqual(reported["size"], len(original))
+
+    def test_pull_rolls_back_delivery_if_progress_reporting_fails(self):
+        source = self._legacy_archive()
+        output = self.root / "pulled.tar"
+        reporter = Mock()
+        reporter.success.side_effect = BrokenPipeError("progress pipe closed")
+        with patch.object(image_store, "pull_image", return_value=(source, True)), \
+                patch.object(progress, "make_reporter", return_value=reporter):
+            self.assertEqual(image_store.pull_main(self._pull_arguments(output)), 1)
+        self.assertFalse(output.exists())
+        self.assertTrue(source.is_file())
 
     def test_valid_save_preserves_exact_archive_and_raw_config_bytes(self):
         source, _, raw = fixture(self.root)

@@ -60,11 +60,6 @@ class _PublishedPaths(list):
         self.identities[path] = identity
         super().append(path)
 
-    def track_exclusive(self, path, stream):
-        """用排他创建的打开句柄登记产物，防止重新读取路径时认领同名文件。"""
-        _observe_publication(path, _node_identity(os.fstat(stream.fileno())))
-        self.track_observed(path)
-
     def track_observed(self, path):
         """只接管子操作实际发布或登记过的产物。"""
         path = Path(os.path.abspath(path))
