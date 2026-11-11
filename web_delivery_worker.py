@@ -162,7 +162,7 @@ def _deliver_cas(plan, settings, store):
     cas = CASStore(root)
     tag, platform, source = plan["tag"], plan["platform"], plan["source"]
     action = plan["action"]
-    with cas.ref_lock(tag, platform, source):
+    with publication_transaction() as published, cas.ref_lock(tag, platform, source):
         raw = cas.snapshot_ref(tag, platform, source)
         if raw is None or parse_image_json(raw, "CAS delivery ref").get("manifest") != plan["manifest"]:
             raise BuildError("镜像标签已变更，请重新选择")
@@ -184,8 +184,11 @@ def _deliver_cas(plan, settings, store):
             with tempfile.TemporaryDirectory(prefix="pyimagebuilder-delivery-cas-") as temporary:
                 workspace = Path(temporary)
                 archive = cas.export_docker(tag, workspace / "source.tar", platform, source)
-                return _deliver_archive(dict(plan, format="docker", tag=docker_archive_tag(tag)),
-                                        settings, store, archive, archive.stat().st_size, workspace)
+                result = _deliver_archive(dict(plan, format="docker", tag=docker_archive_tag(tag)),
+                                          settings, store, archive, archive.stat().st_size, workspace)
+                if action == "optimize":
+                    published.append(Path(result["output"]))
+                return result
     raise BuildError("仅有 CAS 数据的镜像请先导出归档")
 
 
@@ -211,14 +214,10 @@ def _deliver_archive(plan, settings, store, path, size, workspace):
         config = json.loads(snapshot["blobs/sha256/" + manifest["config"]["digest"].split(":", 1)[1]])
         history = image_history(config, len(manifest["layers"]))
         return {"tag": tag, "format": "oci", "history": list(reversed(history or []))}
-    if action in ("analyze", "optimize"):
-        from optimizer import analyze_image, optimize_image
-        if is_oci:
-            _verify_oci(path, tag, platform)
-        else:
-            verify_archive(path, tag, platform)
-        if action == "analyze":
-            return analyze_image(path, tag)
+    if action == "analyze":
+        from optimizer import analyze_image
+        return analyze_image(path, tag, platform=platform)
+    if action == "optimize":
         return _optimize(plan, path)
     if action == "rootfs-export":
         return export_rootfs(path, plan["output"], tag=tag, platform=platform)
@@ -267,7 +266,8 @@ def _optimize(plan, source):
     try:
         with publication_transaction() as published:
             reporter.start(plan["tag"], plan["platform"], mode="optimize")
-            result = optimize_image(source, plan["output"], plan["tag"], reporter=reporter)
+            result = optimize_image(source, plan["output"], plan["tag"], reporter=reporter,
+                                    platform=plan["platform"])
             published.append(Path(result["output"]))
             reporter.success(output=result["output"], size=result["after_bytes"])
         return result
@@ -333,16 +333,19 @@ def _slim(plan, source, **kwargs):
 def main():
     try:
         plan = json.loads(sys.argv[1])
-        result = execute(plan)
-        metrics = {key: result[key] for key in ("before_bytes", "after_bytes", "saved_bytes",
-                   "uncompressed_archive_bytes", "upload_limit", "removed_paths", "protected_paths", "removed_unique_bytes",
-                   "archive_bytes", "hidden_file_bytes", "duplicate_groups", "deleted", "bytes")
-                   if type(result.get(key)) is int}
-        if isinstance(result.get("large_layers"), list):
-            metrics["large_layers"] = result["large_layers"][:50]
-        if metrics:
-            print(json.dumps({"web_metrics": metrics}))
-        print(json.dumps(result, ensure_ascii=plan["action"] not in ("repo-test", "attest-verify"), indent=2))
+        with publication_transaction() as published:
+            result = execute(plan)
+            if plan["action"] == "optimize":
+                published.append(Path(result["output"]))
+            metrics = {key: result[key] for key in ("before_bytes", "after_bytes", "saved_bytes",
+                       "uncompressed_archive_bytes", "upload_limit", "removed_paths", "protected_paths", "removed_unique_bytes",
+                       "archive_bytes", "hidden_file_bytes", "duplicate_groups", "deleted", "bytes")
+                       if type(result.get(key)) is int}
+            if isinstance(result.get("large_layers"), list):
+                metrics["large_layers"] = result["large_layers"][:50]
+            if metrics:
+                print(json.dumps({"web_metrics": metrics}))
+            print(json.dumps(result, ensure_ascii=plan["action"] not in ("repo-test", "attest-verify"), indent=2), flush=True)
         return 0
     except (BuildError, OSError, ValueError, KeyError, TypeError, RuntimeError, tarfile.TarError) as exc:
         print("交付任务失败：{}".format(exc), file=sys.stderr)

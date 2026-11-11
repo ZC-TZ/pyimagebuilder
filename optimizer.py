@@ -12,19 +12,23 @@ import sys
 import tarfile
 import tempfile
 from collections import defaultdict
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from cache import CACHE_VERSION
+from cache_identity import file_identity, stat_identity
 from cache_activity import cache_activity
 from compat import is_linked_directory, unlink_missing
 from path_policy import output_path
 from errors import ArchiveError, BuildError
 from file_publish import publication_transaction, publish_new_file
-from image_reader import (BaseImage, ImageArchiveReader, archive_members, digest_hex,
-                          docker_manifest, image_history, sha256_file)
+from file_resources import open_regular_file
+from image_reader import (BaseImage, DigestReader, ImageArchiveReader, archive_members, digest_hex,
+                          docker_manifest, image_config_bytes, image_history, parse_image_json, sha256_file)
 from image_reader import verify_layer_tar
 from image_writer import ImageArchiveWriter
 from oci_writer import OCIImageWriter
+from platforms import architecture
 from reproducible import parse_epoch
 from rootfs import RootFSIndex, clean_path
 from permissions import normalized_metadata
@@ -45,80 +49,126 @@ def _member_json(archive, name):
     if stream is None:
         raise ArchiveError("Unreadable archive JSON: " + name)
     with stream:
-        return json.load(stream)
+        raw = stream.read(MAX_JSON + 1)
+    if len(raw) != member.size or len(raw) > MAX_JSON:
+        raise ArchiveError("Invalid archive JSON size: " + name)
+    try:
+        return json.loads(raw)
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise ArchiveError("Invalid archive JSON: " + name) from exc
 
 
-def _identify(path, requested_tag):
-    with tarfile.open(path, "r:*") as archive:
-        names = archive_members(archive)
-        if "manifest.json" in names:
-            manifest = docker_manifest(_member_json(archive, "manifest.json"))
-            if not isinstance(manifest, list) or not manifest:
-                raise ArchiveError("Invalid Docker manifest")
-            if any(not isinstance(item, dict) or
-                   (item.get("RepoTags") is not None and
-                    (not isinstance(item["RepoTags"], list) or
-                     any(not isinstance(tag, str) for tag in item["RepoTags"])))
-                   for item in manifest):
-                raise ArchiveError("Invalid Docker manifest tags")
-            tags = [tag for item in manifest if isinstance(item, dict)
-                    for tag in (item.get("RepoTags") or []) if isinstance(tag, str)]
-            if requested_tag is None:
-                if len(set(tags)) != 1:
-                    raise BuildError("Specify --tag for a multi-image Docker archive")
-                requested_tag = tags[0]
-            if requested_tag not in tags:
-                raise BuildError("Tag is not present in Docker archive")
-            return "docker", requested_tag
-        if "index.json" in names:
-            index = _member_json(archive, "index.json")
-            entries = index.get("manifests") if isinstance(index, dict) else None
-            if not isinstance(entries, list) or len(entries) != 1:
-                raise BuildError("Phase 14 accepts single-platform OCI archives only")
-            item = entries[0]
-            annotations = item.get("annotations") if isinstance(item, dict) else None
-            tag = annotations.get("org.opencontainers.image.ref.name") if isinstance(annotations, dict) else None
-            if not isinstance(tag, str) or (requested_tag is not None and requested_tag != tag):
-                raise BuildError("OCI archive tag is missing or differs from --tag")
-            return "oci", tag
+def _identify(archive, requested_tag):
+    names = archive_members(archive)
+    if "manifest.json" in names:
+        manifest = docker_manifest(_member_json(archive, "manifest.json"))
+        if not isinstance(manifest, list) or not manifest:
+            raise ArchiveError("Invalid Docker manifest")
+        if any(not isinstance(item, dict) or
+               (item.get("RepoTags") is not None and
+                (not isinstance(item["RepoTags"], list) or
+                 any(not isinstance(tag, str) for tag in item["RepoTags"])))
+               for item in manifest):
+            raise ArchiveError("Invalid Docker manifest tags")
+        tags = [tag for item in manifest if isinstance(item, dict)
+                for tag in (item.get("RepoTags") or []) if isinstance(tag, str)]
+        if requested_tag is None:
+            if len(set(tags)) != 1:
+                raise BuildError("Specify --tag for a multi-image Docker archive")
+            requested_tag = tags[0]
+        if requested_tag not in tags:
+            raise BuildError("Tag is not present in Docker archive")
+        return "docker", requested_tag
+    if "index.json" in names:
+        index = _member_json(archive, "index.json")
+        entries = index.get("manifests") if isinstance(index, dict) else None
+        if not isinstance(entries, list) or len(entries) != 1:
+            raise BuildError("Phase 14 accepts single-platform OCI archives only")
+        item = entries[0]
+        annotations = item.get("annotations") if isinstance(item, dict) else None
+        tag = annotations.get("org.opencontainers.image.ref.name") if isinstance(annotations, dict) else None
+        if not isinstance(tag, str) or (requested_tag is not None and requested_tag != tag):
+            raise BuildError("OCI archive tag is missing or differs from --tag")
+        return "oci", tag
     raise ArchiveError("Expected a Docker save or single-platform OCI tar")
 
 
-def load_image(path, workspace, tag=None, with_image=False):
-    """验证并准备层；with_image 保留原始配置及来源元数据，供优化器转存使用。
+@contextmanager
+def _archive_source(path):
+    """贯穿识别、读取与无变化复制，收尾时核对实际句柄和源路径。"""
+    with open_regular_file(path) as stream:
+        stamp = file_identity(path, content=False)
+        initial = stat_identity(os.fstat(stream.fileno()))
+        if initial[:4] != stamp[:4]:
+            raise ArchiveError("Source archive changed while opening")
+        yield stream
+        if (stat_identity(os.fstat(stream.fileno())) != initial or
+                file_identity(path, content=False) != stamp):
+            raise ArchiveError("Source archive changed during optimization or analysis")
 
-    默认四元组供只读分析使用，禁止将其中的解析配置当作原样转存数据。
-    """
-    path = Path(path).resolve()
-    kind, tag = _identify(path, tag)
-    workspace = Path(workspace)
+
+def _load_image(path, stream, workspace, tag, platform):
+    """保留已校验的原始 OCI JSON，并验证实际写入私有层文件的字节。"""
+    stream.seek(0)
+    with tarfile.open(fileobj=stream, mode="r:*") as archive:
+        kind, tag = _identify(archive, tag)
     if kind == "docker":
-        image = ImageArchiveReader(path, workspace / "layers").read(tag)
-        return (kind, tag, image) if with_image else (kind, tag, image.config, image.layers)
-    OCIImageWriter().verify(path, tag)
-    with tarfile.open(path, "r:") as archive:
+        image = ImageArchiveReader(path, workspace / "layers").read(tag, platform, fileobj=stream)
+        if tag not in image.repo_tags:
+            raise ArchiveError("Docker archive tag changed during reading")
+        image.original_config_bytes()
+        return kind, tag, image, None
+
+    stream.seek(0)
+    snapshot = OCIImageWriter().verify(path, tag, fileobj=stream)
+    index = parse_image_json(snapshot["index.json"], "OCI index")
+    descriptor = index["manifests"][0]
+    manifest_digest = descriptor["digest"]
+    manifest_raw = snapshot["blobs/sha256/" + digest_hex(manifest_digest)]
+    manifest = parse_image_json(manifest_raw, "OCI manifest")
+    config_digest = manifest["config"]["digest"]
+    config_raw = snapshot["blobs/sha256/" + digest_hex(config_digest)]
+    config = parse_image_json(config_raw, "OCI config")
+    if platform is not None and (config.get("os"), config.get("architecture")) != ("linux", architecture(platform)):
+        raise ArchiveError("OCI archive platform does not match " + platform)
+
+    stream.seek(0)
+    with tarfile.open(fileobj=stream, mode="r:") as archive:
         members = archive_members(archive)
-        index = _member_json(archive, "index.json")
-        manifest_digest = index["manifests"][0]["digest"]
-        manifest = _member_json(archive, "blobs/sha256/" + digest_hex(manifest_digest))
-        config_name = "blobs/sha256/" + digest_hex(manifest["config"]["digest"])
-        with archive.extractfile(members[config_name]) as stream:
-            config_raw = stream.read()
-        config = json.loads(config_raw)
+        layer_entries = manifest["layers"]
+        names = ["blobs/sha256/" + digest_hex(entry["digest"]) for entry in layer_entries]
+        if set(members) != set(snapshot).union(names) or any(not member.isfile() for member in members.values()):
+            raise ArchiveError("OCI members changed after verification")
+        for name, raw in snapshot.items():
+            member = members[name]
+            with archive.extractfile(member) as metadata:
+                if member.size != len(raw) or metadata.read(len(raw) + 1) != raw:
+                    raise ArchiveError("OCI metadata changed after verification: " + name)
         layer_dir = workspace / "layers"
         layer_dir.mkdir(parents=True, exist_ok=True)
         layers = []
-        for number, descriptor in enumerate(manifest["layers"]):
-            name = "blobs/sha256/" + digest_hex(descriptor["digest"])
-            source = archive.extractfile(members[name])
-            if source is None:
-                raise ArchiveError("Missing OCI layer: " + name)
+        for number, (name, entry) in enumerate(zip(names, layer_entries)):
+            member = members[name]
+            if member.size != entry["size"]:
+                raise ArchiveError("OCI layer size changed after verification: " + name)
             target = layer_dir / ("layer-{}.tar".format(number))
-            with source, open(target, "wb") as output:
-                shutil.copyfileobj(source, output, BUFFER)
+            with archive.extractfile(member) as payload, target.open("wb") as output:
+                copied = DigestReader(payload)
+                shutil.copyfileobj(copied, output, BUFFER)
+            if copied.current != entry["size"] or copied.digest.hexdigest() != digest_hex(entry["digest"]):
+                raise ArchiveError("OCI layer content changed after verification: " + name)
             layers.append(target)
-    image = BaseImage(config, layers, [tag], manifest, manifest["config"]["digest"], config_raw, index)
-    return (kind, tag, image) if with_image else (kind, tag, config, layers)
+    image = BaseImage(config, layers, [tag], manifest, config_digest, config_raw, index,
+                      manifest_raw, manifest_digest)
+    return kind, tag, image, snapshot
+
+
+def load_image(path, workspace, tag=None, with_image=False, *, platform=None):
+    """返回已验证镜像；默认四元组供分析使用，转存必须取原始配置。"""
+    path = Path(path).resolve()
+    with _archive_source(path) as stream:
+        kind, tag, image, _ = _load_image(path, stream, Path(workspace), tag, platform)
+    return (kind, tag, image) if with_image else (kind, tag, image.config, image.layers)
 
 
 def _index(layers):
@@ -193,10 +243,14 @@ def _signature(index, memo, reporter=None):
     return tuple(result)
 
 
-def analyze_image(path, tag=None, large_mib=50):
+def analyze_image(path, tag=None, large_mib=50, *, platform=None):
     """报告层大小、隐藏字节和重复文件内容；隐藏判断包含硬链接对旧内容的引用。"""
+    path = Path(path).resolve()
     with tempfile.TemporaryDirectory(prefix="pyimagebuilder-analyze-") as temp:
-        kind, tag, config, layers = load_image(path, temp, tag)
+        with _archive_source(path) as source:
+            archive_size = os.fstat(source.fileno()).st_size
+            kind, tag, image, _ = _load_image(path, source, Path(temp), tag, platform)
+        config, layers = image.config, image.layers
         final = _index(layers)
         live_content = {(entry.layer, entry.member) for entry in final.entries.values()
                         if entry.kind in ("file", "hardlink") and entry.layer}
@@ -245,7 +299,7 @@ def analyze_image(path, tag=None, large_mib=50):
         if duplicates:
             advice.append("Check duplicate_content locations for repeated COPY/ADD outputs; verify whether both paths are needed.")
         return {"format": kind, "tag": tag, "architecture": config.get("architecture"),
-                "archive_bytes": Path(path).stat().st_size,
+                "archive_bytes": archive_size,
                 "uncompressed_layer_bytes": sum(item["tar_bytes"] for item in layers_report),
                 "hidden_file_bytes": sum(item["hidden_file_bytes"] for item in layers_report),
                 "large_layers": large,
@@ -254,7 +308,7 @@ def analyze_image(path, tag=None, large_mib=50):
                 "note": "Duplicate and hidden byte counts are opportunities, not guaranteed savings."}
 
 
-def optimize_image(path, output, tag=None, source_date_epoch=0, reporter=None):
+def optimize_image(path, output, tag=None, source_date_epoch=0, reporter=None, *, platform=None):
     """仅移除已证明不影响最终文件树的完整层，并同步重写配置。
 
     不是文件级压缩；比较共享 inode 和设备/FIFO 元数据，无法证明等价的层保留。
@@ -266,10 +320,13 @@ def optimize_image(path, output, tag=None, source_date_epoch=0, reporter=None):
     epoch = parse_epoch(source_date_epoch)
     output.parent.mkdir(parents=True, exist_ok=True)
     with publication_transaction() as published, \
-            tempfile.TemporaryDirectory(prefix="pyimagebuilder-optimize-", dir=output.parent) as temp:
+            tempfile.TemporaryDirectory(prefix="pyimagebuilder-optimize-", dir=output.parent) as temp, \
+            ExitStack() as source_scope:
+        source = source_scope.enter_context(_archive_source(path))
         if reporter is not None:
             reporter.phase_start("Read optimization source")
-        kind, tag, image = load_image(path, Path(temp) / "input", tag, with_image=True)
+        original_size = os.fstat(source.fileno()).st_size
+        kind, tag, image, snapshot = _load_image(path, source, Path(temp) / "input", tag, platform)
         config, layers = image.config, image.layers
         if reporter is not None:
             reporter.phase_success()
@@ -310,12 +367,15 @@ def optimize_image(path, output, tag=None, source_date_epoch=0, reporter=None):
                         continue
                 filtered.append(item)
             updated["history"] = filtered
+        expected_config = image_config_bytes(updated) if removed else image.original_config_bytes()
         partial = Path(temp) / "optimized.tar"
         writer = ImageArchiveWriter(epoch) if kind == "docker" else OCIImageWriter(epoch)
         if not removed:
             if kind == "oci":
                 # 没有优化发生时，manifest/index 也不能重编码或丢失注解。
-                shutil.copyfile(path, partial)
+                source.seek(0)
+                with partial.open("xb") as target:
+                    shutil.copyfileobj(source, target, BUFFER)
             else:
                 writer.write_image(partial, image, tag)
         elif kind == "oci":
@@ -328,15 +388,18 @@ def optimize_image(path, output, tag=None, source_date_epoch=0, reporter=None):
         if reporter is not None:
             reporter.phase_success()
             reporter.phase_start("Verify optimized filesystem")
-        writer.verify(partial, tag)
-        _, _, _, verified_layers = load_image(partial, Path(temp) / "verify", tag)
-        if _signature(_index(verified_layers), {}, reporter) != original:
+        with _archive_source(partial) as verification:
+            writer.verify(partial, tag)
+            _, _, verified, verified_snapshot = _load_image(partial, verification, Path(temp) / "verify", tag, platform)
+        if verified.original_config_bytes() != expected_config or (not removed and snapshot != verified_snapshot):
+            raise ArchiveError("Optimized archive does not preserve the expected metadata identity")
+        if _signature(_index(verified.layers), {}, reporter) != original:
             raise BuildError("Optimized image rootfs verification failed")
         if reporter is not None:
             reporter.phase_success()
             reporter.log("优化完成：移除 {} 层，保留 {} 层。未证明冗余的层不会删除。".format(len(removed), len(retained)))
-        original_size = path.stat().st_size
         optimized_size = partial.stat().st_size
+        source_scope.close()
         publish_new_file(partial, output)
         published.append(output)
         return {"output": str(output), "format": kind, "tag": tag,
@@ -431,12 +494,14 @@ def main(argv=None):
     image = commands.add_parser("analyze", help="Report large layers and duplicate/hidden files")
     image.add_argument("--archive", type=Path, required=True)
     image.add_argument("--tag")
+    image.add_argument("--platform", choices=("linux/amd64", "linux/arm64"))
     image.add_argument("--large-mib", type=float, default=50)
     image.add_argument("--output", type=Path, help="Optional JSON report file")
     optimize = commands.add_parser("optimize", help="Drop layers proven redundant for final rootfs")
     optimize.add_argument("--archive", type=Path, required=True)
     optimize.add_argument("--output", type=Path, required=True)
     optimize.add_argument("--tag")
+    optimize.add_argument("--platform", choices=("linux/amd64", "linux/arm64"))
     optimize.add_argument("--source-date-epoch", default=os.environ.get("SOURCE_DATE_EPOCH", "0"))
     cache = commands.add_parser("cache", help="Audit stale or corrupt layer cache entries")
     cache.add_argument("--cache-dir", type=Path)
@@ -447,7 +512,7 @@ def main(argv=None):
         if args.command == "analyze":
             if not math.isfinite(args.large_mib) or args.large_mib < 0:
                 raise BuildError("--large-mib must be nonnegative")
-            result = analyze_image(args.archive, args.tag, args.large_mib)
+            result = analyze_image(args.archive, args.tag, args.large_mib, platform=args.platform)
             if args.output:
                 args.output = output_path(args.output)
                 if args.output.exists():
@@ -455,7 +520,11 @@ def main(argv=None):
                 with open(args.output, "x", encoding="utf-8") as stream:
                     stream.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
         elif args.command == "optimize":
-            result = optimize_image(args.archive, args.output, args.tag, args.source_date_epoch)
+            with publication_transaction() as published:
+                result = optimize_image(args.archive, args.output, args.tag, args.source_date_epoch, platform=args.platform)
+                published.append(Path(result["output"]))
+                print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+            return 0
         else:
             from settings import cache_directory, load_settings
             settings, _ = load_settings(args.config)

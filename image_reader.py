@@ -9,7 +9,7 @@ import re
 import shutil
 import tarfile
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -367,8 +367,10 @@ class ImageArchiveReader:
             raise ArchiveError("Base image archive changed while reading; retry with a stable archive")
 
     @contextmanager
-    def _open_archive(self):
-        with open(self.path, "rb") as source:
+    def _open_archive(self, fileobj=None):
+        # 优化器已用此句柄识别归档；继续消费同一来源，避免按路径重新选中另一份镜像。
+        with (open(self.path, "rb") if fileobj is None else nullcontext(fileobj)) as source:
+            source.seek(0)
             self._source_stamp = file_identity(self.path, content=False)
             self._source_identity = self._identity(self.path) if self.trusted_layer_store is not None else None
             # Windows 部分 Python 版本的 stat/fstat 对 ctime 定义不同。
@@ -460,18 +462,20 @@ class ImageArchiveReader:
                 os.unlink(pending)
         return layer
 
-    def read(self, from_reference, expected_platform=None, progress=None, reporter=None):
+    def read(self, from_reference, expected_platform=None, progress=None, reporter=None, *, fileobj=None):
         """选取指定引用及平台，验证 config/layer 摘要并提取层。
 
         显式本地映射在归档仅含一个镜像时允许引用别名；多镜像归档要求准确匹配。
         配置可信层缓存时可复用已验证的层，否则写入调用方提供的私有 workspace。
+        fileobj 可借用已打开的归档句柄；调用方负责关闭，句柄必须匹配 self.path。
         """
         if expected_platform is not None:
             normalize_platform(expected_platform)
         if not self.path.is_file():
             raise BaseImageNotFound("Local base image archive not found: " + str(self.path))
         try:
-            with self._open_archive() as archive:
+            opened = self._open_archive() if fileobj is None else self._open_archive(fileobj)
+            with opened as archive:
                 members = archive_members(archive)
 
                 def json_member(name):

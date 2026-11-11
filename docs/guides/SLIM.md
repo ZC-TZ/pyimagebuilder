@@ -17,7 +17,7 @@
 
 **slim 没有默认删除清单。** 不指定删除规则时只做扁平化；加 `--gzip` 再压缩。它不是给原 tar 简单套 gzip：会重建一层，产生派生镜像和新的 ImageID，继承 ENV、USER、WORKDIR、CMD、ENTRYPOINT 等运行配置。原始配置中的额外字段也保留；rootfs、构建历史和时间戳按派生镜像更新。
 
-输入支持本地 Docker archive、单平台 OCI archive（包括 gzip 包装），以及本工具已有的 CAS 镜像引用。输出统一为 **Docker archive**：`.tar` 或 gzip 的 `.tar.gz` / `.tgz`。多平台 OCI index 应先选择并导出单个平台，不能用一次 slim 处理整个 index。
+输入支持本地 Docker archive（含 gzip 包装）、未压缩的单平台 OCI archive，以及本工具已有的 CAS 镜像引用。压缩后的 OCI 归档需先解开外层 gzip 再裁剪。输出统一为 **Docker archive**：`.tar` 或 gzip 的 `.tar.gz` / `.tgz`。多平台 OCI index 应先选择并导出单个平台，不能用一次 slim 处理整个 index。
 
 ## 2. 最快使用
 
